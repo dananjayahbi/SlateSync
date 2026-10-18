@@ -1,0 +1,22 @@
+# Python virtualenvs & tool caches
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins*
+
+# Logs & user documents (*.slatesync = ZIP containers, user data, never committed)
+*.log
+*.slatesync
+
+# %APPDATA%/SlateSync runtime artifacts (if a dev/test redirect lands them in-repo)
+AppData/
+appdata/
+
+# NOTE: pc_agent/installer/slatesync_agent.spec (PyInstaller) stays TRACKED — do not add *.spec here.

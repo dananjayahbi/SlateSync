@@ -1,0 +1,25 @@
+{
+  "spec": "slatesync.binary_stream_frame",
+  "version": 1,
+  "byte_length": 16,
+  "byte_order": "little_endian",
+  "struct_format": "<BBHfff",
+  "fields": [
+    {"name": "frame_type", "offset": 0,  "size": 1, "c_type": "uint8",   "description": "FrameType byte"},
+    {"name": "tool_id",    "offset": 1,  "size": 1, "c_type": "uint8",   "description": "ToolId byte"},
+    {"name": "seq",        "offset": 2,  "size": 2, "c_type": "uint16",  "description": "per-connection monotonic sequence"},
+    {"name": "f1",         "offset": 4,  "size": 4, "c_type": "float32", "description": "float arg 1"},
+    {"name": "f2",         "offset": 8,  "size": 4, "c_type": "float32", "description": "float arg 2"},
+    {"name": "f3",         "offset": 12, "size": 4, "c_type": "float32", "description": "float arg 3"}
+  ],
+  "frame_type": {
+    "0x01": {"name": "LIVE_POINT",  "f1": "world_x", "f2": "world_y", "f3": "width_pressure_factor"},
+    "0x02": {"name": "LIVE_END",    "f1": 0.0, "f2": 0.0, "f3": 0.0},
+    "0x03": {"name": "CAMERA",      "f1": "scale_zoom", "f2": "translate_x", "f3": "translate_y"},
+    "0x04": {"name": "LASER",       "f1": "world_x", "f2": "world_y", "f3": 0.0}
+  },
+  "tool_id": {"0x01": "Pen", "0x02": "Highlighter", "0x03": "Eraser", "0x04": "Line/Shape Preview"},
+  "seq_rule": {"type": "uint16", "scope": "per_connection", "order": "monotonic",
+    "stale_drop": "receiver drops any frame whose seq is not newer than last accepted, mod 2^16 window"},
+  "mirrors": ["pc_agent/core/protocol.py", "mobile_app/lib/core/models/canvas_models.dart"]
+}

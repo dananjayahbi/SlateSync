@@ -1,0 +1,17 @@
+# runtime (overview.md §5 Doc 04 + numpy for Docs 07/08 math)
+customtkinter
+moderngl
+pyglet
+pycairo
+reportlab
+Pillow
+websockets
+zeroconf
+qrcode
+pystray
+rtree
+numpy
+# dev (Doc 01 pytest.ini / ruff.toml)
+pytest
+ruff
+pyinstaller

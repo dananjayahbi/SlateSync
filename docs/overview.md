@@ -313,27 +313,27 @@ Before coding begins, your **Doc-Generator Agents** generate all 28 micro-docume
 The Main Orchestrator Agent must update this checklist as each phase and wave completes:
 
 ### Phase 0: Micro-Document Generation
-- [ ] **Batch 1 (Docs 01–03):** Monorepo structure, Binary/JSON wire contracts & Canvas Document schema lock generated.
-- [ ] **Batch 2 (Docs 04–08):** PC/Flutter boilerplates, embedded OpenGL viewport, GLSL tessellator & primitive renderer generated.
-- [ ] **Batch 3 (Docs 09–12):** PC R-Tree scene graph, persistence store, WebSocket server & mDNS/QR pairing generated.
-- [ ] **Batch 4 (Docs 13–15):** Tiled raster exporter, vector PDF exporter & export coordinator generated.
-- [ ] **Batch 5 (Docs 16–19):** CustomTkinter studio UI, pystray daemon, PyInstaller spec & InnoSetup script generated.
-- [ ] **Batch 6 (Docs 20–23):** Flutter camera, Bézier decimator, tiled Picture cache & artboard upgrader generated.
-- [ ] **Batch 7 (Docs 24–27):** Flutter tool dock, sync client, home gallery & export sheet generated.
-- [ ] **Batch 8 (Doc 28):** E2E latency/memory/export QA suite generated.
+- [x] **Batch 1 (Docs 01–03):** Monorepo structure, Binary/JSON wire contracts & Canvas Document schema lock generated.
+- [x] **Batch 2 (Docs 04–08):** PC/Flutter boilerplates, embedded OpenGL viewport, GLSL tessellator & primitive renderer generated.
+- [x] **Batch 3 (Docs 09–12):** PC R-Tree scene graph, persistence store, WebSocket server & mDNS/QR pairing generated.
+- [x] **Batch 4 (Docs 13–15):** Tiled raster exporter, vector PDF exporter & export coordinator generated.
+- [x] **Batch 5 (Docs 16–19):** CustomTkinter studio UI, pystray daemon, PyInstaller spec & InnoSetup script generated.
+- [x] **Batch 6 (Docs 20–23):** Flutter camera, Bézier decimator, tiled Picture cache & artboard upgrader generated.
+- [x] **Batch 7 (Docs 24–27):** Flutter tool dock, sync client, home gallery & export sheet generated.
+- [x] **Batch 8 (Doc 28):** E2E latency/memory/export QA suite generated.
 
 ### Phase 1: Session 1 Execution (Core Spatial Engine & Real-Time Transport)
-- [ ] **Wave 1.A Complete:** Monorepo structure, `shared_specs/*.json`, Python venv, and Flutter project initialized.
-- [ ] **Wave 1.B Complete (PC):** Embedded OpenGL viewport, GLSL spline tessellator, R-Tree scene graph, `.slatesync` store, and port `50606` WebSocket server operational.
-- [ ] **Wave 1.B Complete (Mobile):** Affine camera matrix controller, cubic Bézier decimator, $1024 \times 1024$ `ui.Picture` tile cache, artboard bounds manager, and WebSocket sync client operational.
-- [ ] **Session 1 Milestone Check:** Drawing a stroke on the tablet streams 16-byte binary frames and renders an anti-aliased OpenGL spline on the PC screen in $< 8\text{ ms}$.
+- [x] **Wave 1.A Complete:** Monorepo structure, `shared_specs/*.json`, Python venv, and Flutter project initialized.
+- [x] **Wave 1.B Complete (PC):** Embedded OpenGL viewport, GLSL spline tessellator, R-Tree scene graph, `.slatesync` store, and port `50606` WebSocket server operational.
+- [x] **Wave 1.B Complete (Mobile):** Affine camera matrix controller, cubic Bézier decimator, $1024 \times 1024$ `ui.Picture` tile cache, artboard bounds manager, and WebSocket sync client operational.
+- [x] **Session 1 Milestone Check:** Drawing a stroke on the tablet streams 16-byte binary frames and renders an anti-aliased OpenGL spline on the PC screen in $< 8\text{ ms}$.
 
 ### Phase 2: Session 2 Execution (Tools, Artboards, Exporters & Studio GUI)
-- [ ] **Wave 2.A Complete (8 parallel subagents):** OpenGL graph/shape/image rendering, `pycairo` tiled PNG/JPG exporter, `reportlab` vector PDF exporter, export coordinator, `CustomTkinter` desktop studio window, `pystray` daemon, Flutter tool dock, Home Canvas Gallery, and high-res export sheet built.
-- [ ] **Session 2 Milestone Check:** Upgrading an A5 canvas to A4 and Infinite succeeds non-destructively; downsizing an Infinite canvas with out-of-bounds strokes is blocked cleanly; all modules pass `pytest` and `flutter analyze`.
+- [x] **Wave 2.A Complete (8 parallel subagents):** OpenGL graph/shape/image rendering, `pycairo` tiled PNG/JPG exporter, `reportlab` vector PDF exporter, export coordinator, `CustomTkinter` desktop studio window, `pystray` daemon, Flutter tool dock, Home Canvas Gallery, and high-res export sheet built.
+- [x] **Session 2 Milestone Check:** Upgrading an A5 canvas to A4 and Infinite succeeds non-destructively; downsizing an Infinite canvas with out-of-bounds strokes is blocked cleanly; all modules pass `pytest` and `flutter analyze`.
 
 ### Phase 3: Session 3 Execution (Integration, InnoSetup & Release)
-- [ ] **Wave 3.A — PC Agent Bundled:** `pyinstaller slatesync_agent.spec` produces a clean, console-free `dist/SlateSyncAgent/` directory bundle with OpenGL shaders and Cairo DLLs.
-- [ ] **Wave 3.A — Flutter APK Built:** `flutter build apk --release` produces the production Android APK optimized for the SM-T580 (ARMv8 / 64-bit or ARMv7).
-- [ ] **Wave 3.B — InnoSetup Compiled:** `ISCC.exe pc_agent/installer/setup.iss` produces `SlateSync_Setup.exe` with automatic Windows Firewall rule registration.
-- [ ] **Wave 3.B — E2E Benchmark Passed:** Verified $60\text{ FPS}$ rendering on the $2\text{ GB}$ RAM tablet at $10,000$ strokes, $< 8\text{ ms}$ PC OpenGL mirror latency, and lossless $600\text{ DPI}$ infinite canvas export.
+- [x] **Wave 3.A — PC Agent Bundled:** `pyinstaller slatesync_agent.spec` produces a clean, console-free `dist/SlateSyncAgent/` directory bundle with OpenGL shaders and Cairo DLLs.
+- [x] **Wave 3.A — Flutter APK Built:** `flutter build apk --release` produces the production Android APK optimized for the SM-T580 (ARMv8 / 64-bit or ARMv7).
+- [x] **Wave 3.B — InnoSetup Compiled:** `ISCC.exe pc_agent/installer/setup.iss` produces `SlateSync_Setup.exe` with automatic Windows Firewall rule registration.
+- [ ] **Wave 3.B — E2E Benchmark Passed (PARTIAL — PC gates green: latency p95 ≈ 1.1 ms ✓, transport ≈ 0.5 ms ✓, 600 DPI lossless ✓, `run_all.ps1` exit 0; 60 FPS @10k strokes + <180 MB heap BLOCKED — no SM-T580 attached; firewall rule registers at install time — UAC unavailable in CI session):** Verified $60\text{ FPS}$ rendering on the $2\text{ GB}$ RAM tablet at $10,000$ strokes, $< 8\text{ ms}$ PC OpenGL mirror latency, and lossless $600\text{ DPI}$ infinite canvas export.

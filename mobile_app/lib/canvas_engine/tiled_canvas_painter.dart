@@ -1,0 +1,1222 @@
+/// Doc 22 — Tiled Picture Cache Engine (2 GB-safe).
+///
+/// Partitions world space into 1024×1024 tiles, bakes static strokes into
+/// bucketed `ui.Picture` tiles behind an LRU byte-budget cache, keeps an
+/// in-file R-tree over committed nodes, and makes every commit dirty only its
+/// containing tiles (event-driven rebake — the anti-quadratic core). Also
+/// hosts the dual-layer `RepaintBoundary` widget separating static tiles from
+/// live strokes.
+///
+/// Wave 1.B note: Doc 20's `CameraController` and Doc 21's `ProcessedStroke`
+/// are written concurrently by sibling agents, so [TiledCanvasEngine] accepts
+/// them structurally (an object exposing `double scale` / an object exposing
+/// `bbox` + `toRpcPayload()`) instead of importing those types. All frozen
+/// names, arities and behaviors from template §5 are reproduced exactly.
+library;
+
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter/widgets.dart';
+import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
+
+// ---------------------------------------------------------------------------
+// Master constants (template §3 / Doc 22 §4)
+// ---------------------------------------------------------------------------
+
+/// Tile edge length in world units (1024×1024 tiles).
+const double tileSize = 1024.0;
+
+/// Default LRU byte budget: ~120 MB of the <180 MB Flutter heap gate
+/// (Doc 22 §4).
+const int defaultCacheMaxBytes = 120 * 1048576;
+
+/// Eviction hysteresis floor: overflow evicts LRU entries down to ~96 MB
+/// (80 % of the cap, Doc 22 §4).
+const int defaultCacheEvictToBytes = 96 * 1048576;
+
+/// Base retained bytes per baked tile: RGBA `1024·1024·4` with the 4:1
+/// picture-retention factor ⇒ 1 MB (Doc 22 §4 `approxBytes` formula).
+const int pictureRetentionBaseBytes = (1024 * 1024 * 4) ~/ 4;
+
+/// Zoom-bucket exponent `k = round(log2(scale))` so the bucket factor is
+/// `b = 2^k` (Doc 22 §4 "bucket rasterization"). Non-positive scales fall
+/// back to `k = 0`.
+int bucketExponentForScale(double scale) {
+  if (!(scale > 0)) {
+    return 0;
+  }
+  return (math.log(scale) / math.ln2).round();
+}
+
+/// Bucket factor `b = 2^k` for an exponent produced by
+/// [bucketExponentForScale].
+double bucketFactorForExponent(int exponent) => math.pow(2.0, exponent).toDouble();
+
+// ---------------------------------------------------------------------------
+// TileKey (template §5 freeze)
+// ---------------------------------------------------------------------------
+
+/// Immutable tile coordinate value: `TileKey(floor(x/1024), floor(y/1024))`.
+class TileKey {
+  const TileKey(this.tx, this.ty);
+
+  final int tx;
+  final int ty;
+
+  /// Dart's `floor()` handles negatives: `x=-500 ⇒ tx=-1` (Doc 22 §4).
+  static TileKey forPoint(num x, num y) =>
+      TileKey((x / tileSize).floor(), (y / tileSize).floor());
+
+  /// World-space square covered by this tile, `(tx·1024, ty·1024)` →
+  /// `((tx+1)·1024, (ty+1)·1024)`; adjacency is exact (Doc 22 §4).
+  Rect get worldRect => Rect.fromLTWH(
+        tx * tileSize,
+        ty * tileSize,
+        tileSize,
+        tileSize,
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is TileKey && other.tx == tx && other.ty == ty);
+
+  @override
+  int get hashCode => Object.hash(tx, ty);
+
+  @override
+  String toString() => 'TileKey($tx, $ty)';
+}
+
+// ---------------------------------------------------------------------------
+// TileCache (template §5 freeze)
+// ---------------------------------------------------------------------------
+
+class _CacheEntry {
+  _CacheEntry(this.key, this.picture, this.bucket, this.bytes);
+
+  final TileKey key;
+  final ui.Picture picture;
+
+  /// Zoom-bucket exponent recorded when the picture was put (Doc 22 §4).
+  final int bucket;
+  final int bytes;
+
+  /// Recency chain: `prev` ⇒ newer (towards MRU head), `next` ⇒ older
+  /// (towards LRU tail).
+  _CacheEntry? prev;
+  _CacheEntry? next;
+}
+
+/// Map + doubly-linked LRU of baked `ui.Picture` tiles behind a byte budget
+/// (Doc 22 §4): cap ~120 MB, evict oldest-first down to ~96 MB on overflow,
+/// `get` promotes to MRU.
+class TileCache {
+  TileCache({
+    this.maxBytes = defaultCacheMaxBytes,
+    this.evictToBytes = defaultCacheEvictToBytes,
+  }) : assert(evictToBytes <= maxBytes);
+
+  final int maxBytes;
+  final int evictToBytes;
+
+  /// Zoom-bucket exponent used for entries [put] from now on: pictures put
+  /// while this is `k` count `approxBytes` as `1 MB / 4^max(0,-k)` bytes
+  /// (Doc 22 §4 formula). Engine-managed; default `0` (bucket factor 1).
+  int bucket = 0;
+
+  final Map<TileKey, _CacheEntry> _entries = <TileKey, _CacheEntry>{};
+  _CacheEntry? _head; // MRU
+  _CacheEntry? _tail; // LRU
+  int _totalBytes = 0;
+  int _generation = 0;
+
+  /// Bumped on every structural change; painters compare it in
+  /// `shouldRepaint` (Doc 22 §4).
+  int get generation => _generation;
+
+  /// Retained bytes for one tile baked at [bucketExponent]
+  /// (`1 MB / 4^L`, `L = max(0, −k)` — Doc 22 §4).
+  static int bytesForBucket(int bucketExponent) {
+    final int levels = bucketExponent < 0 ? -bucketExponent : 0;
+    // `4^L` shift; clamp keeps at least 1 byte for degenerate zooms (the
+    // 0.05…20.0 camera range ⇒ L ≤ 4 in practice).
+    final int shift = 2 * (levels > 10 ? 10 : levels);
+    return pictureRetentionBaseBytes >> shift;
+  }
+
+  ui.Picture? get(TileKey k) {
+    final _CacheEntry? e = _entries[k];
+    if (e == null) {
+      return null;
+    }
+    _promote(e);
+    return e.picture;
+  }
+
+  /// Non-promoting membership test used by the engine's bake paths.
+  bool contains(TileKey k) => _entries.containsKey(k);
+
+  void put(TileKey k, ui.Picture p) {
+    final _CacheEntry? old = _entries[k];
+    if (old != null) {
+      _drop(old, disposePicture: !identical(old.picture, p));
+    }
+    final _CacheEntry entry =
+        _CacheEntry(k, p, bucket, bytesForBucket(bucket));
+    _entries[k] = entry;
+    _pushHead(entry);
+    _totalBytes += entry.bytes;
+    if (_totalBytes > maxBytes) {
+      while (_totalBytes > evictToBytes && _tail != null) {
+        _drop(_tail!, disposePicture: true);
+      }
+    }
+  }
+
+  void invalidate(TileKey k) {
+    final _CacheEntry? e = _entries[k];
+    if (e != null) {
+      _drop(e, disposePicture: true);
+    }
+  }
+
+  void invalidateAll() {
+    for (final _CacheEntry e in _entries.values) {
+      e.picture.dispose();
+    }
+    _entries.clear();
+    _head = null;
+    _tail = null;
+    _totalBytes = 0;
+    _generation++;
+  }
+
+  int approxBytes() => _totalBytes;
+
+  void _promote(_CacheEntry e) {
+    if (identical(_head, e)) {
+      return;
+    }
+    _unlink(e);
+    _pushHead(e);
+  }
+
+  void _unlink(_CacheEntry e) {
+    final _CacheEntry? p = e.prev;
+    final _CacheEntry? n = e.next;
+    if (p != null) {
+      p.next = n;
+    } else {
+      _head = n;
+    }
+    if (n != null) {
+      n.prev = p;
+    } else {
+      _tail = p;
+    }
+    e.prev = null;
+    e.next = null;
+  }
+
+  void _pushHead(_CacheEntry e) {
+    e.prev = null;
+    e.next = _head;
+    if (_head != null) {
+      _head!.prev = e;
+    } else {
+      _tail = e;
+    }
+    _head = e;
+  }
+
+  void _drop(_CacheEntry e, {required bool disposePicture}) {
+    _unlink(e);
+    if (identical(_entries[e.key], e)) {
+      _entries.remove(e.key);
+    }
+    _totalBytes -= e.bytes;
+    if (disposePicture) {
+      e.picture.dispose();
+    }
+    _generation++;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SpatialRTree (template §5 freeze — in-file classic R-tree, Doc 22 §4)
+// ---------------------------------------------------------------------------
+
+class _RtEntry {
+  _RtEntry(this.node, this.rect);
+
+  final CanvasNodeModel node;
+  final Rect rect;
+
+  _RtLeaf? leaf;
+}
+
+class _RtLeaf {
+  _RtInternal? parent;
+  final List<_RtEntry> entries = <_RtEntry>[];
+  Rect? bbox;
+
+  Rect fit() {
+    Rect? r;
+    for (final _RtEntry e in entries) {
+      r = r == null ? e.rect : r.expandToInclude(e.rect);
+    }
+    bbox = r;
+    return r ?? Rect.zero;
+  }
+}
+
+class _RtInternal {
+  _RtInternal? parent;
+  final List<Object> children = <Object>[]; // _RtLeaf | _RtInternal
+  Rect? bbox;
+
+  Rect fit() {
+    Rect? r;
+    for (final Object c in children) {
+      final Rect? cb = c is _RtLeaf ? c.bbox : (c as _RtInternal).bbox;
+      if (cb == null) {
+        continue;
+      }
+      r = r == null ? cb : r.expandToInclude(cb);
+    }
+    bbox = r;
+    return r ?? Rect.zero;
+  }
+}
+
+/// In-file classic R-tree over [CanvasNodeModel]: leaf/internal nodes with
+/// capacity 8, sorted mid-split bulk load, bbox search with `Rect.overlaps`,
+/// `remove(nodeId)` via an id lookup table (template §5 / Doc 22 §4).
+class SpatialRTree {
+  SpatialRTree();
+
+  static const int capacity = 8;
+
+  Object? _root; // _RtLeaf | _RtInternal | null
+  final Map<String, _RtEntry> _byId = <String, _RtEntry>{};
+
+  /// Sorted mid-split bulk load: sort by bbox center x, split at the midpoint
+  /// of the longer axis, each half ≈ n/2 (Doc 22 §4). Replaces all contents.
+  void bulkLoad(List<CanvasNodeModel> nodes) {
+    clear();
+    if (nodes.isEmpty) {
+      return;
+    }
+    final List<_RtEntry> entries = <_RtEntry>[];
+    for (final CanvasNodeModel n in nodes) {
+      final _RtEntry e = _RtEntry(n, _rectOfNode(n));
+      entries.add(e);
+      _byId[n.nodeId] = e;
+    }
+    entries.sort((_RtEntry a, _RtEntry b) =>
+        a.rect.center.dx.compareTo(b.rect.center.dx));
+    _root = _build(entries, 0, entries.length);
+  }
+
+  void insert(CanvasNodeModel n) {
+    remove(n.nodeId); // id table stays unique — replace semantics
+    final _RtEntry entry = _RtEntry(n, _rectOfNode(n));
+    _byId[n.nodeId] = entry;
+    if (_root == null) {
+      final _RtLeaf leaf = _RtLeaf()..entries.add(entry);
+      leaf.fit();
+      entry.leaf = leaf;
+      _root = leaf;
+      return;
+    }
+    Object node = _root!;
+    while (node is _RtInternal) {
+      node = _chooseChild(node, entry.rect);
+    }
+    final _RtLeaf leaf = node as _RtLeaf;
+    leaf.entries.add(entry);
+    entry.leaf = leaf;
+    _refit(leaf);
+    _splitOverflow(leaf);
+  }
+
+  void remove(String nodeId) {
+    final _RtEntry? entry = _byId.remove(nodeId);
+    if (entry == null) {
+      return;
+    }
+    final _RtLeaf? leaf = entry.leaf;
+    if (leaf == null) {
+      return;
+    }
+    leaf.entries.remove(entry);
+    entry.leaf = null;
+    _prune(leaf);
+  }
+
+  /// bbox search with `Rect.overlaps` pruning (Doc 22 §4). Result order is
+  /// unspecified; consumers compare id sets or sort by layer themselves.
+  List<CanvasNodeModel> query(Rect worldRect) {
+    final List<CanvasNodeModel> out = <CanvasNodeModel>[];
+    if (_root == null) {
+      return out;
+    }
+    final List<Object> stack = <Object>[_root!];
+    while (stack.isNotEmpty) {
+      final Object node = stack.removeLast();
+      if (node is _RtLeaf) {
+        final Rect? bb = node.bbox;
+        if (bb == null || !bb.overlaps(worldRect)) {
+          continue;
+        }
+        for (final _RtEntry e in node.entries) {
+          if (e.rect.overlaps(worldRect)) {
+            out.add(e.node);
+          }
+        }
+      } else if (node is _RtInternal) {
+        final Rect? bb = node.bbox;
+        if (bb == null || !bb.overlaps(worldRect)) {
+          continue;
+        }
+        stack.addAll(node.children);
+      }
+    }
+    return out;
+  }
+
+  /// Drop every entry (document switch, Doc 22 §4 "clear … tree").
+  void clear() {
+    _root = null;
+    _byId.clear();
+  }
+
+  Object _build(List<_RtEntry> entries, int start, int end) {
+    final int count = end - start;
+    if (count <= capacity) {
+      final _RtLeaf leaf = _RtLeaf();
+      for (int i = start; i < end; i++) {
+        leaf.entries.add(entries[i]);
+        entries[i].leaf = leaf;
+      }
+      leaf.fit();
+      return leaf;
+    }
+    // Mid-split on the longer axis; halves ≈ n/2 (Doc 22 §4).
+    final Rect span = _spanOf(entries, start, end);
+    final bool byX = span.width >= span.height;
+    final List<_RtEntry> sorted = entries.sublist(start, end);
+    sorted.sort((_RtEntry a, _RtEntry b) {
+      final double ca = byX ? a.rect.center.dx : a.rect.center.dy;
+      final double cb = byX ? b.rect.center.dx : b.rect.center.dy;
+      return ca.compareTo(cb);
+    });
+    for (int i = 0; i < sorted.length; i++) {
+      entries[start + i] = sorted[i];
+    }
+    final int mid = start + count ~/ 2;
+    final Object left = _build(entries, start, mid);
+    final Object right = _build(entries, mid, end);
+    final _RtInternal internal = _RtInternal();
+    internal.children.addAll(<Object>[left, right]);
+    if (left is _RtLeaf) {
+      left.parent = internal;
+    } else {
+      (left as _RtInternal).parent = internal;
+    }
+    if (right is _RtLeaf) {
+      right.parent = internal;
+    } else {
+      (right as _RtInternal).parent = internal;
+    }
+    internal.fit();
+    return internal;
+  }
+
+  static Rect _spanOf(List<_RtEntry> entries, int start, int end) {
+    Rect? r;
+    for (int i = start; i < end; i++) {
+      r = r == null ? entries[i].rect : r.expandToInclude(entries[i].rect);
+    }
+    return r ?? Rect.zero;
+  }
+
+  Object _chooseChild(_RtInternal node, Rect r) {
+    Object best = node.children.first;
+    double bestEnlargement = double.infinity;
+    double bestArea = double.infinity;
+    for (final Object c in node.children) {
+      final Rect? cb = c is _RtLeaf ? c.bbox : (c as _RtInternal).bbox;
+      if (cb == null) {
+        continue;
+      }
+      final double enlargement =
+          cb.expandToInclude(r).width * cb.expandToInclude(r).height -
+              cb.width * cb.height;
+      final double area = cb.width * cb.height;
+      if (enlargement < bestEnlargement ||
+          (enlargement == bestEnlargement && area < bestArea)) {
+        best = c;
+        bestEnlargement = enlargement;
+        bestArea = area;
+      }
+    }
+    return best;
+  }
+
+  void _refit(Object node) {
+    Object? cur = node;
+    while (cur != null) {
+      if (cur is _RtLeaf) {
+        cur.fit();
+        cur = cur.parent;
+      } else if (cur is _RtInternal) {
+        cur.fit();
+        cur = cur.parent;
+      } else {
+        break;
+      }
+    }
+  }
+
+  /// Sorted mid-split on overflow with upward propagation (Doc 22 §4): the
+  /// overflowing node hands half its items to a new sibling, the sibling is
+  /// inserted beside it under the same parent (parent count +1), and the
+  /// parent is re-fit — repeating while it also overflows. A splitting root
+  /// becomes a two-child internal root.
+  void _splitOverflow(Object node) {
+    Object? cur = node;
+    while (cur != null) {
+      if (!_overflows(cur)) {
+        return;
+      }
+      final Object sibling = _splitNode(cur);
+      final _RtInternal? parent = _parentOf(cur);
+      if (parent == null) {
+        final _RtInternal wrapper = _RtInternal();
+        wrapper.children.addAll(<Object>[cur, sibling]);
+        _setParent(cur, wrapper);
+        _setParent(sibling, wrapper);
+        _root = wrapper;
+        return;
+      }
+      _setParent(sibling, parent);
+      final int idx = parent.children.indexOf(cur);
+      parent.children
+          .insert(idx >= 0 ? idx + 1 : parent.children.length, sibling);
+      _refit(parent);
+      cur = parent;
+    }
+  }
+
+  /// Splits [cur] at the midpoint of its longer axis (sorted mid-split,
+  /// halves ≈ n/2) and returns the new sibling half.
+  Object _splitNode(Object cur) {
+    if (cur is _RtLeaf) {
+      final int count = cur.entries.length;
+      final Rect span = cur.fit();
+      final bool byX = span.width >= span.height;
+      cur.entries.sort((_RtEntry a, _RtEntry b) {
+        final double ca = byX ? a.rect.center.dx : a.rect.center.dy;
+        final double cb = byX ? b.rect.center.dx : b.rect.center.dy;
+        return ca.compareTo(cb);
+      });
+      final int mid = count ~/ 2;
+      final _RtLeaf sibling = _RtLeaf();
+      final List<_RtEntry> moved = cur.entries.sublist(mid);
+      cur.entries.removeRange(mid, count);
+      for (final _RtEntry e in moved) {
+        sibling.entries.add(e);
+        e.leaf = sibling;
+      }
+      cur.fit();
+      sibling.fit();
+      return sibling;
+    }
+    if (cur is _RtInternal) {
+      final int count = cur.children.length;
+      final Rect span = cur.fit();
+      final bool byX = span.width >= span.height;
+      Rect childRect(Object c) => c is _RtLeaf
+          ? (c.bbox ?? Rect.zero)
+          : ((c as _RtInternal).bbox ?? Rect.zero);
+      cur.children.sort((Object a, Object b) {
+        final Rect ra = childRect(a);
+        final Rect rb = childRect(b);
+        final double ca = byX ? ra.center.dx : ra.center.dy;
+        final double cb = byX ? rb.center.dx : rb.center.dy;
+        return ca.compareTo(cb);
+      });
+      final int mid = count ~/ 2;
+      final _RtInternal sibling = _RtInternal();
+      final List<Object> moved = cur.children.sublist(mid);
+      cur.children.removeRange(mid, count);
+      for (final Object c in moved) {
+        sibling.children.add(c);
+        _setParent(c, sibling);
+      }
+      cur.fit();
+      sibling.fit();
+      return sibling;
+    }
+    return cur;
+  }
+
+  static bool _overflows(Object node) {
+    if (node is _RtLeaf) {
+      return node.entries.length > capacity;
+    }
+    if (node is _RtInternal) {
+      return node.children.length > capacity;
+    }
+    return false;
+  }
+
+  static _RtInternal? _parentOf(Object node) {
+    if (node is _RtLeaf) {
+      return node.parent;
+    }
+    if (node is _RtInternal) {
+      return node.parent;
+    }
+    return null;
+  }
+
+  static void _setParent(Object node, _RtInternal parent) {
+    if (node is _RtLeaf) {
+      node.parent = parent;
+    } else if (node is _RtInternal) {
+      node.parent = parent;
+    }
+  }
+
+  void _prune(_RtLeaf leaf) {
+    if (leaf.entries.isNotEmpty) {
+      _refit(leaf);
+      return;
+    }
+    if (identical(_root, leaf)) {
+      _root = null;
+      return;
+    }
+    final _RtInternal? parent = leaf.parent;
+    leaf.parent = null;
+    if (parent != null) {
+      parent.children.remove(leaf);
+      _pruneInternal(parent);
+    }
+  }
+
+  /// Removes now-empty internal nodes bottom-up and re-fits the surviving
+  /// ancestor chain.
+  void _pruneInternal(_RtInternal? node) {
+    _RtInternal? cur = node;
+    while (cur != null && cur.children.isEmpty) {
+      if (identical(_root, cur)) {
+        _root = null;
+        return;
+      }
+      final _RtInternal? up = cur.parent;
+      up?.children.remove(cur);
+      cur.parent = null;
+      cur = up;
+    }
+    if (cur != null) {
+      _refit(cur);
+    }
+  }
+}
+
+Rect _rectOfNode(CanvasNodeModel n) => Rect.fromLTRB(
+      n.bbox[0],
+      n.bbox[1],
+      n.bbox[2],
+      n.bbox[3],
+    );
+
+// ---------------------------------------------------------------------------
+// TiledCanvasEngine (template §5 freeze)
+// ---------------------------------------------------------------------------
+
+/// Event-driven tile rebake core (Doc 22 §4): [setDocument] bulk-loads the
+/// document, [addCommitted] indexes a stroke and rebakes only the tiles its
+/// bbox intersects (≤ 4 per normal commit), [queryVisible] culls the static
+/// layer.
+class TiledCanvasEngine {
+  /// Doc 22 §4 freeze shape `TiledCanvasEngine({required CameraController
+  /// camera})`; see the library doc for the Wave 1.B structural typing note —
+  /// the object must expose `double scale` (Doc 20's camera).
+  TiledCanvasEngine({required this.camera});
+
+  final TileCache cache = TileCache();
+
+  /// Structural camera (Doc 20): only `scale` is read.
+  final dynamic camera;
+
+  final SpatialRTree _tree = SpatialRTree();
+  final Map<TileKey, int> _bakedBucket = <TileKey, int>{};
+  final Set<TileKey> _dirty = <TileKey>{};
+  int _rebakeCount = 0;
+  Rect? _lastViewport;
+
+  /// Per-operation rebake counter, reset at op start — the ≤4-tiles-per-
+  /// commit assertion hook (Doc 22 §4, `@visibleForTesting`).
+  @visibleForTesting
+  int get rebakeCount => _rebakeCount;
+
+  /// Current zoom-bucket exponent of the camera (Doc 22 §4).
+  int get currentBucket => bucketExponentForScale(currentScale);
+
+  /// Camera scale from the structural camera; 1.0 when unavailable.
+  double get currentScale {
+    final dynamic c = camera;
+    if (c == null) {
+      return 1.0;
+    }
+    final dynamic s = c.scale;
+    return s is num ? s.toDouble() : 1.0;
+  }
+
+  /// Zoom-bucket exponent a cached picture was baked at (`null` = uncached).
+  int? bakedBucketOf(TileKey k) => _bakedBucket[k];
+
+  /// Clear cache + tree, bulk-load `doc.elements`, then bake every tile
+  /// containing a node plus the 5×5 hot window (Doc 22 §5 step 5).
+  void setDocument(CanvasDocumentModel doc) {
+    _rebakeCount = 0;
+    cache.invalidateAll();
+    _bakedBucket.clear();
+    _tree.bulkLoad(doc.elements);
+    final int bucket = currentBucket;
+    for (final CanvasNodeModel n in doc.elements) {
+      for (final TileKey k in tilesCovering(_rectOfNode(n))) {
+        _bakeAndStore(k, bucket);
+      }
+    }
+    final Rect hot = _lastViewport ?? _unionOf(doc.elements) ?? Rect.fromLTWH(0, 0, tileSize, tileSize);
+    _lastViewport ??= hot;
+    _bakeWindow(hot, bucket);
+  }
+
+  /// Index a committed stroke (Doc 21) and rebake exactly its dirty tiles.
+  ///
+  /// Structural input: an object exposing `bbox` and `toRpcPayload()`
+  /// (Doc 21's `ProcessedStroke`); see the library doc.
+  void addCommitted(dynamic s) {
+    _rebakeCount = 0;
+    final dynamic payload = s.toRpcPayload();
+    final CanvasNodeModel node = CanvasNodeModel.fromJson(
+      Map<String, dynamic>.from(payload as Map),
+    );
+    _tree.remove(node.nodeId);
+    _tree.insert(node);
+    markDirtyFor(s);
+  }
+
+  /// Compute the tiles intersecting `s.bbox` and rebake that dirty set only
+  /// (Doc 22 §4 `markDirtyFor`).
+  void markDirtyFor(dynamic s) {
+    _rebakeCount = 0;
+    final dynamic b = s.bbox;
+    final Rect r = Rect.fromLTRB(
+      (b[0] as num).toDouble(),
+      (b[1] as num).toDouble(),
+      (b[2] as num).toDouble(),
+      (b[3] as num).toDouble(),
+    );
+    _dirty
+      ..clear()
+      ..addAll(tilesCovering(r));
+    final int bucket = currentBucket;
+    for (final TileKey k in _dirty) {
+      _bakeAndStore(k, bucket, force: true);
+    }
+  }
+
+  /// Static-layer culling: [SpatialRTree.query] overlap filter, paint order
+  /// by layer (Doc 22 §5 step 8).
+  List<CanvasNodeModel> queryVisible(Rect worldRect) {
+    final List<CanvasNodeModel> nodes = _tree.query(worldRect);
+    nodes.sort((CanvasNodeModel a, CanvasNodeModel b) =>
+        a.layer.compareTo(b.layer));
+    return nodes;
+  }
+
+  /// Eagerly bake the 5×5 tile window centered on [worldViewport]'s tile;
+  /// misses/stale-bucket tiles fall back to a synchronous bake (Doc 22 §4).
+  void bakeVisible(Rect worldViewport) {
+    _rebakeCount = 0;
+    _lastViewport = worldViewport;
+    _bakeWindow(worldViewport, currentBucket);
+  }
+
+  /// Re-bake the hot window at the new zoom bucket after a bucket-boundary
+  /// zoom; the bucket storm wipes stale pictures first (Doc 22 §4).
+  void onScaleBucketChanged() {
+    _rebakeCount = 0;
+    cache.invalidateAll();
+    _bakedBucket.clear();
+    final Rect hot =
+        _lastViewport ?? Rect.fromLTWH(0, 0, tileSize, tileSize);
+    _bakeWindow(hot, currentBucket);
+  }
+
+  /// Synchronous get-path: cached picture at the current bucket, otherwise a
+  /// single-tile bake (Doc 22 §4 "misses fall back to synchronous
+  /// single-tile bake in the get-path").
+  ui.Picture getTile(TileKey k) => _bakeAndStore(k, currentBucket);
+
+  /// Tiles whose interior intersects [r] — degenerate right/bottom edges
+  /// sitting exactly on a tile boundary do not spill into the next tile.
+  Set<TileKey> tilesCovering(Rect r) {
+    int x0 = (r.left / tileSize).floor();
+    int x1 = (r.right / tileSize).floor();
+    if (x1 > x0 && r.right == x1 * tileSize) {
+      x1 -= 1;
+    }
+    int y0 = (r.top / tileSize).floor();
+    int y1 = (r.bottom / tileSize).floor();
+    if (y1 > y0 && r.bottom == y1 * tileSize) {
+      y1 -= 1;
+    }
+    final Set<TileKey> out = <TileKey>{};
+    for (int tx = x0; tx <= x1; tx++) {
+      for (int ty = y0; ty <= y1; ty++) {
+        out.add(TileKey(tx, ty));
+      }
+    }
+    return out;
+  }
+
+  ui.Picture _bakeAndStore(TileKey k, int bucket, {bool force = false}) {
+    if (!force) {
+      final int? baked = _bakedBucket[k];
+      if (baked == bucket && cache.contains(k)) {
+        final ui.Picture? hit = cache.get(k);
+        if (hit != null) {
+          return hit;
+        }
+      }
+    }
+    final ui.Picture picture = _bakeTile(k, bucket);
+    cache.bucket = bucket;
+    cache.put(k, picture);
+    _bakedBucket[k] = bucket;
+    _rebakeCount++;
+    return picture;
+  }
+
+  void _bakeWindow(Rect worldViewport, int bucket) {
+    final Offset c = worldViewport.center;
+    final TileKey center = TileKey.forPoint(c.dx, c.dy);
+    for (int dy = -2; dy <= 2; dy++) {
+      for (int dx = -2; dx <= 2; dx++) {
+        _bakeAndStore(TileKey(center.tx + dx, center.ty + dy), bucket);
+      }
+    }
+  }
+
+  /// Record the tile's nodes scaled by the bucket factor `b` into a
+  /// `ui.Picture` (Doc 22 §4 "bake core"): clip to the tile, translate to
+  /// tile-local world coords, scale so ≈1 device px per world unit at that
+  /// zoom, replay nodes in layer order.
+  ui.Picture _bakeTile(TileKey k, int bucket) {
+    final ui.PictureRecorder recorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(recorder);
+    final Rect origin = k.worldRect;
+    canvas.save();
+    canvas.scale(bucketFactorForExponent(bucket));
+    canvas.translate(-origin.left, -origin.top);
+    canvas.clipRect(Rect.fromLTWH(0, 0, tileSize, tileSize));
+    final List<CanvasNodeModel> nodes = _tree.query(origin);
+    nodes.sort((CanvasNodeModel a, CanvasNodeModel b) =>
+        a.layer.compareTo(b.layer));
+    for (final CanvasNodeModel n in nodes) {
+      _drawNode(canvas, n);
+    }
+    canvas.restore();
+    return recorder.endRecording();
+  }
+
+  static Rect? _unionOf(List<CanvasNodeModel> nodes) {
+    if (nodes.isEmpty) {
+      return null;
+    }
+    Rect out = _rectOfNode(nodes.first);
+    for (int i = 1; i < nodes.length; i++) {
+      out = out.expandToInclude(_rectOfNode(nodes[i]));
+    }
+    return out;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Node rasterization (Doc 22 §4 bake core / Doc 03 element semantics)
+// ---------------------------------------------------------------------------
+
+final RegExp _hexColorPattern = RegExp(r'^[0-9a-fA-F]+$');
+
+Color _colorFrom(String hex, double opacity) {
+  final String digits = hex.startsWith('#') ? hex.substring(1) : hex;
+  int argb;
+  if (digits.length == 6 && _hexColorPattern.hasMatch(digits)) {
+    argb = 0xFF000000 | int.parse(digits, radix: 16);
+  } else if (digits.length == 8 && _hexColorPattern.hasMatch(digits)) {
+    argb = int.parse(digits, radix: 16);
+  } else {
+    argb = 0xFF1E1E1E;
+  }
+  final int baseAlpha = (argb >> 24) & 0xFF;
+  final double o = opacity.clamp(0.0, 1.0).toDouble();
+  final int alpha = (baseAlpha * o).round().clamp(0, 255).toInt();
+  return Color((alpha << 24) | (argb & 0x00FFFFFF));
+}
+
+void _drawNode(Canvas canvas, CanvasNodeModel n) {
+  final Paint paint = _paintFor(n);
+  final List<List<double>> pts = n.geometry.pts;
+  switch (n.kind) {
+    case 'SHAPE':
+      _drawShape(canvas, n, pts, paint);
+    case 'IMAGE':
+      canvas.drawRect(_rectOfNode(n), paint);
+    default:
+      _drawPolyline(canvas, pts, paint);
+  }
+}
+
+void _drawShape(
+  Canvas canvas,
+  CanvasNodeModel n,
+  List<List<double>> pts,
+  Paint paint,
+) {
+  final Rect r = _rectOfNode(n);
+  final String? shapeType = n.geometry.shapeType;
+  switch (shapeType) {
+    case 'RECT':
+      canvas.drawRect(r, paint);
+    case 'CIRCLE':
+      canvas.drawOval(r, paint);
+    default:
+      if (pts.length < 2) {
+        canvas.drawRect(r, paint);
+        return;
+      }
+      final Path path = Path()
+        ..moveTo(pts[0][0], pts[0][1]);
+      for (int i = 1; i < pts.length; i++) {
+        if (pts[i].length < 2) {
+          continue;
+        }
+        path.lineTo(pts[i][0], pts[i][1]);
+      }
+      if (shapeType == 'TRIANGLE') {
+        path.close();
+      }
+      canvas.drawPath(path, paint);
+  }
+}
+
+void _drawPolyline(Canvas canvas, List<List<double>> pts, Paint paint) {
+  if (pts.isEmpty) {
+    return;
+  }
+  if (pts.length == 1 && pts[0].length >= 2) {
+    canvas.drawCircle(
+      Offset(pts[0][0], pts[0][1]),
+      paint.strokeWidth / 2,
+      paint,
+    );
+    return;
+  }
+  final Path path = Path();
+  bool moved = false;
+  for (final List<double> p in pts) {
+    if (p.length < 2) {
+      continue;
+    }
+    if (!moved) {
+      path.moveTo(p[0], p[1]);
+      moved = true;
+    } else {
+      path.lineTo(p[0], p[1]);
+    }
+  }
+  if (moved) {
+    canvas.drawPath(path, paint);
+  }
+}
+
+Paint _paintFor(CanvasNodeModel n) {
+  final Paint paint = Paint()
+    ..isAntiAlias = true
+    ..style = PaintingStyle.stroke
+    ..strokeCap = StrokeCap.round
+    ..strokeJoin = StrokeJoin.round
+    ..strokeWidth = n.style.strokeWidth > 0 ? n.style.strokeWidth : 2.0
+    ..blendMode = n.style.blendMode == 'MULTIPLY'
+        ? BlendMode.multiply
+        : BlendMode.srcOver
+    ..color = _colorFrom(n.style.color, n.style.opacity);
+  return paint;
+}
+
+// ---------------------------------------------------------------------------
+// Rendering (Doc 22 §4 "Rendering (dual-layer widget)")
+// ---------------------------------------------------------------------------
+
+/// Inverse-transform the canvas corners back to world space so the painter
+/// knows which tiles are on screen (Doc 22 "worldRectOfViewport").
+Rect _worldRectOfViewport(Matrix4 viewMatrix, Size size) {
+  final Matrix4 inverse = viewMatrix.clone();
+  inverse.invert();
+  final Float64List s = inverse.storage;
+  Offset apply(Offset p) =>
+      Offset(s[0] * p.dx + s[4] * p.dy + s[12], s[1] * p.dx + s[5] * p.dy + s[13]);
+  final Rect out = Rect.fromPoints(
+    apply(Offset.zero),
+    apply(Offset(size.width, size.height)),
+  );
+  return out.isFinite ? out : Rect.zero;
+}
+
+/// Draw every visible tile picture under the current transform. Each picture
+/// was recorded as `(world − tileOrigin) × b`, so replaying it with
+/// `translate(origin) · scale(1/b)` under `viewMatrix` yields the net
+/// `scale/b` correction of Doc 22 §4 — a zoom step inside one bucket needs no
+/// re-bake.
+void _paintTiles(
+  Canvas canvas,
+  Size size,
+  TiledCanvasEngine engine,
+  Matrix4 viewMatrix,
+  double scale,
+) {
+  final Rect world = _worldRectOfViewport(viewMatrix, size);
+  final int fallbackBucket = bucketExponentForScale(scale);
+  for (final TileKey k in engine.tilesCovering(world)) {
+    final ui.Picture picture = engine.getTile(k);
+    canvas.save();
+    canvas.transform(viewMatrix.storage);
+    final Rect tileRect = k.worldRect;
+    canvas.translate(tileRect.left, tileRect.top);
+    final int baked = engine.bakedBucketOf(k) ?? fallbackBucket;
+    canvas.scale(1.0 / bucketFactorForExponent(baked));
+    canvas.drawPicture(picture);
+    canvas.restore();
+  }
+}
+
+/// Live/in-flight stroke layer (Doc 21 points) — never triggers rebakes.
+void _paintLiveStroke(
+  Canvas canvas,
+  Matrix4 viewMatrix,
+  List<Offset> points,
+  Color color,
+  double width,
+  double opacity,
+) {
+  if (points.isEmpty) {
+    return;
+  }
+  final Paint paint = Paint()
+    ..isAntiAlias = true
+    ..style = PaintingStyle.stroke
+    ..strokeCap = StrokeCap.round
+    ..strokeJoin = StrokeJoin.round
+    ..strokeWidth = width > 0 ? width : 2.5
+    ..color = color.withValues(alpha: opacity.clamp(0.0, 1.0).toDouble());
+  canvas.save();
+  canvas.transform(viewMatrix.storage);
+  if (points.length == 1) {
+    canvas.drawCircle(points.first, paint.strokeWidth / 2, paint);
+  } else {
+    final Path path = Path()..moveTo(points.first.dx, points.first.dy);
+    for (int i = 1; i < points.length; i++) {
+      path.lineTo(points[i].dx, points[i].dy);
+    }
+    canvas.drawPath(path, paint);
+  }
+  canvas.restore();
+}
+
+/// Combined `CustomPainter`: static tiles + optional foreground live stroke,
+/// RepaintBoundary-friendly (Doc 22 / Wave 1.B subagent brief).
+class TiledCanvasPainter extends CustomPainter {
+  TiledCanvasPainter({
+    required this.engine,
+    required this.viewMatrix,
+    required this.scale,
+    this.livePoints = const <Offset>[],
+    this.liveColor = const Color(0xFF1E1E1E),
+    this.liveWidth = 2.5,
+    this.liveOpacity = 1.0,
+    super.repaint,
+  }) : generation = engine.cache.generation;
+
+  final TiledCanvasEngine engine;
+  final Matrix4 viewMatrix;
+  final double scale;
+  final List<Offset> livePoints;
+  final Color liveColor;
+  final double liveWidth;
+  final double liveOpacity;
+
+  /// Tile-cache generation captured at construction (Doc 22 §4:
+  /// `shouldRepaint` compares engine/tile generations).
+  final int generation;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    _paintTiles(canvas, size, engine, viewMatrix, scale);
+    _paintLiveStroke(
+      canvas,
+      viewMatrix,
+      livePoints,
+      liveColor,
+      liveWidth,
+      liveOpacity,
+    );
+  }
+
+  @override
+  bool shouldRepaint(TiledCanvasPainter oldDelegate) =>
+      oldDelegate.engine != engine ||
+      oldDelegate.generation != generation ||
+      oldDelegate.scale != scale ||
+      !listEquals(oldDelegate.viewMatrix.storage, viewMatrix.storage) ||
+      !listEquals(oldDelegate.livePoints, livePoints) ||
+      oldDelegate.liveColor != liveColor ||
+      oldDelegate.liveWidth != liveWidth ||
+      oldDelegate.liveOpacity != liveOpacity;
+}
+
+/// Static half of the dual-layer split: only baked tiles (Doc 22 §4).
+class StaticTilePainter extends CustomPainter {
+  StaticTilePainter({
+    required this.engine,
+    required this.viewMatrix,
+    required this.scale,
+    super.repaint,
+  }) : generation = engine.cache.generation;
+
+  final TiledCanvasEngine engine;
+  final Matrix4 viewMatrix;
+  final double scale;
+  final int generation;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    _paintTiles(canvas, size, engine, viewMatrix, scale);
+  }
+
+  @override
+  bool shouldRepaint(StaticTilePainter oldDelegate) =>
+      oldDelegate.engine != engine ||
+      oldDelegate.generation != generation ||
+      oldDelegate.scale != scale ||
+      !listEquals(oldDelegate.viewMatrix.storage, viewMatrix.storage);
+}
+
+/// Foreground half of the dual-layer split: only live strokes (Doc 21
+/// `livePoints` + Doc 24 previews); never triggers tile rebakes.
+class ForegroundStrokePainter extends CustomPainter {
+  const ForegroundStrokePainter({
+    required this.viewMatrix,
+    this.points = const <Offset>[],
+    this.color = const Color(0xFF1E1E1E),
+    this.width = 2.5,
+    this.opacity = 1.0,
+    super.repaint,
+  });
+
+  final Matrix4 viewMatrix;
+  final List<Offset> points;
+  final Color color;
+  final double width;
+  final double opacity;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    _paintLiveStroke(canvas, viewMatrix, points, color, width, opacity);
+  }
+
+  @override
+  bool shouldRepaint(ForegroundStrokePainter oldDelegate) =>
+      !listEquals(oldDelegate.points, points) ||
+      oldDelegate.color != color ||
+      oldDelegate.width != width ||
+      oldDelegate.opacity != opacity ||
+      !listEquals(oldDelegate.viewMatrix.storage, viewMatrix.storage);
+}
+
+/// Dual-layer view (Doc 22 §4): static tiles and live strokes sit in
+/// separate [RepaintBoundary] layers so stroke ticks never repaint tiles and
+/// tile bakes never repaint strokes.
+class TiledCanvasView extends StatefulWidget {
+  const TiledCanvasView({
+    super.key,
+    required this.engine,
+    required this.viewMatrix,
+    required this.scale,
+    this.livePoints = const <Offset>[],
+    this.liveColor = const Color(0xFF1E1E1E),
+    this.liveWidth = 2.5,
+    this.liveOpacity = 1.0,
+    this.repaint,
+  });
+
+  final TiledCanvasEngine engine;
+  final Matrix4 viewMatrix;
+  final double scale;
+  final List<Offset> livePoints;
+  final Color liveColor;
+  final double liveWidth;
+  final double liveOpacity;
+
+  /// Typically the camera's change hook (Doc 20 `onCameraChanged`).
+  final Listenable? repaint;
+
+  @override
+  State<TiledCanvasView> createState() => _TiledCanvasViewState();
+}
+
+class _TiledCanvasViewState extends State<TiledCanvasView> {
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      // Non-directional alignment keeps the view free of a Directionality
+      // dependency (pure drawing widget).
+      alignment: Alignment.topLeft,
+      fit: StackFit.expand,
+      children: [
+        RepaintBoundary(
+          child: CustomPaint(
+            painter: StaticTilePainter(
+              engine: widget.engine,
+              viewMatrix: widget.viewMatrix,
+              scale: widget.scale,
+              repaint: widget.repaint,
+            ),
+          ),
+        ),
+        RepaintBoundary(
+          child: CustomPaint(
+            painter: ForegroundStrokePainter(
+              viewMatrix: widget.viewMatrix,
+              points: widget.livePoints,
+              color: widget.liveColor,
+              width: widget.liveWidth,
+              opacity: widget.liveOpacity,
+              repaint: widget.repaint,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}

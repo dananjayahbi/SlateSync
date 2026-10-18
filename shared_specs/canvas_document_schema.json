@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "shared_specs/canvas_document_schema.json",
+  "title": "SlateSync Canvas Document",
+  "description": "Locked .slatesync document.json body (overview §4.3). All document keys snake_case.",
+  "type": "object",
+  "required": ["canvas_id", "title", "created_at", "updated_at", "artboard", "content_bounds", "elements"],
+  "properties": {
+    "canvas_id": {"type": "string", "description": "uuid-v4"},
+    "title": {"type": "string"},
+    "created_at": {"type": "integer", "description": "unix seconds"},
+    "updated_at": {"type": "integer", "description": "unix seconds"},
+    "artboard": {"$ref": "#/$defs/Artboard"},
+    "content_bounds": {"$ref": "#/$defs/ContentBounds"},
+    "elements": {"type": "array", "items": {"$ref": "#/$defs/Element"}}
+  },
+  "$defs": {
+    "Artboard": {
+      "description": "Page frame in 300-DPI world units; top-left origin (0,0) -> (w,h); INFINITE keeps width/height null.",
+      "type": "object",
+      "required": ["preset", "width", "height", "is_infinite", "background_style", "background_color"],
+      "properties": {
+        "preset": {"enum": ["A5", "A4", "LETTER", "INFINITE"]},
+        "width": {"type": ["number", "null"], "description": "A5 1748.0 | A4 2480.0 | LETTER 2550.0 | null if INFINITE"},
+        "height": {"type": ["number", "null"], "description": "A5 2480.0 | A4 3508.0 | LETTER 3300.0 | null if INFINITE"},
+        "is_infinite": {"type": "boolean"},
+        "background_style": {"enum": ["BLANK", "RULED", "DOT_GRID", "ISO_GRID"]},
+        "background_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"}
+      }
+    },
+    "ContentBounds": {
+      "description": "Union of all element bboxes recomputed after every mutation; empty document => all zeros (owners: PC Doc 09, Dart Docs 22+23).",
+      "type": "object",
+      "required": ["min_x", "min_y", "max_x", "max_y"],
+      "properties": {"min_x": {"type": "number"}, "min_y": {"type": "number"},
+                     "max_x": {"type": "number"}, "max_y": {"type": "number"}}
+    },
+    "NodeStyle": {
+      "description": "Per-element paint settings (mirror: template §4 NodeStyle / Dart NodeStyleModel).",
+      "type": "object",
+      "required": ["color", "stroke_width", "opacity", "blend_mode"],
+      "properties": {
+        "color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+        "stroke_width": {"type": "number", "minimum": 0},
+        "opacity": {"type": "number", "minimum": 0, "maximum": 1},
+        "blend_mode": {"enum": ["SRC_OVER", "MULTIPLY"]}
+      }
+    },
+    "NodeGeometry": {
+      "description": "Point list plus kind-specific fields; unused fields are null (mirror: template §4 NodeGeometry / Dart NodeGeometryModel).",
+      "type": "object",
+      "required": ["pts"],
+      "properties": {
+        "pts": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+                "description": "world-space points/Bézier controls; empty for IMAGE elements"},
+        "shape_type": {"enum": ["RECT", "CIRCLE", "TRIANGLE", "ARROW", "CARTESIAN_2D", "NUMBER_LINE", null],
+                       "description": "set for SHAPE/GRAPH_AXES, else null"},
+        "graph_config": {"type": ["object", "null"],
+          "properties": {"origin": {"type": "array", "items": {"type": "number"}},
+                         "x_range": {"type": "array", "items": {"type": "number"}},
+                         "y_range": {"type": "array", "items": {"type": "number"}},
+                         "grid_step": {"type": "number"}, "show_labels": {"type": "boolean"}}},
+        "asset_ref": {"type": ["string", "null"], "pattern": "^assets/",
+                      "description": "ZIP entry path of the attached file, e.g. assets/img_9921.png"}
+      }
+    },
+    "Element": {
+      "description": "One vector node (overview §4.3); kind selects how geometry is interpreted.",
+      "type": "object",
+      "required": ["node_id", "kind", "layer", "bbox", "style", "geometry"],
+      "properties": {
+        "node_id": {"type": "string", "description": "uuid per node"},
+        "kind": {"enum": ["STROKE", "HIGHLIGHT", "LINE", "SHAPE", "GRAPH_AXES", "IMAGE"]},
+        "layer": {"type": "integer"},
+        "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
+                 "description": "[min_x, min_y, max_x, max_y] world units"},
+        "style": {"$ref": "#/$defs/NodeStyle"},
+        "geometry": {"$ref": "#/$defs/NodeGeometry"}
+      }
+    }
+  },
+  "x_presets": {"origin": "top_left_0_0", "units": "world_units_at_300_dpi",
+    "A5": {"width": 1748.0, "height": 2480.0}, "A4": {"width": 2480.0, "height": 3508.0},
+    "LETTER": {"width": 2550.0, "height": 3300.0}, "INFINITE": {"width": null, "height": null}},
+  "x_upgrade_rule": "ALLOW = (target == \"INFINITE\") OR (content_bounds.min_x >= 0 AND content_bounds.min_y >= 0 AND content_bounds.max_x <= target.width AND content_bounds.max_y <= target.height)",
+  "x_content_bounds_rule": "union of element bboxes after every mutation; empty document => {min_x:0,min_y:0,max_x:0,max_y:0}",
+  "x_container": ".slatesync = ZIP: document.json (this schema) + assets/*"
+}

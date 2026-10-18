@@ -1,0 +1,506 @@
+"""Doc 11 tests — ``docs/micro/11_pc_websocket_stream_server.md`` §6.
+
+Hermetic by construction: loopback host, ephemeral port (``ws_port=0``),
+token stub, real ``EventBus`` wired to thread-safe recorders; the fixture
+teardown stops every server so no bound port or thread leaks across the suite.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import threading
+import time
+from collections.abc import Callable
+from typing import Any
+
+import pytest
+import websockets
+from websockets.exceptions import ConnectionClosed
+
+from pc_agent.core.config_manager import AppConfig
+from pc_agent.core.events import (
+    CAMERA_DELTA,
+    CONNECTION_STATE,
+    LIVE_FRAME,
+    RPC_MESSAGE,
+    EventBus,
+)
+from pc_agent.core.protocol import (
+    FRAME_CAMERA,
+    FRAME_LIVE_POINT,
+    TOOL_PEN,
+    LiveFrame,
+    pack_live_frame,
+)
+from pc_agent.network.ws_stream_server import WsStreamServer
+
+TOKEN = "hermetic-session-token"
+_WAIT_S = 5.0
+
+
+def _wait_until(predicate: Callable[[], bool], timeout: float = _WAIT_S) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+async def _async_wait_until(predicate: Callable[[], bool], timeout: float = _WAIT_S) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return predicate()
+
+
+class EventRecorder:
+    """Thread-safe spy: the server emits on its asyncio thread, tests read here."""
+
+    def __init__(self, bus: EventBus, events: tuple[str, ...]) -> None:
+        self._lock = threading.Lock()
+        self._events: list[tuple[str, dict[str, Any]]] = []
+        for name in events:
+            bus.on(name, self._make_recorder(name))
+
+    def _make_recorder(self, name: str) -> Callable[..., None]:
+        def record(**payload: Any) -> None:
+            with self._lock:
+                self._events.append((name, payload))
+
+        return record
+
+    def of(self, name: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return [payload for event, payload in self._events if event == name]
+
+    def snapshot(self) -> list[tuple[str, dict[str, Any]]]:
+        with self._lock:
+            return list(self._events)
+
+    def wait_for(self, name: str, count: int = 1, timeout: float = _WAIT_S) -> bool:
+        return _wait_until(lambda: len(self.of(name)) >= count, timeout)
+
+
+def _ws_url(server: WsStreamServer, token: str | None = TOKEN, path: str = "/ws") -> str:
+    url = f"ws://127.0.0.1:{server.port}{path}"
+    if token is not None:
+        url += f"?token={token}"
+    return url
+
+
+async def _await_close_code(url: str) -> int | None:
+    """Connect, then return the close code the server chose (None if none)."""
+    try:
+        async with websockets.connect(url) as websocket:
+            await asyncio.wait_for(websocket.recv(), _WAIT_S)
+    except ConnectionClosed as exc:
+        if exc.rcvd is not None:
+            return exc.rcvd.code
+        if exc.sent is not None:
+            return exc.sent.code
+    except asyncio.TimeoutError:
+        return None
+    return None
+
+
+def _envelope(**overrides: Any) -> dict[str, Any]:
+    msg: dict[str, Any] = {
+        "id": "3f6a0000-0000-4000-8000-000000000001",
+        "type": "CANVAS_LIFECYCLE",
+        "action": "OPEN_CANVAS",
+        "canvas_id": "canvas-1",
+        "payload": {"preset": "A4"},
+    }
+    msg.update(overrides)
+    return msg
+
+
+def _frame(seq: int, frame_type: int = FRAME_LIVE_POINT) -> LiveFrame:
+    # 0.25/0.75/3.5 are float32-exact, so packed/unpacked fields compare equal.
+    return LiveFrame(frame_type, TOOL_PEN, seq, 0.25, 0.75, 3.5)
+
+
+@pytest.fixture()
+def server_env() -> Any:
+    bus = EventBus()
+    recorder = EventRecorder(bus, (LIVE_FRAME, CAMERA_DELTA, RPC_MESSAGE, CONNECTION_STATE))
+    server = WsStreamServer(bus, AppConfig(ws_port=0), lambda: TOKEN, host="127.0.0.1")
+    server.start()
+    try:
+        yield bus, server, recorder
+    finally:
+        server.stop()
+
+
+# -- lifecycle ---------------------------------------------------------------
+
+
+def test_start_stop_lifecycle_and_bound_port(server_env: Any) -> None:
+    _, server, _ = server_env
+    assert 0 < server.port < 65536
+    bound_port = server.port
+    thread = server._thread
+    assert thread is not None and thread.is_alive()
+
+    server.start()  # second start: logged no-op, same bound port
+    assert server.port == bound_port
+    assert server._thread is thread
+
+    started = time.monotonic()
+    server.stop()
+    assert time.monotonic() - started < 5.0  # thread joined well within 5 s
+    server.stop()  # idempotent
+    assert not thread.is_alive()
+    assert server.port == 0  # back to config.ws_port
+
+
+def test_startup_failure_raises_and_is_stoppable() -> None:
+    bus = EventBus()
+    server = WsStreamServer(bus, AppConfig(ws_port=0), lambda: TOKEN, host="192.0.2.1")
+    with pytest.raises(RuntimeError, match="failed to start"):
+        server.start()
+    server.stop()  # safe no-op after a failed start
+    assert server.port == 0
+
+
+# -- auth and path gates -----------------------------------------------------
+
+
+def test_valid_token_connects_and_state_is_exactly_once(server_env: Any) -> None:
+    _, server, rec = server_env
+
+    async def scenario() -> None:
+        async with websockets.connect(_ws_url(server)):
+            assert await _async_wait_until(lambda: len(rec.of(CONNECTION_STATE)) >= 1)
+
+    asyncio.run(scenario())
+    assert rec.wait_for(CONNECTION_STATE, count=2)
+    states = rec.of(CONNECTION_STATE)
+    assert [state["connected"] for state in states] == [True, False]
+    assert states[0]["peer"] is not None and states[0]["peer"].startswith("127.0.0.1:")
+    assert states[1]["peer"] is None
+
+
+@pytest.mark.parametrize("rejection", ["missing_token", "wrong_token", "wrong_path"])
+def test_rejected_connection_closes_without_events(server_env: Any, rejection: str) -> None:
+    _, server, rec = server_env
+    if rejection == "missing_token":
+        code = asyncio.run(_await_close_code(_ws_url(server, token=None)))
+        assert code == 4001
+    elif rejection == "wrong_token":
+        code = asyncio.run(_await_close_code(_ws_url(server, token="not-the-token")))
+        assert code == 4001
+    else:
+        code = asyncio.run(_await_close_code(_ws_url(server, path="/other")))
+        assert code is not None  # closed before any event; exact code is internal
+    assert rec.snapshot() == []
+
+
+# -- dual-path dispatch ------------------------------------------------------
+
+
+def test_binary_live_point_emits_live_frame(server_env: Any) -> None:
+    _, server, rec = server_env
+    frame = LiveFrame(FRAME_LIVE_POINT, TOOL_PEN, 7, 0.25, 0.75, 2.5)
+
+    async def scenario() -> None:
+        async with websockets.connect(_ws_url(server)) as websocket:
+            await websocket.send(pack_live_frame(frame))
+
+    asyncio.run(scenario())
+    assert rec.wait_for(LIVE_FRAME)
+    assert rec.of(LIVE_FRAME)[0]["frame"] == frame
+    assert rec.of(CAMERA_DELTA) == []
+
+
+def test_binary_camera_emits_camera_delta(server_env: Any) -> None:
+    _, server, rec = server_env
+    frame = LiveFrame(FRAME_CAMERA, TOOL_PEN, 9, 1.5, 10.0, -20.0)
+
+    async def scenario() -> None:
+        async with websockets.connect(_ws_url(server)) as websocket:
+            await websocket.send(pack_live_frame(frame))
+
+    asyncio.run(scenario())
+    assert rec.wait_for(CAMERA_DELTA)
+    assert rec.of(CAMERA_DELTA)[0]["frame"] == frame
+    assert rec.of(LIVE_FRAME) == []
+
+
+def test_wrong_length_binary_dropped_connection_survives(server_env: Any) -> None:
+    _, server, rec = server_env
+    good = _frame(3)
+
+    async def scenario() -> None:
+        async with websockets.connect(_ws_url(server)) as websocket:
+            await websocket.send(b"\x01" * 15)
+            await websocket.send(b"\x01" * 17)
+            await websocket.send(pack_live_frame(good))
+
+    asyncio.run(scenario())
+    assert rec.wait_for(LIVE_FRAME)
+    time.sleep(0.1)  # settle before exactness check
+    assert [event["frame"] for event in rec.of(LIVE_FRAME)] == [good]
+
+
+def test_invalid_json_dropped_but_connection_survives(server_env: Any) -> None:
+    _, server, rec = server_env
+    valid = _envelope()
+
+    async def scenario() -> None:
+        async with websockets.connect(_ws_url(server)) as websocket:
+            await websocket.send("{this is not json")
+            await websocket.send(json.dumps(valid))
+
+    asyncio.run(scenario())
+    assert rec.wait_for(RPC_MESSAGE)
+    time.sleep(0.1)
+    assert rec.of(RPC_MESSAGE) == [{"msg": valid}]
+
+
+def test_envelope_shell_validation_matrix(server_env: Any) -> None:
+    _, server, rec = server_env
+    base = _envelope()
+    bad: list[Any] = []
+    for key in ("id", "type", "action", "canvas_id"):
+        case = dict(base)
+        del case[key]
+        bad.append(case)
+    bad.append(_envelope(type="NOT_A_TYPE"))
+    bad.append(_envelope(action="NOT_AN_ACTION"))
+    bad.append(_envelope(action=""))
+    bad.append(_envelope(id=123))
+    bad.append(_envelope(canvas_id=7))
+    bad.append([base])  # valid JSON, not an envelope object
+    good = _envelope(type="EXPORT_JOB", action="EXPORT_FINISHED", payload={"job_id": "j1"})
+
+    async def scenario() -> None:
+        async with websockets.connect(_ws_url(server)) as websocket:
+            for case in bad:
+                await websocket.send(json.dumps(case))
+            await websocket.send(json.dumps(good))
+
+    asyncio.run(scenario())
+    assert rec.wait_for(RPC_MESSAGE)
+    time.sleep(0.1)
+    assert rec.of(RPC_MESSAGE) == [{"msg": good}]
+
+
+def test_envelope_fidelity_passthrough(server_env: Any) -> None:
+    _, server, rec = server_env
+    envelopes = [
+        _envelope(payload={"preset": "A4", "title": "Notes"}),
+        _envelope(
+            type="ARTBOARD_RESIZE",
+            action="UPGRADE_SIZE",
+            payload={"min_x": 0.0, "min_y": 0.0, "max_x": 748.0, "max_y": 1052.0},
+        ),
+        _envelope(
+            type="ASSET_UPLOAD",
+            action="ASSET_CHUNK",
+            payload={
+                "transfer_id": "t1",
+                "filename": "a.png",
+                "total_chunks": 2,
+                "size_bytes": 300000,
+                "index": 0,
+                "data_b64": "AAAA",
+            },
+        ),
+    ]
+
+    async def scenario() -> None:
+        async with websockets.connect(_ws_url(server)) as websocket:
+            for msg in envelopes:
+                await websocket.send(json.dumps(msg))
+
+    asyncio.run(scenario())
+    assert rec.wait_for(RPC_MESSAGE, count=len(envelopes))
+    time.sleep(0.1)
+    assert rec.of(RPC_MESSAGE) == [{"msg": msg} for msg in envelopes]
+
+
+# -- seq gate ----------------------------------------------------------------
+
+
+def test_seq_accept_table(server_env: Any) -> None:
+    _, server, _ = server_env
+    assert server._seq_accept(None, 0)
+    assert server._seq_accept(None, 65535)
+    assert server._seq_accept(100, 101)
+    assert not server._seq_accept(100, 100)  # duplicate
+    assert not server._seq_accept(100, 99)  # reordered/stale
+    assert server._seq_accept(65535, 1)  # u16 wrap
+    assert server._seq_accept(100, 32767)  # just inside the half-window
+    assert not server._seq_accept(100, 32868)  # half-window boundary dropped
+
+
+def test_seq_gate_reorder_and_duplicate_dropped(server_env: Any) -> None:
+    _, server, rec = server_env
+
+    async def scenario() -> None:
+        async with websockets.connect(_ws_url(server)) as websocket:
+            for seq in (10, 10, 9, 12):
+                await websocket.send(pack_live_frame(_frame(seq)))
+
+    asyncio.run(scenario())
+    assert rec.wait_for(LIVE_FRAME, count=2)
+    time.sleep(0.1)
+    assert [event["frame"].seq for event in rec.of(LIVE_FRAME)] == [10, 12]
+
+
+def test_seq_gate_per_connection_isolation(server_env: Any) -> None:
+    _, server, rec = server_env
+
+    async def scenario() -> None:
+        async with (
+            websockets.connect(_ws_url(server)) as client_a,
+            websockets.connect(_ws_url(server)) as client_b,
+        ):
+            assert await _async_wait_until(lambda: len(rec.of(CONNECTION_STATE)) >= 2)
+            for seq_a, seq_b in ((10, 1), (10, 1), (12, 3)):
+                await client_a.send(pack_live_frame(_frame(seq_a)))
+                await client_b.send(pack_live_frame(_frame(seq_b)))
+
+    asyncio.run(scenario())
+    assert rec.wait_for(LIVE_FRAME, count=4)
+    time.sleep(0.1)
+    seqs = [event["frame"].seq for event in rec.of(LIVE_FRAME)]
+    assert sorted(seqs) == [1, 3, 10, 12]  # each connection kept its own gate
+
+
+def test_seq_gate_wrap_and_reconnect_resets_gate(server_env: Any) -> None:
+    _, server, rec = server_env
+
+    async def scenario() -> None:
+        async with websockets.connect(_ws_url(server)) as first:
+            for seq in (65535, 65534, 1):  # wrap 65535 -> 1 accepted, stale dropped
+                await first.send(pack_live_frame(_frame(seq)))
+        async with websockets.connect(_ws_url(server)) as second:
+            await second.send(pack_live_frame(_frame(1)))  # fresh last_seq = None
+
+    asyncio.run(scenario())
+    assert rec.wait_for(LIVE_FRAME, count=3)
+    time.sleep(0.1)
+    seqs = [event["frame"].seq for event in rec.of(LIVE_FRAME)]
+    assert seqs == [65535, 1, 1]
+
+
+# -- broadcast ---------------------------------------------------------------
+
+
+def test_broadcast_json_reaches_clients_from_foreign_thread(server_env: Any) -> None:
+    _, server, rec = server_env
+    msg = _envelope(
+        type="EXPORT_JOB", action="EXPORT_PROGRESS", payload={"job_id": "j1", "percent": 40.0}
+    )
+
+    async def scenario() -> None:
+        async with (
+            websockets.connect(_ws_url(server)) as gui,
+            websockets.connect(_ws_url(server)) as tablet,
+        ):
+            assert await _async_wait_until(lambda: len(rec.of(CONNECTION_STATE)) >= 2)
+            task_gui = asyncio.create_task(gui.recv())
+            task_tablet = asyncio.create_task(tablet.recv())
+            worker = threading.Thread(target=lambda: server.broadcast_json(msg))
+            worker.start()
+            worker.join()
+            raw_gui, raw_tablet = await asyncio.wait_for(
+                asyncio.gather(task_gui, task_tablet), _WAIT_S
+            )
+            assert json.loads(raw_gui) == msg
+            assert json.loads(raw_tablet) == msg
+
+    asyncio.run(scenario())
+
+
+def test_broadcast_json_survives_one_dead_client(server_env: Any) -> None:
+    _, server, rec = server_env
+    msg = _envelope(type="EXPORT_JOB", action="EXPORT_FINISHED", payload={"job_id": "j1"})
+
+    async def scenario() -> None:
+        async with (
+            websockets.connect(_ws_url(server)) as vanishing,
+            websockets.connect(_ws_url(server)) as survivor,
+        ):
+            assert await _async_wait_until(lambda: len(rec.of(CONNECTION_STATE)) >= 2)
+            vanishing.transport.abort()  # vanish without a close frame
+            await asyncio.wait_for(vanishing.wait_closed(), _WAIT_S)
+            pending = asyncio.create_task(survivor.recv())
+            worker = threading.Thread(target=lambda: server.broadcast_json(msg))
+            worker.start()
+            worker.join()
+            raw = await asyncio.wait_for(pending, _WAIT_S)
+            assert json.loads(raw) == msg
+
+    asyncio.run(scenario())
+
+
+def test_broadcast_json_before_start_drops_without_raising(caplog: Any) -> None:
+    bus = EventBus()
+    server = WsStreamServer(bus, AppConfig(ws_port=0), lambda: TOKEN, host="127.0.0.1")
+    with caplog.at_level(logging.WARNING, logger="slatesync.ws"):
+        server.broadcast_json(_envelope())  # must never raise into a GUI thread
+    assert "message dropped" in caplog.text
+
+
+def test_broadcast_json_after_stop_and_non_serializable(server_env: Any) -> None:
+    _, server, _ = server_env
+    server.broadcast_json({"bad": object()})  # TypeError swallowed + logged
+    server.stop()
+    server.broadcast_json(_envelope())  # stopped server: dropped, never raises
+
+
+# -- connection state on abrupt drop ----------------------------------------
+
+
+def test_abrupt_drop_emits_single_disconnect(server_env: Any) -> None:
+    _, server, rec = server_env
+
+    async def scenario() -> None:
+        async with websockets.connect(_ws_url(server)) as websocket:
+            assert await _async_wait_until(lambda: len(rec.of(CONNECTION_STATE)) >= 1)
+            websocket.transport.abort()  # vanish without a close frame
+            await asyncio.wait_for(websocket.wait_closed(), _WAIT_S)
+
+    asyncio.run(scenario())
+    assert rec.wait_for(CONNECTION_STATE, count=2)
+    time.sleep(0.1)
+    states = rec.of(CONNECTION_STATE)
+    assert [state["connected"] for state in states] == [True, False]
+    assert states[1]["peer"] is None
+
+
+# -- token liveness ----------------------------------------------------------
+
+
+def test_token_provider_read_per_connection() -> None:
+    bus = EventBus()
+    rec = EventRecorder(bus, (LIVE_FRAME, CONNECTION_STATE))
+    state = {"token": "token-alpha"}
+    server = WsStreamServer(bus, AppConfig(ws_port=0), lambda: state["token"], host="127.0.0.1")
+    server.start()
+    try:
+
+        async def scenario() -> None:
+            async with websockets.connect(_ws_url(server, token="token-alpha")) as first:
+                assert await _async_wait_until(lambda: len(rec.of(CONNECTION_STATE)) >= 1)
+                state["token"] = "token-beta"  # swap affects only NEW connections
+                stale = await _await_close_code(_ws_url(server, token="token-alpha"))
+                assert stale == 4001
+                async with websockets.connect(_ws_url(server, token="token-beta")) as second:
+                    await second.send(pack_live_frame(_frame(1)))
+                    assert rec.wait_for(LIVE_FRAME)
+                await first.send(pack_live_frame(_frame(5)))  # established stays open
+                assert rec.wait_for(LIVE_FRAME, count=2)
+
+        asyncio.run(scenario())
+    finally:
+        server.stop()
+    assert [event["frame"].seq for event in rec.of(LIVE_FRAME)] == [1, 5]
