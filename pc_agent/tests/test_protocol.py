@@ -94,9 +94,11 @@ def test_rpc_actions_mirror_doc02_exactly() -> None:
         # Doc 02 §9.1 — Hub Sync & Multi-Device Extension (19 actions).
         "CANVAS_PUT",
         "CANVAS_PULL",
+        # Doc 02 §10.1 — Round-6 clear (20 actions).
+        "CLEAR_CANVAS",
     }
     assert RPC_ACTIONS == frozenset(expected)
-    assert len(RPC_ACTIONS) == 19
+    assert len(RPC_ACTIONS) == 20
 
 
 def test_rpc_types_mirror_doc02_exactly() -> None:

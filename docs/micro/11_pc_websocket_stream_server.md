@@ -3,7 +3,7 @@
 ## 1. Objective & Scope
 * Async WebSocket server on port `50606`, path `/ws` (the `websockets` library), running its own asyncio loop inside a **daemon thread** — the dual-path gateway between the tablet and the PC `EventBus`.
 * **Binary path:** 16-byte frames unpacked zero-copy from a `memoryview` via `unpack_live_frame` → stale-seq drop (mod $2^{16}$) → `CAMERA_DELTA` (frame_type `0x03`) or `LIVE_FRAME`.
-* **Text path:** §4.2 JSON envelope validation → `RPC_MESSAGE` (feeds Docs 09, 10, 15). Also emits `CONNECTION_STATE` and provides thread-safe `broadcast_json` for PC-originated pushes (Doc 15, Doc 12 handshake data via Doc 16).
+* **Text path:** §4.2 JSON envelope validation → `RPC_MESSAGE` (feeds Docs 09, 10, 15). Also emits `CONNECTION_STATE` and provides thread-safe `broadcast_json(msg, exclude=None)` for PC-originated pushes (Doc 15, Doc 12 handshake data via Doc 16) and for the **live mutation relay** (Doc 02 §10.2): after local dispatch, incoming `ELEMENT_COMMIT` (incl. `CLEAR_CANVAS`) and `ARTBOARD_RESIZE` envelopes are re-broadcast to every **other** connection — the sender is excluded.
 * Auth: token from the injected `token_provider` callable (wired to `DiscoveryPairing.session_token`, Doc 12); missing/mismatched token → close code `4001`, no events.
 * Envelope fan-out only: the server never interprets `payload` (`OPEN_CANVAS`/`ASSET_*`/`UPGRADE_SIZE` keys belong to Docs 10/09/15) — it validates the §4.2 shell and forwards. Ordering: a single `async for` per connection preserves frame order (no task spawned per message).
 
@@ -31,7 +31,7 @@
 * Pairing context (Doc 12): the announced TXT/port and QR payload both point at this server’s connect URL `ws://<ipv4>:50606/ws?token=<session_token>` (template §3) — Doc 11 is the sole enforcement point.
 
 ## 4. Interface Freeze
-**Verbatim from template §4 — `WsStreamServer`, do not modify:**
+**Verbatim from template §4 — `WsStreamServer` (the `broadcast_json` line carries the Doc 02 §10.2 round-6 `exclude` amendment; rest unchanged, do not modify):**
 
 ```python
 class WsStreamServer:                                   # Doc 11
@@ -42,7 +42,7 @@ class WsStreamServer:                                   # Doc 11
     def stop(self) -> None: ...
     @property
     def port(self) -> int: ...
-    def broadcast_json(self, msg: dict) -> None: ...     # thread-safe push to all clients
+    def broadcast_json(self, msg: dict, exclude=None) -> None: ...  # thread-safe push to all clients; Doc 02 §10.2 additive `exclude` = connection skipped by identity (`is`); one-arg callers unchanged
 # binary  → unpack_live_frame → emit("CAMERA_DELTA") if 0x03 else emit("LIVE_FRAME", frame=...)
 # text    → json envelope      → emit("RPC_MESSAGE", msg=...)
 # emits CONNECTION_STATE(connected: bool, peer: str | None)
@@ -65,17 +65,23 @@ class WsStreamServer:                                   # Doc 11
 #   stale/duplicate dropped silently; last_seq updated only on accepted frames (all frame types)
 # text frame: json.loads → require keys {id, type, action, canvas_id} else drop+log
 #   → emit("RPC_MESSAGE", msg=<dict>)   (payload key contract for OPEN_CANVAS/ASSET/UPGRADE lives with Docs 09/10)
+#   → live mutation relay (Doc 02 §10.2): AFTER the emit, if msg.type in {ELEMENT_COMMIT, ARTBOARD_RESIZE}
+#        → broadcast_json(msg, exclude=<sending connection>) — every OTHER client receives it, sender gets no
+#          echo; non-mutation types (CANVAS_LIFECYCLE, ASSET_UPLOAD, EXPORT_JOB) are never relayed.
+#          CLEAR_CANVAS travels as type ELEMENT_COMMIT, so it is relayed alongside the other element commits.
 # any per-message exception → logging.getLogger("slatesync.ws") + continue (connection survives one bad frame)
-# broadcast_json(msg): json.dumps → asyncio.run_coroutine_threadsafe(_send_all, self._loop) — never blocks,
-#   best-effort per client (dead clients dropped, failures logged); callable from ANY thread (Tk, executor)
+# broadcast_json(msg, exclude=None): json.dumps → asyncio.run_coroutine_threadsafe(_send_all, self._loop) — never blocks,
+#   best-effort per client (dead clients dropped, failures logged); callable from ANY thread (Tk, executor);
+#   `exclude` (Doc 02 §10.2, round-6 additive) skips ONE connection by identity (`is`) so a relayed mutation
+#   never echoes to its sender — existing single-argument callers are unchanged
 # port property: actual bound port (config.ws_port=50606 in prod; tests bind ephemeral port via
 #   dataclasses.replace(config, ws_port=0))
 # wiring (Wave 3.A, main.py): WsStreamServer(bus, config, token_provider=lambda: pairing.session_token)
 # stop(): close server, stop loop, join thread ≤5 s — idempotent
 ```
 
-* Envelope shell check (§4.2): `id` (uuid-v4 string), `type` ∈ the five §3 types, `action` non-empty string, `canvas_id` string — everything else, including `payload`, passes through untouched.
-* `type`/`action` pairs are **not** filtered here: Docs 09/10/15 each select their own subset from the same `RPC_MESSAGE` fan-out.
+* Envelope shell check (§4.2): `id` (uuid-v4 string), `type` ∈ the five §3 types, `action` ∈ the **20-action** `RPC_ACTIONS` set (Doc 02 §8.1/§9.1/§10.1 — 14 → 17 → 19 → 20 with `CLEAR_CANVAS`), `canvas_id` string — everything else, including `payload`, passes through untouched.
+* `type`/`action` pairs are **not** filtered here beyond that shared membership check: Docs 09/10/15 each select their own subset from the same `RPC_MESSAGE` fan-out; the relay (§10.2) keys only on `type`, never on `payload`.
 * Seq gating applies to binary frames only; text frames ignore seq entirely, and per-connection `last_seq` resets to `None` on every reconnect (state never shared between connections).
 * Oversized or non-UTF8 text: log + drop that message only — connection stays open and remains in `self._clients`.
 * `broadcast_json` with zero clients is a cheap no-op; called before `start()` logs a warning and drops the message (never raises into a GUI thread).
@@ -86,7 +92,7 @@ Component map (illustrative signatures):
 ```python
 def _run(self) -> None: ...                            # thread target: new loop → serve() → ready.set() → run_forever()
 async def _handler(self, ws) -> None: ...              # path gate → token gate → async-for dispatch → finally: state event
-async def _send_all(self, payload: str) -> None: ...   # snapshot clients, discard dead sockets, never raise
+async def _send_all(self, payload: str, exclude=None) -> None: ...  # snapshot clients, skip `exclude` by identity, discard dead sockets, never raise
 def _seq_accept(self, last: int | None, seq: int) -> bool: ...   # mod 2^16 newer-than check
 ```
 
@@ -94,8 +100,8 @@ def _seq_accept(self, last: int | None, seq: int) -> bool: ...   # mod 2^16 newe
 2. **Auth + path gate.** In the handler: exact `/ws` path check, `urllib.parse.urlsplit(request.path).query` → `parse_qs` token, compare to `token_provider()`; mismatch/missing → `await ws.close(code=4001)` and return (no events); else emit `CONNECTION_STATE(connected=True, peer=...)` and add to `self._clients`.
 3. **Binary path.** `async for message in ws`: bytes → `memoryview` → length check (16) → `unpack_live_frame` (struct `<BBHfff`, no copy) → seq gate → emit `CAMERA_DELTA`/`LIVE_FRAME` with `frame=<LiveFrame>`.
 4. **Seq tracker.** Per-connection `last_seq: int | None`; accept first frame; accept iff `0 < ((seq - last_seq) % 65536) < 32768` (handles u16 wrap 65535→1); update only on acceptance; drop silently.
-5. **Text path.** `json.loads` inside try/except; validate required envelope keys `{id, type, action, canvas_id}` from §4.2; emit `RPC_MESSAGE(msg=msg)`; malformed JSON or missing keys → warn + continue.
-6. **`broadcast_json`.** Serialize once, `asyncio.run_coroutine_threadsafe(self._send_all(payload), self._loop)` (fire-and-forget, futures observed only for logging); `_send_all` iterates a snapshot of `self._clients`, discarding closed sockets on error.
+5. **Text path.** `json.loads` inside try/except; validate required envelope keys `{id, type, action, canvas_id}` from §4.2 against the 20-action `RPC_ACTIONS`/5-type enums; emit `RPC_MESSAGE(msg=msg)`; malformed JSON or missing keys → warn + continue. **Round-6 relay (Doc 02 §10.2):** immediately AFTER the emit, if `msg["type"] in {"ELEMENT_COMMIT", "ARTBOARD_RESIZE"}` (so `CLEAR_CANVAS` included) → `broadcast_json(msg, exclude=<sender connection>)`; `CANVAS_LIFECYCLE`/`ASSET_UPLOAD`/`EXPORT_JOB` are never relayed. Receiving endpoints apply the rule from Doc 02 §10.2/§10.1 (PC always; devices only for their open document).
+6. **`broadcast_json(msg, exclude=None)`.** Serialize once, `asyncio.run_coroutine_threadsafe(self._send_all(payload, exclude), self._loop)` (fire-and-forget, futures observed only for logging); `_send_all` iterates a snapshot of `self._clients`, skips the `exclude` connection by identity (`is`), discarding closed sockets on error. Existing one-argument callers behave exactly as before.
 7. **Connection state.** `finally:` block per connection emits `CONNECTION_STATE(connected=False, peer=None)` exactly once and removes the client — GUI badge (Doc 16) stays consistent even on abrupt drops.
 8. **Graceful `stop()`.** Schedule server close via `run_coroutine_threadsafe(...).result(timeout=...)`, then `loop.call_soon_threadsafe(loop.stop)`, join thread ≤5 s; safe to call twice.
 9. **Reconnect independence.** Every connection gets fresh `last_seq`, client-set membership, and events — a tablet reconnect replays Doc 25’s offline RPC queue onto a clean pipeline with no stale-seq interference.
@@ -110,7 +116,8 @@ def _seq_accept(self, last: int | None, seq: int) -> bool: ...   # mod 2^16 newe
 * **Seq table (unit):** `_seq_accept(None, any)` accept; `(100,101)` accept; `(100,100)` drop; `(100,99)` drop; `(65535,1)` accept (wrap); `(100,32868)` drop (half-window).
 * **Lifecycle:** `start()` twice / `stop()` twice are safe; `port` equals the actually bound port; `stop()` joins the daemon thread ≤5 s (no leaked threads across the test suite).
 * **`CONNECTION_STATE` exactly-once:** a client vanishing without a close frame still emits one `(False, None)`; a valid connect never emits `(False, …)` first.
-* **Envelope fidelity:** `OPEN_CANVAS` / `UPGRADE_SIZE` / `ASSET_CHUNK` envelopes sent by a Doc-25-style client reach `RPC_MESSAGE` subscribers (Docs 10/09/15) with `type/action/payload` unchanged.
+* **Envelope fidelity:** `OPEN_CANVAS` / `UPGRADE_SIZE` / `ASSET_CHUNK` envelopes sent by a Doc-25-style client reach `RPC_MESSAGE` subscribers (Docs 10/09/15) with `type/action/payload` unchanged; an envelope with an action outside the 20-action set is dropped at shell validation.
+* **Live mutation relay (Doc 02 §10.2):** with devices A + B (+ GUI) connected, an `ELEMENT_COMMIT` (incl. `CLEAR_CANVAS`) or `ARTBOARD_RESIZE` envelope from A reaches B and the GUI with `type/action/payload/canvas_id` byte-identical AFTER `RPC_MESSAGE` fires, and never comes back to A; `CANVAS_LIFECYCLE`/`ASSET_UPLOAD`/`EXPORT_JOB` messages are not relayed; `broadcast_json(msg)` (no `exclude`) still reaches every client.
 * **Fan-out:** `broadcast_json` called from a foreign thread reaches N concurrent clients (GUI + tablet); a client that closed mid-broadcast is discarded without raising.
 * **Token liveness:** `token_provider` is invoked per connection attempt — swapping its target later affects only new connections; established ones stay open (documented v1 behavior).
 

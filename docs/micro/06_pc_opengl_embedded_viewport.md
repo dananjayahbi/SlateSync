@@ -59,7 +59,7 @@
   §6 Wave 1.B subagent 1 (runs Docs 06 + 07 together).
 
 ## 4. Interface Freeze
-**Verbatim from template §4 — do not modify:**
+**Verbatim from template §4 — do not modify (the two §10.5 round-6 additive lines are annotated):**
 
 ```python
 class GLCanvasHost:                                     # Doc 06
@@ -71,6 +71,13 @@ class GLCanvasHost:                                     # Doc 06
     def request_redraw(self) -> None: ...                # thread-safe, coalesced
     def resize(self, w: int, h: int) -> None: ...
     def shutdown(self) -> None: ...
+    # Doc 02 §10.5 round-6 additive (frozen): zoom-to-fit the OPEN document with
+    # 48 world units padding per side — bounded ⇒ target (0, 0, w, h),
+    # infinite ⇒ content_bounds (empty ⇒ (-500, -500, 1000, 1000)); main.py
+    # calls it on every DOCUMENT_LOADED, then reads camera_scale for update_hud
+    def fit_viewport(self) -> None: ...
+    @property
+    def camera_scale(self) -> float: ...                 # current camera scale (§3 zoom range)
 class ProgramRegistry:                                  # Doc 06 (generic stem loader)
     def get(self, stem: str) -> "moderngl.Program": ...  # pairs <stem>.vert + <stem>.frag in config.shader_dir
     # stems: "stroke" (Doc 07), "primitive", "grid", "texture" (Doc 08)

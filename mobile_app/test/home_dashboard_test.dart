@@ -125,10 +125,32 @@ void main() {
   }
 
   /// Real-IO aware settle for multi-step chains (save/insert/refresh/pop).
-  Future<void> settleIo(WidgetTester tester, {int rounds = 16}) async {
+  /// Round count covers the Doc 02 §10.6 save path, which now also
+  /// rasterizes a PNG thumbnail before the chain can land.
+  Future<void> settleIo(WidgetTester tester, {int rounds = 28}) async {
     await flushReal(tester, rounds: rounds);
     await tester.pump(const Duration(milliseconds: 500));
     await flushReal(tester, rounds: 2);
+  }
+
+  /// Poll [condition] with real-event-loop windows between frame pumps
+  /// (up to [maxRounds]) — for chains whose length varies with the PNG
+  /// rasterization step (Doc 02 §10.6) and machine load. Returns whether
+  /// the condition held on the last check.
+  Future<bool> settleUntil(
+    WidgetTester tester,
+    Future<bool> Function() condition, {
+    int maxRounds = 50,
+  }) async {
+    bool ok = await condition();
+    for (int i = 0; i < maxRounds && !ok; i++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 15)),
+      );
+      await tester.pump(const Duration(milliseconds: 60));
+      ok = await condition();
+    }
+    return ok;
   }
 
   Future<LocalDb> openDbInTester(WidgetTester tester, String name) async {
@@ -594,9 +616,20 @@ void main() {
       await tester.tap(find.byKey(const Key('new_background_DOT_GRID')));
       await tester.pump();
       await tester.tap(find.byKey(const Key('create_canvas')));
-      await settleIo(tester);
-
-      expect(find.byKey(const Key('new_title_field')), findsNothing);
+      // The create chain now includes the Doc 02 §10.6 PNG rasterization —
+      // poll for the modal to close (it pops only after save+insert land)
+      // instead of assuming one fixed real-time window suffices.
+      final bool modalClosed = await settleUntil(
+        tester,
+        () async => find.byKey(const Key('new_title_field')).evaluate().isEmpty,
+      );
+      await tester.pump(); // run the pop transition frames
+      expect(
+        find.byKey(const Key('new_title_field')),
+        findsNothing,
+        reason: 'modal must close once the create chain completes '
+            '(modalClosed=$modalClosed)',
+      );
 
       final List<CanvasRecord>? rows =
           await tester.runAsync(() => db.list());
@@ -700,7 +733,29 @@ void main() {
         'Renamed lecture',
       );
       await tester.tap(find.byKey(const Key('rename_confirm')));
-      await settleIo(tester);
+      // Row update + archive re-save (zip + Doc 02 §10.6 PNG) are real IO —
+      // poll until the re-saved archive carries the new title.
+      final bool archiveRenamed = await settleUntil(
+        tester,
+        () async {
+          // Errors are swallowed INSIDE the real-zone callback so a
+          // half-written zip never surfaces as a framework zone error.
+          final String? title = await tester.runAsync<String?>(() async {
+            try {
+              final CanvasDocumentModel d = await loadDocument(
+                'rn-1',
+                baseDir: cacheDir,
+              );
+              return d.title;
+            } catch (_) {
+              return null; // not (fully) written yet
+            }
+          });
+          return title == 'Renamed lecture';
+        },
+      );
+      expect(archiveRenamed, isTrue, reason: 'rename re-save must land');
+      await tester.pump();
 
       final CanvasRecord? row =
           await tester.runAsync<CanvasRecord?>(() => db.get('rn-1'));
@@ -712,7 +767,20 @@ void main() {
       );
       expect(reloaded!.title, 'Renamed lecture');
 
-      await flushReal(tester); // let the post-rename _refresh repaint
+      // The post-rename `_refresh` only runs after the §10.6 thumbnail
+      // render inside the re-save chain finishes — poll for the repaint
+      // instead of assuming one fixed real-time window.
+      final bool cardRepainted = await settleUntil(
+        tester,
+        () async =>
+            find.descendant(
+              of: find.byKey(const Key('canvas_card_rn-1')),
+              matching: find.text('Renamed lecture'),
+            ).evaluate().length ==
+            1,
+      );
+      expect(cardRepainted, isTrue, reason: 'post-rename refresh must '
+          'repaint the card with the new title');
       expect(
         find.descendant(
           of: find.byKey(const Key('canvas_card_rn-1')),
@@ -785,10 +853,11 @@ void main() {
       expect(calls, 0); // not fired by init/refresh alone
 
       // Flush until the callback fires: the create/rename/delete chains do
-      // real sqflite/file IO and the suite runs test files in parallel, so
-      // a fixed pump budget can be starved under load.
+      // real sqflite/file IO plus the §10.6 PNG rasterization, and the
+      // suite runs test files in parallel, so a fixed pump budget can be
+      // starved under load.
       Future<void> settleUntil(int expected) async {
-        for (int i = 0; i < 20 && calls < expected; i++) {
+        for (int i = 0; i < 60 && calls < expected; i++) {
           await flushReal(tester, rounds: 3);
           await tester.pump();
         }

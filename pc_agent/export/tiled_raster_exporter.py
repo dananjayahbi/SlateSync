@@ -29,7 +29,7 @@ import numpy as np
 from PIL import Image
 
 from pc_agent.core.config_manager import AppConfig
-from pc_agent.engine.document_store import Artboard, CanvasDocument
+from pc_agent.engine.document_store import Artboard, CanvasDocument, artboard_is_infinite
 from pc_agent.engine.scene_graph import CanvasNode
 
 #: Export strip size in px (template §3 "Export strips").
@@ -62,9 +62,13 @@ def resolve_extent(doc: CanvasDocument) -> tuple[float, float, float, float]:
 
     Bounded ⇒ ``(0, 0, w, h)``; INFINITE ⇒ ``content_bounds`` padded 64 world
     units per side; empty / degenerate ⇒ ``ValueError("empty canvas")``.
+
+    §10.4 (issue 06): boundedness comes from the preset table
+    (:func:`artboard_is_infinite`) — an extent resolving to content size for a
+    bounded preset is a bug, whatever the ``is_infinite`` flag says.
     """
     artboard = doc.artboard
-    infinite = artboard.is_infinite or artboard.preset == "INFINITE"
+    infinite = artboard_is_infinite(artboard)
     if not infinite:
         w, h = artboard.width, artboard.height
         if w is None or h is None or w <= 0 or h <= 0:

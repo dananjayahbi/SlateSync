@@ -1,7 +1,8 @@
 """Dark-mode CustomTkinter desktop shell of the PC agent (Doc 16 §4 freeze).
 
 Layout: TOP HUD (connection badge / zoom / artboard preset / QR button),
-LEFT gallery strip (Issue 03-PC, docked col 0, hidden until paired),
+LEFT gallery strip (Issue 07-PC thumbnail cards, docked col 0, hidden until
+paired),
 CENTER OpenGL viewport via Doc 06 ``GLCanvasHost.mount``, BOTTOM export bar
 (format/DPI/target combos, Start, progress, Open-in-Explorer) plus the
 File/View/Help menu. Export execution reaches Doc 15 **only** through the
@@ -146,16 +147,30 @@ class StudioWindow:
         gl_host: "GLCanvasHost",
         export_submit: Callable[[dict], str],
         open_request: Callable[[str], None] | None = None,
+        *,
+        thumbnail_fn: Callable[[dict, Path, int], object] | None = None,
+        thumbs_dir: str | Path | None = None,
+        canvases_dir: str | Path | None = None,
     ) -> None:
         """``open_request`` (round 4, optional): injected File → "Open synced
         canvas…" callback wired by main.py to
         ``CanvasSyncManager.request_open(canvas_id)`` — the window only ever
-        passes the picked id; the manager owns the wire envelope."""
+        passes the picked id; the manager owns the wire envelope.
+
+        ``thumbnail_fn`` / ``thumbs_dir`` / ``canvases_dir`` (Issue 07-PC,
+        optional) forward to the gallery's §10.6 render pipeline — tests
+        inject a fake renderer and isolated directories; main.py leaves all
+        three ``None`` (lazy renderer import, ``%APPDATA%/SlateSync/thumbs``
+        output, ``%APPDATA%/SlateSync/canvases`` archives).
+        """
         self._config = config
         self._bus = bus
         self._gl_host = gl_host
         self._export_submit = export_submit
         self._open_request = open_request
+        self._thumbnail_fn = thumbnail_fn
+        self._thumbs_dir = thumbs_dir
+        self._canvases_dir = canvases_dir
 
         # Tk scaffolding — set by build(); None until then.
         self._root: tk.Misc | None = None
@@ -330,7 +345,19 @@ class StudioWindow:
             row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4)
         )
         self._gallery = CanvasGalleryPanel(
-            parent, open_request=self._open_request
+            parent,
+            open_request=self._open_request,
+            thumbnail_fn=self._thumbnail_fn,
+            thumbs_dir=(
+                self._thumbs_dir
+                if self._thumbs_dir is not None
+                else self._config.appdata_dir / "thumbs"
+            ),
+            canvases_dir=(
+                self._canvases_dir
+                if self._canvases_dir is not None
+                else self._config.appdata_dir / "canvases"
+            ),
         )
         self._gallery.mount(row=1, column=0, sticky="nsw", padx=(8, 0), pady=4)
         self._build_center().grid(

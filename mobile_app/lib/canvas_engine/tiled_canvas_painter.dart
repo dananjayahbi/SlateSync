@@ -763,8 +763,10 @@ Rect _rectOfNode(CanvasNodeModel n) => Rect.fromLTRB(
 
 /// Event-driven tile rebake core (Doc 22 §4): [setDocument] bulk-loads the
 /// document, [addCommitted] indexes a stroke and rebakes only the tiles its
-/// bbox intersects (≤ 4 per normal commit), [queryVisible] culls the static
-/// layer.
+/// bbox intersects (≤ 4 per normal commit), [addNode] indexes any node kind
+/// (SHAPE / GRAPH_AXES / IMAGE / LINE — Issue R6) through the same per-kind
+/// draw path, [clearAll] wipes index + cache state, [queryVisible] culls the
+/// static layer.
 class TiledCanvasEngine {
   /// Doc 22 §4 freeze shape `TiledCanvasEngine({required CameraController
   /// camera})`; see the library doc for the Wave 1.B structural typing note —
@@ -828,6 +830,27 @@ class TiledCanvasEngine {
     _bakeWindow(hot, bucket);
   }
 
+  /// Issue R6 (Doc 02 §10.1 engine half) — wipe ALL canvas state: the
+  /// spatial index, the dirty set, the per-tile bucket map and every cached
+  /// picture. Each entry's base, chunk tails and combined snapshot are
+  /// DISPOSED by [TileCache.invalidateAll] (`chunks.disposeAll`) — no
+  /// picture leaks — and a single cache-generation bump repaints every
+  /// static-layer painter with an empty canvas.
+  ///
+  /// Deliberately preserved: camera/viewport state ([bakeVisible] window)
+  /// and the cumulative [bakeStats] counters — neither is document state.
+  /// RPC/broadcast of CLEAR_CANVAS stays with the canvas page (§10.1); the
+  /// engine only clears state. Subsequent [addCommitted] / [addNode] /
+  /// [setDocument] calls operate on the empty engine exactly as on a fresh
+  /// one (miss ⇒ synchronous full bake).
+  void clearAll() {
+    _rebakeCount = 0;
+    _tree.clear();
+    _dirty.clear();
+    _bakedBucket.clear();
+    cache.invalidateAll();
+  }
+
   /// Index a committed stroke (Doc 21) and rebake exactly its dirty tiles.
   ///
   /// Structural input: an object exposing `bbox` and `toRpcPayload()`
@@ -838,6 +861,42 @@ class TiledCanvasEngine {
     _tree.remove(node.nodeId);
     _tree.insert(node);
     _dirtyCommit(node);
+  }
+
+  /// Issue R6 (Doc 02 §10.3 / Doc 22 §4) — index one node of ANY kind
+  /// (`SHAPE` / `GRAPH_AXES` / `IMAGE` / `LINE` / stroke) and render it
+  /// through the exact same per-kind `_drawNode` dispatch [setDocument]
+  /// uses, dirtying only `tilesCovering(node.bbox)` (≤ 4 tiles; never a
+  /// full-cache invalidation).
+  ///
+  /// Fresh/missed/stale tiles take a synchronous full bake; tiles already
+  /// baked at the current zoom bucket take the O(1) chunk-append path — one
+  /// recorded node picture + a fold only at the K=32 tail threshold (Issue
+  /// 05 §1) — so a node coexists with chunked stroke bakes in one tile.
+  ///
+  /// Re-inserting an existing `nodeId` replaces the indexed copy
+  /// ([SpatialRTree.insert] replace semantics): the union of the previous
+  /// and new tiles is force-rebaked from the index so no ghost ink survives
+  /// the replacement.
+  void addNode(CanvasNodeModel node) {
+    _rebakeCount = 0;
+    final CanvasNodeModel? prev = _tree.nodeById(node.nodeId);
+    if (prev == null) {
+      _tree.insert(node);
+      _dirtyCommit(node);
+      return;
+    }
+    _tree.insert(node); // replace semantics — id table stays unique
+    final int bucket = currentBucket;
+    _dirty
+      ..clear()
+      ..addAll(tilesCovering(_rectOfNode(prev)))
+      ..addAll(tilesCovering(_rectOfNode(node)));
+    for (final TileKey k in _dirty) {
+      if (cache.contains(k) && bakedBucketOf(k) == bucket) {
+        _ensureBaked(k, bucket, force: true); // re-record WITHOUT old copy
+      }
+    }
   }
 
   /// Compute the tiles intersecting `s.bbox` and rebake that dirty set only
@@ -1137,8 +1196,12 @@ void _drawNode(Canvas canvas, CanvasNodeModel n) {
   switch (n.kind) {
     case 'SHAPE':
       _drawShape(canvas, n, pts, paint);
+    case 'GRAPH_AXES':
+      _drawGraph(canvas, n, paint);
     case 'IMAGE':
       canvas.drawRect(_rectOfNode(n), paint);
+    case 'LINE':
+      _drawLine(canvas, pts, paint);
     default:
       _drawPolyline(canvas, pts, paint);
   }
@@ -1150,13 +1213,23 @@ void _drawShape(
   List<List<double>> pts,
   Paint paint,
 ) {
-  final Rect r = _rectOfNode(n);
   final String? shapeType = n.geometry.shapeType;
+  if (shapeType == 'CARTESIAN_2D' || shapeType == 'NUMBER_LINE') {
+    // PC `_draw_shape` dispatches graph shapes to the graph renderer even
+    // under kind SHAPE (§10.3 — same conventions either way).
+    _drawGraph(canvas, n, paint);
+    return;
+  }
+  final Rect r = _rectOfNode(n);
   switch (shapeType) {
     case 'RECT':
       canvas.drawRect(r, paint);
     case 'CIRCLE':
       canvas.drawOval(r, paint);
+    case 'TRIANGLE':
+      _drawTriangle(canvas, pts, r, paint);
+    case 'ARROW':
+      _drawArrow(canvas, pts, r, paint);
     default:
       if (pts.length < 2) {
         canvas.drawRect(r, paint);
@@ -1170,10 +1243,100 @@ void _drawShape(
         }
         path.lineTo(pts[i][0], pts[i][1]);
       }
-      if (shapeType == 'TRIANGLE') {
-        path.close();
-      }
       canvas.drawPath(path, paint);
+  }
+}
+
+/// LINE — always a straight segment, first anchor → last anchor;
+/// intermediate anchors are ignored (Doc 02 §10.3 / PC `_draw_stroke`).
+/// < 2 usable points falls back to the polyline dot/empty handling.
+void _drawLine(Canvas canvas, List<List<double>> pts, Paint paint) {
+  if (pts.length >= 2 && pts.first.length >= 2 && pts.last.length >= 2) {
+    canvas.drawLine(
+      Offset(pts.first[0], pts.first[1]),
+      Offset(pts.last[0], pts.last[1]),
+      paint,
+    );
+    return;
+  }
+  _drawPolyline(canvas, pts, paint);
+}
+
+/// TRIANGLE — 3 verts from `pts` (Doc 08 §4(4) / PC `triangle_points`);
+/// a geometry with < 3 usable points falls back to the PC bbox triangle
+/// (top-center → bottom-right → bottom-left, PC `_draw_shape`).
+void _drawTriangle(
+  Canvas canvas,
+  List<List<double>> pts,
+  Rect r,
+  Paint paint,
+) {
+  final List<List<double>> usable =
+      pts.where((List<double> p) => p.length >= 2).toList();
+  final Path path = Path();
+  if (usable.length >= 3) {
+    path
+      ..moveTo(usable[0][0], usable[0][1])
+      ..lineTo(usable[1][0], usable[1][1])
+      ..lineTo(usable[2][0], usable[2][1])
+      ..close();
+  } else {
+    path
+      ..moveTo((r.left + r.right) / 2, r.top)
+      ..lineTo(r.right, r.bottom)
+      ..lineTo(r.left, r.bottom)
+      ..close();
+  }
+  canvas.drawPath(path, paint);
+}
+
+/// ARROW — shaft `pts[0] → pts[-1]` plus the head (Doc 08 §4(4), PC
+/// `_draw_shape`): two barbs from the tip at ±0.4 rad with
+/// `head = max(12, 4·strokeWidth)`. The PC export barb geometry is used
+/// (rather than the viewport's apex-beyond-end filled triangles) so the
+/// head stays inside the node bbox the dirty-set math covers. < 2 usable
+/// points ⇒ horizontal shaft across the bbox mid-line (PC fallback); a
+/// zero-length shaft draws only its round-cap dot.
+void _drawArrow(
+  Canvas canvas,
+  List<List<double>> pts,
+  Rect r,
+  Paint paint,
+) {
+  double ax;
+  double ay;
+  double bx;
+  double by;
+  if (pts.length >= 2 && pts.first.length >= 2 && pts.last.length >= 2) {
+    ax = pts.first[0];
+    ay = pts.first[1];
+    bx = pts.last[0];
+    by = pts.last[1];
+  } else {
+    final double midY = (r.top + r.bottom) / 2;
+    ax = r.left;
+    ay = midY;
+    bx = r.right;
+    by = midY;
+  }
+  canvas.drawLine(Offset(ax, ay), Offset(bx, by), paint);
+  final double dx = bx - ax;
+  final double dy = by - ay;
+  final double length = math.sqrt(dx * dx + dy * dy);
+  if (length <= 1e-9) {
+    return;
+  }
+  final double ang = math.atan2(dy, dx);
+  final double head = math.max(12.0, paint.strokeWidth * 4.0);
+  for (final double delta in const <double>[-0.4, 0.4]) {
+    canvas.drawLine(
+      Offset(bx, by),
+      Offset(
+        bx - head * math.cos(ang + delta),
+        by - head * math.sin(ang + delta),
+      ),
+      paint,
+    );
   }
 }
 
@@ -1204,6 +1367,223 @@ void _drawPolyline(Canvas canvas, List<List<double>> pts, Paint paint) {
   }
   if (moved) {
     canvas.drawPath(path, paint);
+  }
+}
+
+/// Degenerate-config guard for huge graph ranges (PC `MAX_GRAPH_TICKS`):
+/// beyond this many data-unit ticks on one axis, gridlines/ticks/labels for
+/// that axis are skipped while the axes still draw.
+const int _maxGraphTicks = 4096;
+
+/// `graph_config` numeric field with fallback (Doc 03 inner keys).
+double _graphNum(Object? v, double fallback) =>
+    v is num ? v.toDouble() : fallback;
+
+/// `graph_config` two-number field (`origin` / `x_range` / `y_range` /
+/// `range`) with fallback; malformed values take the default.
+List<double> _graphPair(Object? v, List<double> fallback) {
+  if (v is List && v.length >= 2 && v[0] is num && v[1] is num) {
+    return <double>[(v[0] as num).toDouble(), (v[1] as num).toDouble()];
+  }
+  return fallback;
+}
+
+/// GRAPH_AXES axes/grid/ticks/labels from `geometry.graphConfig`
+/// (Doc 08 §4(3); the PC `_draw_graph` in `pc_agent/export/*_exporter.py`
+/// is the normative reference and this mirrors it point-for-point): data y
+/// is UP, world y is DOWN (`wy = oy − data·grid_step`), gridlines at every
+/// integer data unit inside the ranges (CARTESIAN only), tick length
+/// `0.35·grid_step` (Doc 08 §4(3)), numeric labels at major ticks when
+/// `show_labels`. `NUMBER_LINE` gets a horizontal axis + ticks + labels +
+/// arrowheads at both ends and NO gridlines (Doc 08 §4(3)).
+///
+/// Config dialects: `CARTESIAN_2D` reads Doc 03 `origin / x_range /
+/// y_range / grid_step / show_labels`; `NUMBER_LINE` reads the Doc 24
+/// builder keys `range / step` with `x_range / grid_step` accepted as PC
+/// aliases. Unknown `shape_type` values fall back to the legacy polyline so
+/// documents that predate graphs never regress their rendering.
+void _drawGraph(Canvas canvas, CanvasNodeModel n, Paint paint) {
+  final String? shapeType = n.geometry.shapeType;
+  if (shapeType != 'CARTESIAN_2D' && shapeType != 'NUMBER_LINE') {
+    _drawPolyline(canvas, n.geometry.pts, paint);
+    return;
+  }
+  final Map<String, dynamic> cfg =
+      n.geometry.graphConfig ?? const <String, dynamic>{};
+  final bool numberLine = shapeType == 'NUMBER_LINE';
+  final List<double> origin =
+      _graphPair(cfg['origin'], const <double>[0.0, 0.0]);
+  final double ox = origin[0];
+  final double oy = origin[1];
+  final List<double> xr =
+      _graphPair(cfg['range'] ?? cfg['x_range'], const <double>[-10.0, 10.0]);
+  final double xr0 = math.min(xr[0], xr[1]);
+  final double xr1 = math.max(xr[0], xr[1]);
+  final List<double> yr =
+      _graphPair(cfg['y_range'], const <double>[-10.0, 10.0]);
+  final double yr0 = math.min(yr[0], yr[1]);
+  final double yr1 = math.max(yr[0], yr[1]);
+  double gs = _graphNum(cfg['grid_step'] ?? cfg['step'], 25.0);
+  if (!(gs > 0)) {
+    gs = 25.0; // PC export fallback
+  }
+  final bool showLabels = cfg['show_labels'] != false;
+
+  // World extents — PC export convention (matches the canvas page's bbox
+  // math for symmetric ranges): wx = ox + data·gs, wy = oy − data·gs.
+  final double wx0 = ox + xr0 * gs;
+  final double wx1 = ox + xr1 * gs;
+  final double wy0 = oy - yr1 * gs;
+  final double wy1 = oy - yr0 * gs;
+
+  // Integer data-unit tick sequences (one per grid_step in world units).
+  final int i0 = xr0.ceil();
+  final int i1 = xr1.floor();
+  final int j0 = yr0.ceil();
+  final int j1 = yr1.floor();
+  final bool xTicksOk = i1 - i0 + 1 > 0 && i1 - i0 + 1 <= _maxGraphTicks;
+  final bool yTicksOk = j1 - j0 + 1 > 0 && j1 - j0 + 1 <= _maxGraphTicks;
+
+  // Light grid (CARTESIAN only) — PC _GRID_RGB (0.78, 0.78, 0.80).
+  if (!numberLine) {
+    final Path grid = Path();
+    if (xTicksOk) {
+      for (int i = i0; i <= i1; i++) {
+        final double x = ox + i * gs;
+        grid
+          ..moveTo(x, wy0)
+          ..lineTo(x, wy1);
+      }
+    }
+    if (yTicksOk) {
+      for (int j = j0; j <= j1; j++) {
+        final double y = oy - j * gs;
+        grid
+          ..moveTo(wx0, y)
+          ..lineTo(wx1, y);
+      }
+    }
+    canvas.drawPath(
+      grid,
+      Paint()
+        ..isAntiAlias = true
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.0
+        ..color = const Color(0xFFC7C7CC),
+    );
+  }
+
+  // Axes through the origin, clipped to the ranges (style color/width).
+  final Path axes = Path()
+    ..moveTo(wx0, oy)
+    ..lineTo(wx1, oy);
+  if (!numberLine) {
+    axes
+      ..moveTo(ox, wy0)
+      ..lineTo(ox, wy1);
+  }
+  canvas.drawPath(
+    axes,
+    Paint()
+      ..isAntiAlias = true
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = math.max(1.0, paint.strokeWidth)
+      ..color = paint.color,
+  );
+
+  // Ticks: x-axis vertical downward, y-axis leftward; length 0.35·grid_step
+  // (Doc 08 §4(3)), width 1.2 (PC export).
+  final double tickLen = 0.35 * gs;
+  final Paint tickPaint = Paint()
+    ..isAntiAlias = true
+    ..style = PaintingStyle.stroke
+    ..strokeWidth = 1.2
+    ..color = paint.color;
+  if (xTicksOk) {
+    final Path ticks = Path();
+    for (int i = i0; i <= i1; i++) {
+      final double x = ox + i * gs;
+      ticks
+        ..moveTo(x, oy)
+        ..lineTo(x, oy + tickLen);
+    }
+    canvas.drawPath(ticks, tickPaint);
+  }
+  if (!numberLine && yTicksOk) {
+    final Path ticks = Path();
+    for (int j = j0; j <= j1; j++) {
+      final double y = oy - j * gs;
+      ticks
+        ..moveTo(ox, y)
+        ..lineTo(ox - tickLen, y);
+    }
+    canvas.drawPath(ticks, tickPaint);
+  }
+
+  // NUMBER_LINE arrowheads at both ends (Doc 08 §4(3) — mirrored triangles
+  // at the axis tips, viewport proportions `0.35·step` long / `0.4×` wide).
+  if (numberLine) {
+    final double headLen = tickLen;
+    final double headHw = tickLen * 0.4;
+    final Path head = Path()
+      ..moveTo(wx1, oy - headHw)
+      ..lineTo(wx1, oy)
+      ..lineTo(wx1 + headLen, oy)
+      ..close()
+      ..moveTo(wx1, oy + headHw)
+      ..lineTo(wx1, oy)
+      ..lineTo(wx1 + headLen, oy)
+      ..close()
+      ..moveTo(wx0, oy - headHw)
+      ..lineTo(wx0, oy)
+      ..lineTo(wx0 - headLen, oy)
+      ..close()
+      ..moveTo(wx0, oy + headHw)
+      ..lineTo(wx0, oy)
+      ..lineTo(wx0 - headLen, oy)
+      ..close();
+    canvas.drawPath(
+      head,
+      Paint()
+        ..isAntiAlias = true
+        ..style = PaintingStyle.fill
+        ..color = paint.color,
+    );
+  }
+
+  // Numeric labels at major ticks when show_labels (Doc 08 §4(3)) — label
+  // height 0.30·grid_step (viewport convention), clamped to a legible world
+  // range so degenerate steps cannot explode or vanish.
+  if (showLabels) {
+    final double labelH = (0.30 * gs).clamp(4.0, 64.0);
+    final double pad = 0.06 * gs;
+    final TextStyle style = TextStyle(color: paint.color, fontSize: labelH);
+    if (xTicksOk) {
+      for (int i = i0; i <= i1; i++) {
+        final double x = ox + i * gs;
+        final TextPainter tp = TextPainter(
+          text: TextSpan(text: '$i', style: style),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        tp.paint(
+          canvas,
+          Offset(x - tp.width / 2, oy + tickLen + pad - tp.height / 2),
+        );
+      }
+    }
+    if (!numberLine && yTicksOk) {
+      for (int j = j0; j <= j1; j++) {
+        final double y = oy - j * gs;
+        final TextPainter tp = TextPainter(
+          text: TextSpan(text: '$j', style: style),
+          textDirection: TextDirection.ltr,
+        )..layout();
+        tp.paint(
+          canvas,
+          Offset(ox - tickLen - pad - tp.width, y - tp.height / 2),
+        );
+      }
+    }
   }
 }
 

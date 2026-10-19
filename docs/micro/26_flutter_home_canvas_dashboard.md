@@ -8,6 +8,7 @@ Build the Home screen: a searchable `sqflite`-backed gallery of canvas thumbnail
 - `mobile_app/lib/features/home/home_canvas_dashboard.dart`
 - `mobile_app/lib/core/storage/local_db.dart`
 - `mobile_app/test/home_dashboard_test.dart`
+- `mobile_app/test/thumbnail_pipeline_test.dart` (round-6 — Doc 02 §10.6 save-time thumb + lazy backfill)
 
 ### Read-only dependencies (imports, each cited as "Doc NN")
 - Doc 05 `mobile_app/lib/core/models/canvas_models.dart` — `CanvasDocumentModel`, `Artboard`, `Presets`, `NodeStyleModel`, uuid note (Doc 25 `uuidV4()` helper may be imported read-only)
@@ -16,9 +17,10 @@ Build the Home screen: a searchable `sqflite`-backed gallery of canvas thumbnail
 - Doc 03 `shared_specs/canvas_document_schema.json` — document JSON keys, presets, upgrade rule §4.4
 - Doc 23 `mobile_app/lib/canvas_engine/artboard_manager.dart` — `UpgradeResult`, `ArtboardManager.tryUpgrade`
 - Doc 25 `mobile_app/lib/network/vector_sync_client.dart` — `uuidV4()` helper (Wave 1.B prerequisite)
+- Doc 02 §10.6 pre-seeded renderer `mobile_app/lib/canvas_engine/thumbnail_renderer.dart` — `renderDocThumbnail` / `saveDocThumbnail` (import read-only; the file itself is FROZEN, Doc 02 §10.8)
 
 ### Never touches (paths owned by concurrent docs — write-conflict guard)
-`mobile_app/lib/features/tools/**` (Doc 24), `mobile_app/lib/features/export/**` (Doc 27), `mobile_app/lib/network/**` (Doc 25), `mobile_app/lib/canvas_engine/**` (Docs 20–23), `mobile_app/lib/core/models/**` + `lib/core/theme/**` + `lib/main.dart` (Doc 05), `pc_agent/**`, `shared_specs/**`
+`mobile_app/lib/features/tools/**` (Doc 24), `mobile_app/lib/features/export/**` (Doc 27), `mobile_app/lib/network/**` (Doc 25), `mobile_app/lib/canvas_engine/**` (Docs 20–23; incl. the frozen `thumbnail_renderer.dart`, Doc 02 §10.6/§10.8), `mobile_app/lib/core/models/**` + `lib/core/theme/**` + `lib/main.dart` (Doc 05), `pc_agent/**`, `shared_specs/**`
 
 > Path note: this doc owns `features/home/home_canvas_dashboard.dart` exactly as mandated by the template §6 ownership matrix (and matching the `26_flutter_home_canvas_dashboard.md` catalog title in overview §5).
 
@@ -27,6 +29,7 @@ Build the Home screen: a searchable `sqflite`-backed gallery of canvas thumbnail
 - Doc 03 §4.4 upgrade rule: allow iff `target==INFINITE` OR (`min_x>=0 AND min_y>=0 AND max_x<=target.w AND max_y<=target.h`)
 - Doc 03 example element/style keys per `overview.md` §4.3 for the initial empty document
 - Doc 23 freeze: `UpgradeResult { final bool allowed; final String? reasonKey; }` — reason keys `"clips_content"`, `"invalid_target"`
+- Doc 02 §10.6 thumbnail contract: `Future<Uint8List> renderDocThumbnail(CanvasDocumentModel doc, {int size = 256})` and `Future<String> saveDocThumbnail(CanvasDocumentModel doc, String outPath, {int size = 256})` in the frozen `lib/canvas_engine/thumbnail_renderer.dart`; preset badges (A5/A4/LETTER/INFINITE) are **UI overlays never baked into the image**; local save paths generate the thumbnail (mobile: inside `saveDocument`)
 
 ## 4. Interface Freeze
 **Consumed — Doc 05 (verbatim, template §5):**
@@ -66,9 +69,14 @@ class LocalDb {
   Future<void> delete(String id);
   Future<void> close();
 }
-Future<String> saveDocument(CanvasDocumentModel doc);    // ZIP document.json+assets →
+Future<String> saveDocument(CanvasDocumentModel doc,
+                            {String? baseDir, Map<String, List<int>>? assets,
+                             ThumbGenerator? thumbGenerator});  // ZIP document.json+assets →
                                                          // path_provider app-documents/SlateSync/<canvasId>.slatesync
-Future<CanvasDocumentModel> loadDocument(String id);     // unzip + CanvasDocumentModel.fromJson
+                                                         // + Doc 02 §10.6: generates the gallery thumbnail
+                                                         //   (frozen saveDocThumbnail, size 256) on every save
+Future<CanvasDocumentModel> loadDocument(String id, {String? baseDir}); // unzip + CanvasDocumentModel.fromJson
+Future<String> thumbFilePath(String id, {String? baseDir});   // canonical <base>/thumbs/<id>.png (§10.6)
 
 // mobile_app/lib/features/home/home_canvas_dashboard.dart
 class HomeCanvasDashboard extends StatefulWidget {
@@ -86,9 +94,10 @@ class UpgradeDialog extends StatefulWidget {
 ## 5. Implementation Plan
 1. **`LocalDb` schema** — `onCreate`: `CREATE TABLE canvases(id TEXT PRIMARY KEY, title TEXT, preset TEXT, background TEXT, thumb_path TEXT, file_path TEXT, updated_at INTEGER)`; `insertCanvas` = `insert(..., conflictAlgorithm: replace)`.
 2. **CRUD + search** — `list({String? query})`: `WHERE title LIKE ?` (`%q%`) when query non-empty, always `ORDER BY updated_at DESC`; `get/update/delete` by `id`; `open()` uses `getDatabasesPath()` (tests inject `pathOverride` with `sqflite_common_ffi`).
-3. **`.slatesync` cache** — `saveDocument`: `doc.toJson()` → `jsonEncode` → `ZipEncoder` writing `document.json` (+ `assets/*` if `assetRef`s present) to `getApplicationDocumentsDirectory()/SlateSync/<canvasId>.slatesync`; `loadDocument(id)` unzips and returns `CanvasDocumentModel.fromJson`. *(Doc 05 `archive` dependency — consume, never redefine.)*
-4. **Gallery grid** — `HomeCanvasDashboard`: `TextField` search (debounced, calls `LocalDb.list(query)`), `GridView` of thumbnail cards (thumb image or preset-colored placeholder, title, preset chip `A5/A4/Letter/Infinite`, relative updated time like "2 h ago"); empty state: icon + "No canvases yet — tap + to start".
-   Card layout contract (tested): title (ellipsis), preset chip, relative time — three visual children in one `Card`; thumbnail rendered from `thumb_path` if the file exists, else a gradient placeholder tinted by preset.
+3. **`.slatesync` cache** — `saveDocument`: `doc.toJson()` → `jsonEncode` → `ZipEncoder` writing `document.json` (+ `assets/*` if `assetRef`s present) to `getApplicationDocumentsDirectory()/SlateSync/<canvasId>.slatesync`; **then (Doc 02 §10.6) generate the gallery thumbnail inside `saveDocument`** via the frozen renderer `saveDocThumbnail(doc, <docs>/SlateSync/thumbs/<canvasId>.png, size: 256)` so every local save path refreshes the card image; `loadDocument(id)` unzips and returns `CanvasDocumentModel.fromJson`. *(Doc 05 `archive` dependency — consume, never redefine; renderer imported read-only — never edited here.)*
+4. **Gallery grid** — `HomeCanvasDashboard`: `TextField` search (debounced, calls `LocalDb.list(query)`), `GridView` of thumbnail cards; empty state: icon + "No canvases yet — tap + to start".
+   Card layout contract (tested): `Card` = thumbnail area on top (neutral/gradient placeholder underneath, `Image.file` fade-in when `thumb_path` exists, **preset badge chip OVERLAID top-left** — Doc 02 §10.6, a widget never painted into the PNG) + title (ellipsis) + relative time row (menu on the right); the badge is a solid distinct hue per preset with white bold text (≥ 4.5:1 contrast).
+   **Lazy backfill (Doc 02 §10.6):** rows whose `thumb_path` is empty or whose file is missing (legacy rows, evicted files) enqueue into a tiny id queue drained sequentially on gallery refresh — frozen renderer → write `<thumbs>/<id>.png` → `LocalDb.update` the row — each missing thumb generated **exactly once**, gradient placeholder showing until then.
 5. **New Canvas modal** — `showDialog` → `NewCanvasModal`: preset cards A5/A4/Letter/Infinite (sizes from `Presets`; Infinite ⇒ `isInfinite: true`, null dims) + four mini `CustomPainter` background previews (`BLANK/RULED/DOT_GRID/ISO_GRID`); title field (default "Untitled"); Create ⇒ build `CanvasDocumentModel` (Doc 05 defaults: `contentBounds` zeros, `elements: []`, `background_color: #FFFFFF`, uuid via Doc 25 `uuidV4()`) → `saveDocument` + `insertCanvas` row → refresh grid.
    New document seed (initial `toJson()` fragment per Doc 03):
    ```json
@@ -98,7 +107,7 @@ class UpgradeDialog extends StatefulWidget {
    ```
 6. **Open / rename / delete** — card tap ⇒ `loadDocument(id)` → `onOpenDocument(doc)` (canvas route wired Wave 3.A); long-press context menu: Rename (dialog → `LocalDb.update`), Delete (confirm → `LocalDb.delete` + delete `.slatesync` file + thumb).
 7. **Upgrade dialog** — preset chips call injected `manager.tryUpgrade(target)`; `allowed == false` ⇒ warning overlay/banner showing `reasonKey` (`"clips_content"` → “New size would crop existing content”, `"invalid_target"` → “Invalid target size”); `allowed == true` ⇒ apply returned `Artboard` to the model, `saveDocument` again, `onSaved(newArtboard)`, pop.
-8. **Relative-time & chips** — preset chip labels `A5 / A4 / Letter / Infinite`; updated time rendered as `just now` (<60 s), `N min ago`, `N h ago`, `N d ago`, else `yyyy-MM-dd`; derived purely from `updated_at` (unix seconds) — unit-testable helper `String relativeTime(int now, int updatedAt)`.
+8. **Relative-time & chips** — preset chip labels `A5 / A4 / Letter / Infinite` (the §10.6 **badge chip** — a UI overlay ON the thumbnail's top-left corner, never baked into the rendered image); updated time rendered as `just now` (<60 s), `N min ago`, `N h ago`, `N d ago`, else `yyyy-MM-dd`; derived purely from `updated_at` (unix seconds) — unit-testable helper `String relativeTime(int now, int updatedAt)`.
 9. **Tests** — see §6.
 
 ## 6. Testing & Acceptance Criteria
@@ -106,6 +115,8 @@ class UpgradeDialog extends StatefulWidget {
 - **Search case-insensitivity**: query `"lecture"` matches title `"Control Systems LECTURE 04"` (SQLite `LIKE` default); empty query returns all rows.
 - **Roundtrip**: build a `CanvasDocumentModel` (1 element) → `saveDocument` → `loadDocument` ⇒ deep-equals on `toJson()` keys incl. `artboard`, `content_bounds`, `elements`.
 - **ZIP container**: produced file is a real ZIP containing `document.json` at root (template §3 `.slatesync` contract), readable by `ZipDecoder`.
+- **Thumbnail on save (Doc 02 §10.6, `test/thumbnail_pipeline_test.dart`)**: `saveDocument` writes `<thumbs>/<canvas_id>.png` after the ZIP (frozen `saveDocThumbnail`, default `size: 256`; injected `thumbGenerator` seam for tests; best-effort — a rasterization failure never fails the save); a second save refreshes it; the PNG contains **no** preset badge — badges are overlaid chips only.
+- **Lazy backfill**: insert a row with `thumb_path=''` (or delete the PNG file) ⇒ the next gallery refresh regenerates the thumbnail and updates the row (each missing thumb exactly once — fake call counts); rows with a valid file are left untouched.
 - **Upgrade allowed**: fake `ArtboardManager.tryUpgrade('A4')` ⇒ `UpgradeResult(true, null)`; dialog calls `onSaved`, document re-saved with new `Artboard`.
 - **Upgrade blocked**: fake ⇒ `UpgradeResult(false, 'clips_content')` ⇒ banner text visible, `onSaved` **not** called, dialog stays open.
 - **Reason-key mapping**: both `"clips_content"` and `"invalid_target"` render distinct, human-readable messages.

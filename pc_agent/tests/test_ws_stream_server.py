@@ -541,3 +541,172 @@ def test_token_provider_read_per_connection() -> None:
     finally:
         server.stop()
     assert [event["frame"].seq for event in rec.of(LIVE_FRAME)] == [1, 5]
+
+
+# -- round 6 live mutation relay (Doc 02 §10.2) ------------------------------
+
+
+class _FakeConn:
+    """Stand-in ``ServerConnection``: records every payload pushed to it.
+
+    ``__eq__`` deliberately reports every fake as equal to every other — the
+    relay's ``exclude`` must therefore key on IDENTITY (``is``), never ``==``.
+    """
+
+    def __init__(self, name: str, *, broken: bool = False) -> None:
+        self.name = name
+        self.broken = broken
+        self.sent: list[str] = []
+
+    async def send(self, payload: str) -> None:
+        if self.broken:
+            raise RuntimeError(f"fake connection {self.name!r} is dead")
+        self.sent.append(payload)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _FakeConn)
+
+    __hash__ = object.__hash__  # keep identity hashing for set membership
+
+
+def test_relay_reaches_other_clients_but_never_the_sender(server_env: Any) -> None:
+    _, server, rec = server_env
+    sender, peer_a, peer_b = _FakeConn("sender"), _FakeConn("a"), _FakeConn("b")
+    server._clients.update({sender, peer_a, peer_b})
+    msg = _envelope(type="ELEMENT_COMMIT", action="ADD_STROKE", payload={"node_id": "n1"})
+
+    server._dispatch_text(json.dumps(msg), sender=sender)
+
+    assert rec.wait_for(RPC_MESSAGE)  # local dispatch happens first, always
+    assert _wait_until(lambda: len(peer_a.sent) == 1 and len(peer_b.sent) == 1)
+    time.sleep(0.1)  # settle: an (incorrect) echo would have landed by now
+    assert rec.of(RPC_MESSAGE) == [{"msg": msg}]
+    assert sender.sent == []  # the sending device never receives its own echo
+    assert [json.loads(raw) for raw in peer_a.sent] == [msg]  # exact payload
+    assert [json.loads(raw) for raw in peer_b.sent] == [msg]
+
+
+def test_relay_covers_clear_and_resize_but_never_other_types(server_env: Any) -> None:
+    _, server, rec = server_env
+    sender, peer = _FakeConn("sender"), _FakeConn("peer")
+    server._clients.update({sender, peer})
+    relayed = [
+        _envelope(type="ELEMENT_COMMIT", action="CLEAR_CANVAS", payload={}),
+        _envelope(type="ARTBOARD_RESIZE", action="UPGRADE_SIZE", payload={"preset": "A4"}),
+    ]
+    not_relayed = [
+        _envelope(
+            type="CANVAS_LIFECYCLE",
+            action="CANVAS_PUT",
+            payload={"canvas": {"canvas_id": "c-1"}, "source": "device"},
+        ),
+        _envelope(
+            type="ASSET_UPLOAD",
+            action="ASSET_START",
+            payload={"transfer_id": "t", "filename": "f", "total_chunks": 1, "size_bytes": 1},
+        ),
+        _envelope(
+            type="EXPORT_JOB",
+            action="START_EXPORT",
+            payload={"job_id": "j", "format": "PNG", "dpi": 300, "target": "PC"},
+        ),
+    ]
+
+    for msg in relayed + not_relayed:
+        server._dispatch_text(json.dumps(msg), sender=sender)
+
+    assert rec.wait_for(RPC_MESSAGE, count=len(relayed) + len(not_relayed))
+    assert _wait_until(lambda: len(peer.sent) == len(relayed))
+    time.sleep(0.1)  # settle: non-mutation types must never trickle through
+    assert [json.loads(raw) for raw in peer.sent] == relayed  # in order, exact
+    assert sender.sent == []
+
+
+def test_broadcast_json_exclude_is_connection_identity(server_env: Any) -> None:
+    _, server, _ = server_env
+    excluded, equal_peer, bystander = (
+        _FakeConn("excluded"),
+        _FakeConn("equal-peer"),
+        _FakeConn("bystander"),
+    )
+    server._clients.update({excluded, equal_peer, bystander})
+    msg = _envelope(type="ELEMENT_COMMIT", action="DELETE_NODE", payload={"node_id": "gone"})
+
+    server.broadcast_json(msg, exclude=excluded)
+
+    assert _wait_until(lambda: equal_peer.sent and bystander.sent)
+    time.sleep(0.1)
+    assert excluded.sent == []  # only the excluded connection identity is skipped
+    assert all(json.loads(raw) == msg for raw in equal_peer.sent + bystander.sent)
+    assert excluded == equal_peer  # ...even though "==" cannot tell the fakes apart
+
+
+def test_relay_skips_dead_client(server_env: Any) -> None:
+    _, server, _ = server_env
+    sender, peer, dead = _FakeConn("sender"), _FakeConn("peer"), _FakeConn("dead", broken=True)
+    server._clients.update({sender, peer, dead})
+    msg = _envelope(type="ELEMENT_COMMIT", action="CLEAR_CANVAS", payload={})
+
+    server._dispatch_text(json.dumps(msg), sender=sender)
+
+    assert _wait_until(lambda: len(peer.sent) == 1)  # dead client never blocks peers
+    assert _wait_until(lambda: dead not in server._clients)  # discarded, best-effort
+    time.sleep(0.1)
+    assert json.loads(peer.sent[0]) == msg
+    assert sender.sent == []
+
+
+def test_concurrent_relay_sends_are_safe(server_env: Any) -> None:
+    _, server, _ = server_env
+    a, b, c = _FakeConn("a"), _FakeConn("b"), _FakeConn("c")
+    server._clients.update({a, b, c})
+    per_sender = 25
+
+    def relay(fake: _FakeConn) -> None:
+        for index in range(per_sender):
+            server.broadcast_json(
+                _envelope(
+                    type="ELEMENT_COMMIT",
+                    action="ADD_STROKE",
+                    payload={"node_id": f"{fake.name}-{index}"},
+                ),
+                exclude=fake,
+            )
+
+    threads = [threading.Thread(target=relay, args=(fake,)) for fake in (a, b, c)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(_WAIT_S)
+        assert not thread.is_alive()
+
+    expected = per_sender * 2  # every fake must hear the OTHER two senders
+    assert _wait_until(lambda: all(len(fake.sent) == expected for fake in (a, b, c)))
+    time.sleep(0.1)
+    for fake in (a, b, c):
+        assert len(fake.sent) == expected  # no drops, no duplicates under load
+        node_ids = [json.loads(raw)["payload"]["node_id"] for raw in fake.sent]
+        assert len(set(node_ids)) == expected
+        assert not any(nid.startswith(f"{fake.name}-") for nid in node_ids)  # no self-echo
+
+
+def test_relay_end_to_end_between_two_real_connections(server_env: Any) -> None:
+    """Handler wiring proof: ``_handler`` passes ``sender=websocket`` through."""
+    _, server, rec = server_env
+    msg = _envelope(type="ELEMENT_COMMIT", action="CLEAR_CANVAS", payload={})
+
+    async def scenario() -> None:
+        async with (
+            websockets.connect(_ws_url(server)) as device_a,
+            websockets.connect(_ws_url(server)) as device_b,
+        ):
+            assert await _async_wait_until(lambda: len(rec.of(CONNECTION_STATE)) >= 2)
+            await device_a.send(json.dumps(msg))
+            raw = await asyncio.wait_for(device_b.recv(), _WAIT_S)
+            assert json.loads(raw) == msg  # peer got the exact payload...
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(device_a.recv(), 0.4)  # ...sender got no echo
+
+    asyncio.run(scenario())
+    assert rec.wait_for(RPC_MESSAGE)
+    assert rec.of(RPC_MESSAGE) == [{"msg": msg}]

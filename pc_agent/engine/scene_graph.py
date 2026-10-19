@@ -20,6 +20,7 @@ import rtree
 
 from pc_agent.core.events import (
     ARTBOARD_CHANGED,
+    CANVAS_CLEARED,
     COMMITTED_NODE,
     RPC_MESSAGE,
     EventBus,
@@ -212,6 +213,25 @@ class SceneGraph:
         with self._lock:
             self._artboard = artboard
 
+    def clear_all(self) -> None:
+        """Wipe EVERY element: fresh rtree + dict + zero bounds (Doc 02 §10.1).
+
+        Also discards the full undo/redo history — the stacked commands hold
+        closures over the removed nodes, so nothing could be restored meaningfully
+        (history loss is deliberate; matching ``replace_all``, this emits nothing:
+        the ``CANVAS_CLEARED`` event is emitted by ``apply_rpc``). The bound
+        artboard (if any) is untouched: only elements are cleared.
+        """
+        with self._lock:
+            self._nodes = {}
+            self._index = rtree.Index()
+            self._boxes = {}
+            self._ids = {}
+            self._next_id = 0
+            self._bounds = dict(_ZERO_BOUNDS)
+            self._undo.clear()
+            self._redo.clear()
+
     # ------------------------------------------------------------------
     # RPC routing (frozen table, Doc 09 §4)
     # ------------------------------------------------------------------
@@ -230,6 +250,15 @@ class SceneGraph:
                     logger.warning("DELETE_NODE without payload.node_id ignored: %r", msg)
                     return
                 self.delete(str(node_id))
+            elif action == "CLEAR_CANVAS":
+                # Doc 02 §10.1: PC applies ALWAYS (no open-document gating in
+                # the scene graph — it indexes the single currently-open doc).
+                self.clear_all()
+                canvas_id = msg.get("canvas_id")
+                self._bus.emit(
+                    CANVAS_CLEARED,
+                    canvas_id=canvas_id if isinstance(canvas_id, str) else "",
+                )
             elif action in _DEFAULT_KINDS:
                 self._rpc_add(action, payload)
         elif envelope_type == "ARTBOARD_RESIZE" and action == "UPGRADE_SIZE":

@@ -29,6 +29,9 @@ import 'package:mobile_app/canvas_engine/tiled_canvas_painter.dart'; // Doc 22
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 import 'package:mobile_app/core/storage/local_db.dart'; // Doc 26
 import 'package:mobile_app/core/theme/studio_theme.dart'; // Doc 05
+import 'package:mobile_app/features/canvas/canvas_shape_conventions.dart';
+import 'package:mobile_app/features/canvas/image_source_popup.dart';
+import 'package:mobile_app/features/canvas/remote_mutation_applier.dart';
 import 'package:mobile_app/features/export/export_modal_sheet.dart'; // Doc 27
 import 'package:mobile_app/features/home/home_canvas_dashboard.dart'; // Doc 26
 import 'package:mobile_app/features/pairing/pairing_screen.dart'; // Issue 03
@@ -51,6 +54,7 @@ class CanvasStudioPage extends StatefulWidget {
     required this.client,
     this.db,
     this.baseDir,
+    this.pickImageFromSource,
   });
 
   final CanvasDocumentModel document;
@@ -61,6 +65,10 @@ class CanvasStudioPage extends StatefulWidget {
 
   /// Optional `.slatesync` cache directory (tests).
   final String? baseDir;
+
+  /// Issue 05 — image-tool picker override (tests); `null` ⇒ the default
+  /// `image_picker` implementation in image_source_popup.dart.
+  final ImageSourcePickFn? pickImageFromSource;
 
   @override
   State<CanvasStudioPage> createState() => _CanvasStudioPageState();
@@ -73,6 +81,10 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   late final CameraController _camera;
   late final TiledCanvasEngine _engine;
   late final ArtboardManager _artboard;
+
+  /// Doc 02 §10.2 live-mutation relay receive side (shared with the local
+  /// clear path through [wipeDocumentElements]).
+  late final RemoteMutationApplier _remote;
 
   // -- Tool state (Doc 24) -------------------------------------------------
   late final ValueNotifier<ToolConfig> _toolConfig;
@@ -90,6 +102,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   int? _shapePointer;
   Offset? _shapeStart;
   Offset? _shapeEnd;
+
+  /// Issue 05 — one Gallery/Camera popup at a time per image-tool tap.
+  bool _imageFlowActive = false;
 
   // -- Repaint plumbing ----------------------------------------------------
   final ValueNotifier<int> _canvasTick = ValueNotifier<int>(0);
@@ -134,6 +149,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     }
 
     _engine.setDocument(_doc);
+    _remote = RemoteMutationApplier(
+      doc: _doc,
+      engine: _engine,
+      artboard: _artboard,
+    );
     _camera.onCameraChanged = _onCameraChanged;
     // Issue 05 §4 — OS memory pressure → aggressive tile-cache trim.
     WidgetsBinding.instance.addObserver(this);
@@ -173,10 +193,36 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   void _onSyncEvent(SyncEvent event) {
-    if (!mounted || event.kind != SyncEventKind.stateChanged) {
+    if (!mounted) {
+      return;
+    }
+    if (event.kind == SyncEventKind.rpcReceived) {
+      _applyRemoteMsg(event.msg);
+      return;
+    }
+    if (event.kind != SyncEventKind.stateChanged) {
       return;
     }
     setState(() {}); // connection chip + banner follow Doc 25 transitions
+  }
+
+  /// Doc 02 §10.2 — live mutation relay: apply peer commits/renames for the
+  /// OPEN document; every other envelope (incl. other `canvas_id`s) is
+  /// ignored silently. The hub excludes our own echoes; the applier still
+  /// guards against duplicates from a misbehaving relay.
+  void _applyRemoteMsg(Map<String, dynamic>? msg) {
+    if (msg == null) {
+      return;
+    }
+    if (!_remote.apply(msg, openCanvasId: _doc.canvasId) || !mounted) {
+      return;
+    }
+    _dirty = true;
+    _canvasTick.value++;
+    setState(() {});
+    if (msg['type'] == 'ARTBOARD_RESIZE') {
+      unawaited(_save()); // remote preset swap persists immediately (Doc 23)
+    }
   }
 
   void _onCameraChanged(CameraSnapshot snap) {
@@ -219,6 +265,13 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   // Layout + initial framing
   // -------------------------------------------------------------------------
 
+  /// Doc 02 §10.5 fit-on-open target: bounded ⇒ page rect `(0,0,w,h)`;
+  /// infinite ⇒ `content_bounds`, with the spec's `(-500,-500,1000,1000)`
+  /// fallback while those bounds are empty.
+  Rect _fitTarget() => _artboard.boundaryRect() ??
+      _boundsRectOrNull() ??
+      const Rect.fromLTWH(-500, -500, 1000, 1000);
+
   void _ensureInitialFit(Size size) {
     if (size.isEmpty) {
       return;
@@ -228,15 +281,34 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       return;
     }
     _fitDone = true;
-    final Rect target = _artboard.boundaryRect() ??
-        _boundsRectOrNull() ??
-        Rect.fromCenter(center: Offset.zero, width: 1200, height: 900);
-    final double zx = size.width / (target.width + 96);
-    final double zy = size.height / (target.height + 96);
-    final double fit = zx < zy ? zx : zy;
-    // Silent assign (no Doc 20 hook) — we are inside build.
-    _camera.applyRemote(fit, target.center.dx, target.center.dy);
-    _lastBucket = _engine.currentBucket; // Issue 05 §3 baseline
+    // §10.5: `zoomToFit` runs AFTER the first layout frame (the viewport is
+    // only known here, and the Doc 20 hook may not fire mid-build). The
+    // camera applies the 48-unit padding (+96 per axis) and centers the
+    // target via the §3 transform; the hook then repaints + baselines the
+    // Issue 05 §3 zoom bucket.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      _applyFit();
+      _lastBucket = _engine.currentBucket; // Issue 05 §3 baseline
+    });
+  }
+
+  /// Doc 02 §10.5 fit: [CameraController.zoomToFit] takes the viewport only
+  /// to COMPUTE the scale — the controller's own viewport (what `viewMatrix`
+  /// centers against) is fed by gestures alone, so a fresh controller still
+  /// holds its 800×600 default and the page would open visibly off-centre
+  /// until the first pinch. A rebase + 1× update at focal `(0, 0)` adopts
+  /// the live viewport while the fixed-point math cancels exactly (scale
+  /// and centre are unchanged) — safe at any point in the gesture history.
+  void _applyFit() {
+    _camera.zoomToFit(_fitTarget(), _viewport); // fires onCameraChanged
+    _camera.onScaleStart(ScaleStartDetails(focalPoint: Offset.zero));
+    _camera.onScaleUpdate(
+      ScaleUpdateDetails(focalPoint: Offset.zero),
+      _viewport,
+    ); // fires onCameraChanged again — idempotent state, synced viewport
   }
 
   Rect? _boundsRectOrNull() {
@@ -251,27 +323,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     return Rect.fromLTRB(minX, minY, maxX, maxY);
   }
 
-  Map<String, double> _unionBounds(Rect r) {
-    final Map<String, double> b = _doc.contentBounds;
-    final double minX = b['min_x'] ?? 0;
-    final double minY = b['min_y'] ?? 0;
-    final double maxX = b['max_x'] ?? 0;
-    final double maxY = b['max_y'] ?? 0;
-    if (minX == 0 && minY == 0 && maxX == 0 && maxY == 0) {
-      return <String, double>{
-        'min_x': r.left,
-        'min_y': r.top,
-        'max_x': r.right,
-        'max_y': r.bottom,
-      };
-    }
-    return <String, double>{
-      'min_x': math.min(minX, r.left),
-      'min_y': math.min(minY, r.top),
-      'max_x': math.max(maxX, r.right),
-      'max_y': math.max(maxY, r.bottom),
-    };
-  }
+  Map<String, double> _unionBounds(Rect r) =>
+      unionContentBounds(_doc.contentBounds, r);
 
   // -------------------------------------------------------------------------
   // Pointer input (Listener) + camera gestures (GestureDetector)
@@ -285,13 +338,17 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     if (tool == StudioTool.eraser) {
       _erasing = true;
       _erasedInDrag.clear();
-      _eraseAt(e.localPosition, drag: false);
+      _eraseAt(e.localPosition);
       return;
     }
-    if (tool == StudioTool.image ||
-        tool == StudioTool.cartesianGraph ||
-        tool == StudioTool.numberLine) {
-      return; // dialog / picker flows — no direct canvas input
+    if (tool == StudioTool.image) {
+      if (_pointers.length == 1) {
+        unawaited(_beginImageFlow(e.localPosition));
+      }
+      return; // Gallery/Camera popup flow — no direct canvas input
+    }
+    if (tool == StudioTool.cartesianGraph || tool == StudioTool.numberLine) {
+      return; // dock graph-builder dialogs — no direct canvas input
     }
     if (_palm.shouldReject(e)) {
       return;
@@ -319,7 +376,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   void _onPointerMove(PointerMoveEvent e) {
     if (toolIsEraser()) {
       if (_erasing && _toolConfig.value.eraserMode == EraserMode.stroke) {
-        _eraseAt(e.localPosition, drag: true);
+        _eraseAt(e.localPosition);
       }
       return;
     }
@@ -330,10 +387,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       final Offset world = _camera.screenToWorld(e.localPosition, _viewport);
       final Offset snapped = _applyLineSnap(_shapeStart!, world);
       _shapeEnd = snapped;
+      // Local preview shows the actual shape outline; the PC mirrors the
+      // drag corner via ToolId.shapePreview (0x04) frames below.
       _liveView
         ..clear()
-        ..add(_shapeStart!)
-        ..add(snapped);
+        ..addAll(shapePreviewPoints(_tool.value, _shapeStart!, snapped));
       _canvasTick.value++;
       _streamPoint(snapped, 1.0);
       return;
@@ -560,7 +618,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   // Eraser hit-testing (Doc 22 queryVisible → Doc 25 DELETE_NODE)
   // -------------------------------------------------------------------------
 
-  void _eraseAt(Offset screen, {required bool drag}) {
+  void _eraseAt(Offset screen) {
     final Offset world = _camera.screenToWorld(screen, _viewport);
     // Eraser hit radius follows ToolConfig.width (dock's "Hit radius" slider, dp).
     final double pad =
@@ -588,8 +646,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     if (victim == null) {
       return;
     }
-    if (drag && !_erasedInDrag.add(victim.nodeId)) {
-      return; // one DELETE_NODE per node per drag (Doc 24 stroke mode)
+    if (!_erasedInDrag.add(victim.nodeId)) {
+      // One DELETE_NODE per node per press/drag (Doc 24 §4): the
+      // precision/stroke down-hit records the id too, so a stroke-mode drag
+      // that starts ON a node (or crosses it twice) never double-fires.
+      return;
     }
     _deleteNode(victim.nodeId);
   }
@@ -640,32 +701,16 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       _canvasTick.value++;
       return; // accidental tap — nothing to commit
     }
-    final String? shapeType = switch (tool) {
-      StudioTool.rect => 'RECT',
-      StudioTool.circle => 'CIRCLE',
-      StudioTool.triangle => 'TRIANGLE',
-      StudioTool.arrow => 'ARROW',
-      _ => null,
-    };
-    final String kind = tool == StudioTool.line ? 'LINE' : 'SHAPE';
-    final List<List<double>> pts = switch (tool) {
-      StudioTool.triangle => <List<double>>[
-        <double>[rect.left, rect.bottom],
-        <double>[rect.right, rect.bottom],
-        <double>[rect.center.dx, rect.top],
-      ],
-      StudioTool.line || StudioTool.arrow => <List<double>>[
-        <double>[start.dx, start.dy],
-        <double>[end.dx, end.dy],
-      ],
-      _ => <List<double>>[
-        <double>[rect.left, rect.top],
-        <double>[rect.right, rect.bottom],
-      ],
-    };
+    // Doc 02 §10.3 — kind / shape_type / pts follow the PC conventions
+    // (canvas_shape_conventions.dart); then index locally + RPC in one step.
     _streamEnd();
     _commitElement(
-      _buildNode(kind: kind, shapeType: shapeType, pts: pts, rect: rect),
+      _buildNode(
+        kind: shapeKindForTool(tool),
+        shapeType: shapeTypeForTool(tool),
+        pts: shapePtsForTool(tool, start: start, end: end),
+        rect: rect,
+      ),
       rect,
       'ADD_SHAPE',
     );
@@ -712,6 +757,46 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       rect,
       'ADD_GRAPH',
     );
+  }
+
+  /// Issue 05 — image tool: a canvas TAP opens the page-owned Gallery /
+  /// Camera popup; a completed pick places the image centred at the tap's
+  /// world point (600-unit long-side planner, Doc 24 math), then streams
+  /// ASSET_START/CHUNK/DONE + ADD_IMAGE through [_onPickImage].
+  Future<void> _beginImageFlow(Offset screen) async {
+    if (_imageFlowActive) {
+      return;
+    }
+    _imageFlowActive = true;
+    try {
+      final ImageSource? source = await showImageSourcePopup(context);
+      if (source == null || !mounted) {
+        return; // cancelled (barrier tap / back / Cancel)
+      }
+      final ImageSourcePickFn pick =
+          widget.pickImageFromSource ?? defaultPickImageFromSource;
+      final PickedImage? picked = await pick(source);
+      if (picked == null || !mounted) {
+        return; // cancelled pick — nothing to place
+      }
+      final Offset world = _camera.screenToWorld(screen, _viewport);
+      final Rect rect = planImageWorldRect(
+        picked.widthPx,
+        picked.heightPx,
+        at: world,
+      );
+      await _onPickImage(
+        PendingImage(
+          bytes: picked.bytes,
+          filename: picked.filename,
+          widthPx: picked.widthPx,
+          heightPx: picked.heightPx,
+          plannedWorldRect: rect,
+        ),
+      );
+    } finally {
+      _imageFlowActive = false;
+    }
   }
 
   Future<void> _onPickImage(PendingImage img) async {
@@ -808,12 +893,36 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   void _commitElement(CanvasNodeModel node, Rect content, String action) {
+    // Issue 05 root cause: shape/graph/image commits landed only in the
+    // document + RPC — never in the engine index — so their ink vanished on
+    // mobile at pen-lift (live preview cleared, nothing rebaked) while the
+    // PC, applying the same RPC, kept rendering it. Every element commit
+    // now indexes the node FIRST, exactly like `_commitStroke`.
+    _engine.addNode(node);
     _doc.elements.add(node);
     _artboard.noteContent(content);
     _doc.contentBounds = _unionBounds(content);
     _dirty = true;
     unawaited(widget.client.sendRpc(_commitEnvelope(action, node.toJson())));
     _canvasTick.value++;
+  }
+
+  /// Doc 02 §10.1 (Doc 24 §10.7 dock callback): wipe ALL elements locally,
+  /// then broadcast CLEAR_CANVAS for this document (payload `{}` — the
+  /// envelope's `canvas_id` identifies the target). `updated_at` bumps on
+  /// the next persist, same as every other mutation here.
+  void _onClearCanvas() {
+    wipeDocumentElements(doc: _doc, engine: _engine, artboard: _artboard);
+    _dirty = true;
+    _canvasTick.value++;
+    if (mounted) {
+      setState(() {});
+    }
+    unawaited(
+      widget.client.sendRpc(
+        _commitEnvelope('CLEAR_CANVAS', <String, dynamic>{}),
+      ),
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -878,10 +987,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   void _zoomToFit() {
-    final Rect target = _artboard.boundaryRect() ??
-        _boundsRectOrNull() ??
-        Rect.fromCenter(center: Offset.zero, width: 1200, height: 900);
-    _camera.zoomToFit(target, _viewport); // fires onCameraChanged → setState
+    // Doc 02 §10.5 target + 48-unit padding — same math as fit-on-open.
+    _applyFit(); // zoomToFit + viewport sync (fires onCameraChanged → setState)
   }
 
   void _onArtboardUpgraded(Artboard newArtboard) {
@@ -1169,6 +1276,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                     tool: _tool,
                     snapEnabled: _snap,
                     onEraseRequest: _deleteNode,
+                    onClearRequested: _onClearCanvas,
                     onPickImage: (PendingImage img) =>
                         unawaited(_onPickImage(img)),
                     onGraphCommitted: _onGraphCommitted,

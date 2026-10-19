@@ -4,9 +4,11 @@ Binding spec: ``docs/micro/11_pc_websocket_stream_server.md`` + template §3/§4
 A ``websockets`` asyncio server on ``config.ws_port`` (50606) path ``/ws`` runs
 in a daemon thread with its own event loop. Dispatch is emit-only: the server
 validates the §4.2 envelope shell but never interprets ``payload`` (Docs 09/10
-own the payload keys). One ``async for`` per connection preserves frame order;
-the u16 seq gate has a single ``last_seq`` per connection shared by all frame
-types (template §3).
+own the payload keys). Round 6 (Doc 02 §10.2): mutation envelopes received from
+a device are re-broadcast to every OTHER connection after local dispatch
+(``broadcast_json(msg, exclude=None)``). One ``async for`` per connection
+preserves frame order; the u16 seq gate has a single ``last_seq`` per
+connection shared by all frame types (template §3).
 """
 
 from __future__ import annotations
@@ -45,6 +47,10 @@ _CLOSE_BAD_PATH = 1008
 _STARTUP_TIMEOUT_S = 5.0
 _STOP_JOIN_TIMEOUT_S = 5.0
 _REQUIRED_ENVELOPE_KEYS = ("id", "type", "action", "canvas_id")
+
+#: Doc 02 §10.2 — envelope types re-broadcast to other devices after local
+#: dispatch (mutation relay); every other type is PC-local and never relayed.
+_RELAY_TYPES = frozenset({"ELEMENT_COMMIT", "ARTBOARD_RESIZE"})
 
 
 class WsStreamServer:
@@ -128,12 +134,17 @@ class WsStreamServer:
             return self._bound_port
         return self._config.ws_port
 
-    def broadcast_json(self, msg: dict) -> None:
+    def broadcast_json(self, msg: dict, exclude: ServerConnection | None = None) -> None:
         """Thread-safe fan-out of a JSON envelope to every live connection.
 
         Callable from ANY thread (Tk, executor). Never blocks and never raises
         into the caller: before ``start()`` (or after ``stop()``) the message is
         logged and dropped.
+
+        ``exclude`` (Doc 02 §10.2, additive round-6 parameter): a connection
+        object skipped by IDENTITY (``is``) — used by the live mutation relay
+        so a sending device never receives its own echo. Existing single-argument
+        callers are unchanged.
         """
         loop = self._loop
         if loop is None or not loop.is_running():
@@ -145,7 +156,7 @@ class WsStreamServer:
             logger.exception("broadcast_json: message is not JSON-serializable; dropped")
             return
         try:
-            future = asyncio.run_coroutine_threadsafe(self._send_all(payload), loop)
+            future = asyncio.run_coroutine_threadsafe(self._send_all(payload, exclude), loop)
         except RuntimeError:  # loop stopped between the check and scheduling
             logger.warning("broadcast_json: event loop unavailable; message dropped")
             return
@@ -212,7 +223,7 @@ class WsStreamServer:
             async for message in websocket:  # single reader preserves frame order
                 try:
                     if isinstance(message, str):
-                        self._dispatch_text(message)
+                                self._dispatch_text(message, sender=websocket)
                     else:
                         last_seq = self._dispatch_binary(message, last_seq)
                 except Exception:
@@ -252,7 +263,7 @@ class WsStreamServer:
 
     # -- text path -----------------------------------------------------------
 
-    def _dispatch_text(self, raw: str) -> None:
+    def _dispatch_text(self, raw: str, sender: ServerConnection | None = None) -> None:
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
@@ -262,6 +273,13 @@ class WsStreamServer:
             logger.warning("dropping RPC envelope failing section 4.2 shell validation")
             return
         self._bus.emit(RPC_MESSAGE, msg=msg)  # payload untouched (Docs 09/10/15)
+        # Doc 02 §10.2 live mutation relay: AFTER local dispatch, re-broadcast
+        # ELEMENT_COMMIT (incl. CLEAR_CANVAS) / ARTBOARD_RESIZE to every OTHER
+        # device — the sending connection is excluded, dead clients are skipped
+        # in _send_all. Non-mutation types (CANVAS_LIFECYCLE, ASSET_UPLOAD,
+        # EXPORT_JOB) are never relayed.
+        if sender is not None and msg["type"] in _RELAY_TYPES:
+            self.broadcast_json(msg, exclude=sender)
 
     @staticmethod
     def _valid_envelope(msg: dict) -> bool:
@@ -278,8 +296,10 @@ class WsStreamServer:
 
     # -- broadcast helpers (loop thread) -------------------------------------
 
-    async def _send_all(self, payload: str) -> None:
+    async def _send_all(self, payload: str, exclude: ServerConnection | None = None) -> None:
         for websocket in list(self._clients):  # snapshot: handlers may mutate
+            if exclude is not None and websocket is exclude:
+                continue  # §10.2: identity-based sender exclusion (never ==)
             try:
                 await websocket.send(payload)
             except Exception:

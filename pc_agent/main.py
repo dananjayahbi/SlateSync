@@ -43,6 +43,29 @@ def run_smoke() -> int:
     return 0
 
 
+def attach_view_fit(bus, gl_host, window, current_doc: dict) -> None:
+    """Doc 02 §10.5 — fit-the-view + HUD refresh when a document finishes loading.
+
+    Registered on ``DOCUMENT_LOADED`` (fires AFTER ``remember_document`` has
+    refreshed ``current_doc``): first ``gl_host.fit_viewport()`` — frozen
+    contract, zoom-to-fit with 48 world units of padding — then
+    ``window.update_hud(scale=gl_host.camera_scale, preset=...)`` with the
+    freshly-fitted camera scale. ``current_doc`` is run_full's
+    ``{"doc": CanvasDocument | None}`` slot, used only as the preset fallback
+    when the event carries no ``doc``.
+    """
+    from pc_agent.core.events import DOCUMENT_LOADED
+
+    def fit_and_refresh(doc=None, **_extra) -> None:
+        gl_host.fit_viewport()
+        loaded = doc if doc is not None else current_doc.get("doc")
+        artboard = getattr(loaded, "artboard", None)
+        preset = (getattr(artboard, "preset", "") if artboard is not None else "") or ""
+        window.update_hud(scale=gl_host.camera_scale, preset=preset)
+
+    bus.on(DOCUMENT_LOADED, fit_and_refresh)
+
+
 def run_full() -> int:
     """Full lifecycle (Doc 04 §5 step 7, wired by Wave 3.A).
 
@@ -163,6 +186,10 @@ def run_full() -> int:
         canvases=canvas_sync.canvases,
         devices=canvas_sync.devices,
     )
+
+    # Doc 02 §10.5 — view-fit-on-open: every DOCUMENT_LOADED zooms the viewport
+    # to the freshly opened document and refreshes the HUD with the new scale.
+    attach_view_fit(bus, gl_host, window, current_doc)
 
     def menu_rpc(envelope: dict) -> None:
         """File→New/Open envelopes (Doc 16 §5.12), routed by payload shape."""

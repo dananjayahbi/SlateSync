@@ -46,6 +46,18 @@ Color presetTint(String preset) => switch (preset) {
       _ => StudioTheme.accent,
     };
 
+/// Doc 02 §10.6 preset badge fill — a SOLID, distinct hue per preset with
+/// white bold text, chosen ≥ 4.5:1 contrast so the overlaid badge stays
+/// readable on the light theme (badges are UI overlays, never baked into
+/// the thumbnail image).
+Color presetBadgeColor(String preset) => switch (preset) {
+      'A5' => const Color(0xFF1D4ED8), // blue-700
+      'A4' => const Color(0xFF6D28D9), // violet-700
+      'LETTER' => const Color(0xFF047857), // emerald-700
+      'INFINITE' => const Color(0xFFB45309), // amber-700
+      _ => const Color(0xFF3F4654), // neutral slate
+    };
+
 /// Preset dimension table (template §3, 300-DPI world units). INFINITE ⇒
 /// null dims + `infinite: true`. Unknown preset ⇒ [ArgumentError].
 ({double? w, double? h, bool infinite}) presetDims(String preset) =>
@@ -214,6 +226,7 @@ class HomeCanvasDashboard extends StatefulWidget {
     this.client,
     this.onListChanged,
     this.refreshListenable,
+    this.thumbGenerator,
   });
 
   /// Canvas route hand-off (Doc 26 §4, wired in Wave 3.A).
@@ -244,6 +257,11 @@ class HomeCanvasDashboard extends StatefulWidget {
   /// untouched).
   final Listenable? refreshListenable;
 
+  /// Doc 02 §10.6 thumbnail seam (additive, default `null`): forwarded to
+  /// `saveDocument` on create/rename/upgrade and to the lazy gallery
+  /// backfill. `null` ⇒ the frozen `saveDocThumbnail` renderer.
+  final ThumbGenerator? thumbGenerator;
+
   @override
   State<HomeCanvasDashboard> createState() => _HomeCanvasDashboardState();
 }
@@ -256,6 +274,17 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
   Timer? _debounce;
   Timer? _refreshDebounce;
   Listenable? _attachedRefresh;
+
+  /// Monotonic read token: only the NEWEST initiated `_refresh` may publish
+  /// its rows, so a slow read started earlier can never overwrite newer
+  /// titles with a stale snapshot (rename vs. backfill re-read race).
+  int _refreshEpoch = 0;
+
+  // Doc 02 §10.6 lazy thumbnail backfill — a tiny id queue drained by ONE
+  // sequential async chain (microtask yields, no timers), so first paint is
+  // never blocked and bursts of refreshes coalesce instead of racing.
+  final Set<String> _thumbQueue = <String>{};
+  bool _thumbDraining = false;
 
   @override
   void initState() {
@@ -321,18 +350,110 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
     if (db == null) {
       return;
     }
+    final int epoch = ++_refreshEpoch;
     final List<CanvasRecord> rows;
     try {
       rows = await db.list(query: _query);
     } catch (_) {
       return; // database closed mid-flight (widget/test teardown)
     }
-    if (!mounted) {
-      return;
+    if (!mounted || epoch != _refreshEpoch) {
+      return; // superseded by a newer read — it owns the published state
     }
     setState(() {
       _records = rows;
     });
+    _queueThumbBackfill(rows);
+  }
+
+  // ----- Doc 02 §10.6 thumbnail backfill -----------------------------------
+
+  /// Queue every listed row whose `thumb_path` is missing (or whose file
+  /// vanished) for the sequential backfill drain. Additive: never throws,
+  /// never blocks the list render that just happened.
+  void _queueThumbBackfill(List<CanvasRecord> rows) {
+    if (_db == null) {
+      return;
+    }
+    for (final CanvasRecord row in rows) {
+      if (row.thumbPath.isEmpty || !File(row.thumbPath).existsSync()) {
+        _thumbQueue.add(row.id);
+      }
+    }
+    if (_thumbQueue.isNotEmpty && !_thumbDraining) {
+      unawaited(_drainThumbQueue());
+    }
+  }
+
+  /// Drain queued ids one at a time: `loadDocument` → `ensureThumbnail`
+  /// (fake-injectable via [HomeCanvasDashboard.thumbGenerator]) → row
+  /// update. Sequential with microtask yields between items — cooperative
+  /// and timer-free, so it never starves frames or leaks pending timers
+  /// into widget tests. Failures (missing/corrupt archive, headless
+  /// rasterizer) keep the placeholder and retry on a later refresh.
+  Future<void> _drainThumbQueue() async {
+    if (_thumbDraining) {
+      return;
+    }
+    _thumbDraining = true;
+    try {
+      while (mounted && _thumbQueue.isNotEmpty) {
+        final String id = _thumbQueue.first;
+        await Future<void>.microtask(() {}); // yield — let the frame land
+        try {
+          final LocalDb? db = _db;
+          final CanvasRecord? row = db == null ? null : await db.get(id);
+          if (row == null ||
+              (row.thumbPath.isNotEmpty &&
+                  File(row.thumbPath).existsSync())) {
+            continue; // deleted meanwhile — or filled by another writer
+          }
+          final CanvasDocumentModel doc = await loadDocument(
+            id,
+            baseDir: widget.baseDir,
+          );
+          final String thumbPath = await ensureThumbnail(
+            doc,
+            baseDir: widget.baseDir,
+            generator: widget.thumbGenerator,
+          );
+          // Single-column patch: never clobber a title/preset that changed
+          // while this (potentially slow) render was in flight.
+          await db!.setThumbPath(id, thumbPath);
+          if (mounted) {
+            // Patch against the CURRENT in-memory list (never the drain's
+            // earlier read), and only thumb_path — a fresh title published
+            // meanwhile survives, and no out-of-band row re-read escapes
+            // this drain (home only re-reads on explicit triggers).
+            setState(() {
+              _records = <CanvasRecord>[
+                for (final CanvasRecord r in _records)
+                  r.id == id
+                      ? CanvasRecord(
+                          id: r.id,
+                          title: r.title,
+                          preset: r.preset,
+                          background: r.background,
+                          thumbPath: thumbPath,
+                          filePath: r.filePath,
+                          updatedAt: r.updatedAt,
+                        )
+                      : r,
+              ];
+            });
+          }
+        } catch (_) {
+          // Best-effort: leave the neutral placeholder in place.
+        } finally {
+          _thumbQueue.remove(id);
+        }
+      }
+    } finally {
+      _thumbDraining = false;
+      if (mounted && _thumbQueue.isNotEmpty) {
+        unawaited(_drainThumbQueue()); // refreshed mid-drain — pick it up
+      }
+    }
   }
 
   void _onQueryChanged(String value) {
@@ -379,14 +500,24 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
     if (db == null) {
       throw StateError('LocalDb is not ready yet');
     }
-    final String path = await saveDocument(doc, baseDir: widget.baseDir);
+    // Doc 02 §10.6: saveDocument writes the archive AND the thumbnail PNG;
+    // the row stores the canonical thumb path (refreshed by every re-save).
+    final String path = await saveDocument(
+      doc,
+      baseDir: widget.baseDir,
+      thumbGenerator: widget.thumbGenerator,
+    );
+    final String thumbPath = await thumbFilePath(
+      doc.canvasId,
+      baseDir: widget.baseDir,
+    );
     await db.insertCanvas(
       CanvasRecord(
         id: doc.canvasId,
         title: doc.title,
         preset: doc.artboard.preset,
         background: doc.artboard.backgroundStyle,
-        thumbPath: '',
+        thumbPath: thumbPath,
         filePath: path,
         updatedAt: doc.updatedAt,
       ),
@@ -439,6 +570,12 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
       return;
     }
     final int now = unixNowSeconds();
+    // Doc 02 §10.6: rename re-saves ⇒ thumbnail refreshes at the canonical
+    // path, which the row records.
+    final String thumbPath = await thumbFilePath(
+      record.id,
+      baseDir: widget.baseDir,
+    );
     try {
       await db.update(
         CanvasRecord(
@@ -446,7 +583,7 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
           title: newTitle,
           preset: record.preset,
           background: record.background,
-          thumbPath: record.thumbPath,
+          thumbPath: thumbPath,
           filePath: record.filePath,
           updatedAt: now,
         ),
@@ -458,7 +595,11 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
         );
         doc.title = newTitle;
         doc.updatedAt = now;
-        await saveDocument(doc, baseDir: widget.baseDir);
+        await saveDocument(
+          doc,
+          baseDir: widget.baseDir,
+          thumbGenerator: widget.thumbGenerator,
+        );
       } catch (_) {
         // No cached document yet — the row rename still stands.
       }
@@ -537,14 +678,24 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
     CanvasRecord old,
   ) async {
     try {
-      final String path = await saveDocument(doc, baseDir: widget.baseDir);
+      // Doc 02 §10.6: the upgrade re-save refreshes the thumbnail at the
+      // canonical path; the row records it (was [CanvasRecord.thumbPath]).
+      final String path = await saveDocument(
+        doc,
+        baseDir: widget.baseDir,
+        thumbGenerator: widget.thumbGenerator,
+      );
+      final String thumbPath = await thumbFilePath(
+        doc.canvasId,
+        baseDir: widget.baseDir,
+      );
       await _db?.update(
         CanvasRecord(
           id: doc.canvasId,
           title: doc.title,
           preset: doc.artboard.preset,
           background: doc.artboard.backgroundStyle,
-          thumbPath: old.thumbPath,
+          thumbPath: thumbPath,
           filePath: path,
           updatedAt: doc.updatedAt,
         ),
@@ -671,8 +822,9 @@ class _EmptyGallery extends StatelessWidget {
   }
 }
 
-/// One thumbnail card: [title (ellipsis), preset chip, relative time] —
-/// three visual children inside a single [Card] (Doc 26 §5.4, tested).
+/// One gallery card (Doc 02 §10.6 rework): thumbnail image (fade-in over a
+/// neutral placeholder) with the preset badge chip OVERLAID on it, plus
+/// title (ellipsis) and relative updated time below.
 class _CanvasGridCard extends StatelessWidget {
   const _CanvasGridCard({
     required this.record,
@@ -702,7 +854,7 @@ class _CanvasGridCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
-            Expanded(child: _thumbnail(tint)),
+            Expanded(child: _thumbnailArea()),
             Padding(
               padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
               child: Text(
@@ -721,27 +873,6 @@ class _CanvasGridCard extends StatelessWidget {
               padding: const EdgeInsets.fromLTRB(10, 6, 4, 4),
               child: Row(
                 children: <Widget>[
-                  Container(
-                    key: Key('preset_chip_${record.id}'),
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 2,
-                    ),
-                    decoration: BoxDecoration(
-                      border: Border.all(color: tint),
-                      borderRadius: BorderRadius.circular(999),
-                    ),
-                    child: Text(
-                      presetLabel(record.preset),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        color: tint,
-                        fontSize: StudioTheme.captionSize,
-                        fontWeight: FontWeight.w600,
-                      ),
-                    ),
-                  ),
                   const Spacer(),
                   Flexible(
                     child: Text(
@@ -790,32 +921,85 @@ class _CanvasGridCard extends StatelessWidget {
     );
   }
 
-  Widget _thumbnail(Color tint) {
+  /// Doc 02 §10.6 gallery thumbnail: neutral placeholder UNDERNEATH (visible
+  /// while the file decodes/loads or when no thumb exists yet), the fade-in
+  /// [Image.file] on top, and the preset badge chip overlaid top-left.
+  Widget _thumbnailArea() {
     final String path = record.thumbPath;
-    if (path.isNotEmpty && File(path).existsSync()) {
-      return Image.file(File(path), fit: BoxFit.cover, width: double.infinity);
-    }
-    // Gradient placeholder tinted by preset (Doc 26 §5.4).
-    return Container(
-      width: double.infinity,
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-          colors: <Color>[
-            tint.withValues(alpha: 0.25),
-            tint.withValues(alpha: 0.75),
-          ],
+    final bool hasThumb = path.isNotEmpty && File(path).existsSync();
+    return Stack(
+      fit: StackFit.expand,
+      children: <Widget>[
+        _placeholder(),
+        if (hasThumb)
+          Positioned.fill(
+            child: Image.file(
+              File(path),
+              key: Key('card_thumb_${record.id}'),
+              fit: BoxFit.cover,
+              frameBuilder: (
+                BuildContext context,
+                Widget child,
+                int? frame,
+                bool wasSyncLoaded,
+              ) {
+                if (wasSyncLoaded) {
+                  return child;
+                }
+                return AnimatedOpacity(
+                  opacity: frame == null ? 0.0 : 1.0,
+                  duration: const Duration(milliseconds: 250),
+                  curve: Curves.easeOut,
+                  child: child,
+                );
+              },
+              errorBuilder: (
+                BuildContext context,
+                Object error,
+                StackTrace? stackTrace,
+              ) =>
+                  const SizedBox.shrink(), // placeholder below stays visible
+            ),
+          ),
+        Positioned(
+          top: 8,
+          left: 8,
+          child: Container(
+            key: Key('preset_chip_${record.id}'),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+            decoration: BoxDecoration(
+              color: presetBadgeColor(record.preset),
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              record.preset, // A5 / A4 / LETTER / INFINITE — overlay label
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: StudioTheme.captionSize,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.3,
+              ),
+            ),
+          ),
         ),
-      ),
-      alignment: Alignment.center,
-      child: Icon(
-        record.preset == 'INFINITE' ? Icons.all_inclusive : Icons.crop_portrait,
-        size: 36,
-        color: Colors.white.withValues(alpha: 0.85),
-      ),
+      ],
     );
   }
+
+  /// Neutral (preset-agnostic gray) placeholder shown while the thumbnail
+  /// loads or when it has not been generated yet.
+  Widget _placeholder() => Container(
+        key: Key('card_placeholder_${record.id}'),
+        color: const Color(0xFFE4E7EC),
+        alignment: Alignment.center,
+        child: Icon(
+          record.preset == 'INFINITE' ? Icons.all_inclusive : Icons.crop_portrait,
+          size: 32,
+          color: const Color(0xFF9AA3B2),
+        ),
+      );
 }
 
 // ---------------------------------------------------------------------------

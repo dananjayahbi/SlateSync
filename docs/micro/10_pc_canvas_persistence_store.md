@@ -87,6 +87,8 @@ def is_dirty(self) -> bool: ...
 
 **Serialization mapping (document.json ↔ dataclasses):** `artboard.{preset,width,height,is_infinite,background_style,background_color}`; `elements[].{node_id,kind,layer,bbox[4],style{color,stroke_width,opacity,blend_mode},geometry{pts,shape_type,graph_config,asset_ref}}`; top level `{canvas_id,title,created_at,updated_at,artboard,content_bounds,elements}` — keys verbatim from `overview.md` §4.3.
 
+**Artboard normalization on load (Doc 02 §10.4, round-6):** `_artboard_from_json` makes the preset table normative end-to-end so no loader/index path can send a bounded preset down a content-derived extent: known presets backfill missing `width/height` from the §3 table, `INFINITE` forces `width/height=null, is_infinite=true`, `A5/A4/LETTER` force `is_infinite=false`, and `is_infinite` is strictly coerced (real booleans/`0`/`1` keep truthiness; strings `"true"/"false"/"1"/"0"/"yes"/"no"`/`""` map explicitly; anything else raises `ValueError` — a naive `bool("false")` would be `True`). The module also exports **`artboard_is_infinite(artboard)`** — preset-table boundedness (A5/A4/LETTER ALWAYS bounded, INFINITE always unbounded, raw flag only for unknown presets) consumed by Docs 13/14 and the §10.6 thumbnail renderer.
+
 **Minimal `document.json` fragment:**
 
 ```json
@@ -103,7 +105,7 @@ def is_dirty(self) -> bool: ...
 
 ## 5. Implementation Plan
 1. **Module scaffold.** `DocumentStore.__init__` stores `bus/config/scene_graph`, creates `self._lock = threading.Lock()`, `self._current: CanvasDocument | None`, `self._current_path`, `self._dirty` flag, `self._transfers: dict[str, _Transfer]`, and registers the three subscriptions above.
-2. **JSON codecs.** `_doc_to_json(doc)` / `_doc_from_json(dict)` converting `Artboard`, `CanvasNode`, `NodeStyle`, `NodeGeometry` with the frozen key mapping; `json.dumps(..., ensure_ascii=False)` so unicode titles round-trip byte-exact.
+2. **JSON codecs.** `_doc_to_json(doc)` / `_doc_from_json(dict)` converting `Artboard`, `CanvasNode`, `NodeStyle`, `NodeGeometry` with the frozen key mapping; artboard loading normalizes per §4 (Doc 02 §10.4 — preset-table dims/flags end-to-end, strict `is_infinite` coercion) and exposes `artboard_is_infinite()` for the exporters; `json.dumps(..., ensure_ascii=False)` so unicode titles round-trip byte-exact.
 3. **`new()`.** Seed per §4 defaults from the §3 preset table; `scene_graph.replace_all([])` + `set_artboard`; set `current_path`/`dirty`; return doc.
 4. **`save()` — atomic ZIP.** Serialize doc; gather every file in `assets_dir(canvas_id)` into `assets/<name>` entries; write `path.tmp` (`zipfile.ZIP_DEFLATED`); `os.replace(tmp, path)`; on any error `tmp.unlink(missing_ok=True)` and re-raise; clear dirty under lock.
 5. **`open()` — rebuild.** Read `document.json` from the ZIP, parse to `CanvasDocument`, extract `assets/*` (basename-only) into `assets_dir`, hand `doc.elements` to `scene_graph.replace_all(...)`, `set_artboard(doc.artboard)`, set state, emit `DOCUMENT_LOADED(doc=doc)`.
@@ -118,6 +120,7 @@ def is_dirty(self) -> bool: ...
 * **Atomic replace:** `save()` leaves **no** `<path>.tmp`; simulated failure mid-ZIP keeps the previous file intact and still no `.tmp` remains.
 * **Lifecycle:** `OPEN_CANVAS` with `payload.path` loads and emits `DOCUMENT_LOADED` exactly once (state clean before emit); `ASSET_DONE ok=false` discards the buffer; `new()` default dims match A5 `1748×2480` / A4 `2480×3508` / Letter `2550×3300` / INFINITE `None+is_infinite`.
 * **Malformed archive:** corrupt or missing `document.json` ⇒ `open()` raises, no `DOCUMENT_LOADED`, store state unchanged; the `OPEN_CANVAS` wrapper catches and logs — the bus subscriber chain survives.
+* **Artboard normalization (§10.4):** a `document.json` with a bounded preset but missing dims gets the preset-table dims backfilled and `is_infinite=false`; `INFINITE` forces `null` dims + `is_infinite=true`; string `"false"` loads as bounded (never content-derived), and a bogus `is_infinite` value (`"maybe"`) raises `ValueError`; `artboard_is_infinite` agrees with the preset table for all four presets.
 * **Sender contract:** `OPEN_CANVAS` without `payload.path` ⇒ logged error, no state change (Docs 16/26 must always send the key).
 * **Single writer:** `autosave_tick()` racing a WS-thread `ASSET_DONE` never interleaves ZIP writes (shared lock; one `10 s` timer only).
 * **Unicode asset filename** round-trips; `asset_path("cv1", "assets/img_9921.png")` resolves to `assets_dir("cv1")/img_9921.png`.

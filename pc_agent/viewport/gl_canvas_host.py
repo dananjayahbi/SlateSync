@@ -73,6 +73,17 @@ logger = logging.getLogger(__name__)
 # --- template §3 constants -------------------------------------------------
 ZOOM_MIN, ZOOM_MAX = 0.05, 20.0  # live camera clamp (§3 zoom range)
 
+# --- Doc 02 §10.5 view-fit-on-open (issue 03 round 6 — frozen additive) ----
+FIT_PADDING = 48.0  # world units per side (⇒ +96 total per axis, Doc 20 §4)
+#: empty/degenerate content fallback target rect as (x, y, w, h)
+#: — spans (-500,-500)..(500,500), center (0,0); mirrors the mobile
+#: ``Rect.fromLTWH(-500, -500, 1000, 1000)`` thumbnail/fit fallback.
+FIT_FALLBACK_RECT = (-500.0, -500.0, 1000.0, 1000.0)
+
+# GL_SCISSOR_TEST raw enum — moderngl exposes no SCISSOR capability constant,
+# so enable_direct/disable_direct take the raw enum (as in primitive_renderer).
+_GL_SCISSOR_TEST = 0x0C11
+
 # --- Doc 06 §4/§5 tuning ---------------------------------------------------
 TICK_MS = 16  # Tk after(16) pump — never pyglet.app.run()
 LASER_TIMEOUT_S = 0.5  # LASER 0x04 crosshair cleared on LIVE_END or timeout
@@ -452,7 +463,14 @@ class GLCanvasHost:
         self._schedule_drain()
 
     def set_document(self, doc: CanvasDocument) -> None:
-        """Swap the rendered document; strokes are re-queued for tessellation."""
+        """Swap the rendered document; strokes are re-queued for tessellation.
+
+        Also applies the Doc 02 §10.5 view-fit (round 6, issue 03): additive
+        and idempotent — ``main.py`` re-calls :meth:`fit_viewport` after
+        ``DOCUMENT_LOADED`` for the HUD, and any later ``CAMERA_DELTA``
+        overrides the fitted camera (the PC mirrors the tablet camera by
+        design).
+        """
         self._doc = doc
         self._committed.clear()
         self._pending_nodes = []
@@ -464,7 +482,65 @@ class GLCanvasHost:
             self._pending_nodes = [
                 node for node in (getattr(doc, "elements", None) or []) if node is not None
             ]
+            self.fit_viewport()
         self.request_redraw()
+
+    def fit_viewport(self) -> None:
+        """Doc 02 §10.5 (frozen): zoom-to-fit the open document.
+
+        Target rect: bounded ⇒ ``(0, 0, width, height)``; infinite ⇒
+        ``content_bounds`` (empty/degenerate ⇒ :data:`FIT_FALLBACK_RECT`).
+        Scale = ``min(viewport_w / (w + 96), viewport_h / (h + 96))`` (48
+        world units of padding per side, Doc 20 §4 mirror), clamped to the §3
+        zoom range 0.05…20; camera centered on the rect via the §3 transform
+        (``tx, ty`` = rect center). Uses the realized viewport (or the
+        default mount size before ``<Configure>``). Idempotent — repeated
+        calls recompute the same camera.
+        """
+        x, y, w, h = self._fit_target_rect()
+        view_w = self._vp_w if self._vp_w > 0 else DEFAULT_MOUNT_W
+        view_h = self._vp_h if self._vp_h > 0 else DEFAULT_MOUNT_H
+        dw = w + 2.0 * FIT_PADDING
+        dh = h + 2.0 * FIT_PADDING
+        zx = view_w / dw if dw > 0 else ZOOM_MAX
+        zy = view_h / dh if dh > 0 else ZOOM_MAX
+        scale = max(ZOOM_MIN, min(ZOOM_MAX, zx if zx < zy else zy))
+        self.set_camera(scale, x + w * 0.5, y + h * 0.5)
+
+    @property
+    def camera_scale(self) -> float:
+        """Current camera scale — Doc 02 §10.5 frozen accessor (§3 zoom range)."""
+        return float(self._camera[0])
+
+    def _fit_target_rect(self) -> tuple[float, float, float, float]:
+        """§10.5 target rect as ``(x, y, w, h)`` for :meth:`fit_viewport`.
+
+        Mirrors the mobile ``_thumbRect``/``zoomToFit`` rules: bounded
+        artboard with positive size ⇒ ``(0, 0, w, h)``; otherwise
+        ``content_bounds`` when it has positive extent; otherwise the
+        ``(-500, -500, 1000, 1000)`` fallback.
+        """
+        artboard = self._artboard
+        if artboard is None and self._doc is not None:
+            artboard = getattr(self._doc, "artboard", None)
+        if artboard is not None and not bool(getattr(artboard, "is_infinite", False)):
+            width = float(getattr(artboard, "width", 0) or 0)
+            height = float(getattr(artboard, "height", 0) or 0)
+            if width > 0 and height > 0:
+                return (0.0, 0.0, width, height)
+        bounds = self._content_bounds or dict(
+            getattr(self._doc, "content_bounds", None) or {}
+        )
+        try:
+            min_x = float(bounds.get("min_x") or 0.0)
+            min_y = float(bounds.get("min_y") or 0.0)
+            max_x = float(bounds.get("max_x") or 0.0)
+            max_y = float(bounds.get("max_y") or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            return FIT_FALLBACK_RECT
+        if max_x > min_x and max_y > min_y:
+            return (min_x, min_y, max_x - min_x, max_y - min_y)
+        return FIT_FALLBACK_RECT
 
     def set_camera(self, scale: float, tx: float, ty: float) -> None:
         """Programmatic camera; ``scale`` clamped to the §3 zoom range 0.05…20.0."""
@@ -966,6 +1042,26 @@ class GLCanvasHost:
             self._fbo.use()
         self._sync_pending()
         self._ctx.viewport = (0, 0, width, height)
+        # Issue 02 round 6 — full-viewport clear with the stale artboard
+        # scissor box RESET first:
+        #   • PrimitiveRenderer phase 1 stores its artboard box on the bound
+        #     framebuffer (ctx.scissor = box is per-FBO, and moderngl's
+        #     Framebuffer.use() RE-ENABLES GL_SCISSOR_TEST with that box);
+        #   • moderngl's Framebuffer.clear() applies the FBO's stored box and
+        #     re-enables the test ITSELF, so merely disabling the test before
+        #     the clear does not help — with the stale box the clear only
+        #     wiped the PREVIOUS artboard rect.
+        # Everything drawn outside that rect — the page shadow ring and
+        # off-page strokes — then blended over its own previous frame every
+        # pan step: ghost strokes at old positions + darkening "smeared
+        # bands" (the PC-only drag trail; round-5 offscreen fixtures never
+        # panned between frames, so their outside-page columns stayed
+        # white-on-white and looked clean). scissor = None resets the box to
+        # the full framebuffer and turns the test off; disable_direct keeps
+        # the invariant explicit (moderngl exposes no SCISSOR capability
+        # constant, so the raw enum is used).
+        self._ctx.scissor = None
+        self._ctx.disable_direct(_GL_SCISSOR_TEST)
         self._ctx.enable(moderngl.BLEND)
         background = _parse_color(self._background_color(), 1.0)
         self._ctx.clear(background[0], background[1], background[2], 1.0)
@@ -1030,10 +1126,20 @@ class GLCanvasHost:
         )
         tess = self._tessellator
         tess.width_pressure_factor = 0.0  # committed payloads keep style.stroke_width base
-        # Doc 21 chain layout (issue 05 round 5): committed nodes carry Bézier
-        # control chains — tessellate the EXACT cubics, never re-fit controls
-        # as Catmull-Rom anchors (that wanders tens of world units off-path).
-        flat = flatten_stroke_path(points, scale=tess.scale)
+        if kind == "LINE":
+            # r6-pc-line-gl: normative LINE geometry (exporters + mobile
+            # canvas_shape_conventions) — ALWAYS the straight first→last
+            # segment. Never spline the anchors (Catmull-Rom wanders off the
+            # segment through intermediate anchors) and never let a Doc 21
+            # chain-layout guess reinterpret multi-anchor pts as Béziers
+            # (n ≡ 1,2 mod 3 ≥ 4 sampled as control chains). Feed the mesh
+            # pipeline exactly [start, end]; a single-point LINE stays a dot.
+            flat = [points[0], points[-1]] if len(points) >= 2 else points
+        else:
+            # Doc 21 chain layout (issue 05 round 5): committed nodes carry Bézier
+            # control chains — tessellate the EXACT cubics, never re-fit controls
+            # as Catmull-Rom anchors (that wanders tens of world units off-path).
+            flat = flatten_stroke_path(points, scale=tess.scale)
         mesh = tess.build_stroke(flat, [1.0] * len(flat), width)
         node_id = str(getattr(node, "node_id", "") or f"__node_{id(node)}")
         self._committed[node_id] = (mesh, color, blend_mode)

@@ -1,4 +1,4 @@
-"""Synchronous caller-thread ``EventBus`` + the 12 event-name constants (Doc 04 §4)."""
+"""Synchronous caller-thread ``EventBus`` + 13 event-name constants (Doc 04 §4, Doc 02 §10.1)."""
 
 from __future__ import annotations
 
@@ -24,6 +24,11 @@ PAIRING_INFO = "PAIRING_INFO"
 #: hub-merged store (updated_at DESC) and ``devices`` is the live connection
 #: count. Handlers must tolerate unknown keys (``**extra``).
 CANVAS_LIST_UPDATED = "CANVAS_LIST_UPDATED"
+#: Round 6 (Doc 02 §10.1) — ``SceneGraph`` wiped every element via
+#: ``CLEAR_CANVAS``. Frozen payload: ``{canvas_id: str}`` (the envelope's
+#: target document id, echoed verbatim). Viewports repaint on this event;
+#: handlers must tolerate unknown keys (``**extra``).
+CANVAS_CLEARED = "CANVAS_CLEARED"
 
 
 class EventBus:

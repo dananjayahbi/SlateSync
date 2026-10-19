@@ -1,11 +1,24 @@
 #!/usr/bin/env python3
-"""Doc 28 §4 — export_verify: 600 DPI infinite lossless + PDF vector QA.
+"""Doc 28 §4 — export_verify: 600 DPI infinite lossless + vector PDF QA.
 
 Builds two in-memory fixtures (Docs 09/10): an A5-bounded document (strokes +
 GRAPH_AXES inside 1748×2480) and an INFINITE document with
 ``content_bounds (−2000,−1500)–(8000,6000)`` (HIGHLIGHT multiply + IMAGE),
 then runs the read-only exporters (Doc 13 TiledRasterExporter, Doc 14
 VectorPdfExporter) at 300/600/1200 DPI for PNG/JPG plus a vector PDF.
+
+Round-6 additions (Doc 02 §10.4 / §10.6):
+* Per-preset extent matrix (issue-06 regression gate): PNG @300 AND @600 for
+  A5/A4/LETTER fixtures holding IDENTICAL content must land on the frozen,
+  artboard-proportional strip-padded dims (A5@300 2048×4096, A4@300
+  4096×4096, Letter@300 4096×4096, A5@600 4096×6144, A4@600 6144×8192,
+  Letter@600 6144×8192); content px must be distinct per preset (an extent
+  resolving to CONTENT size collapses all three — the issue-06 bug), and the
+  content-derived INFINITE rows must differ from every bounded row.
+* Thumbnail smoke (§10.6): PC ``render_thumbnail`` on the A4 fixture → file
+  exists, ≤192², PNG magic, non-trivial vs the empty-fixture thumbnail.
+  (Mobile thumbnail coverage lives in ``thumbnail_pipeline_test.dart`` —
+  cited by run_all, not duplicated here.)
 
 Assertions (Doc 28 §4): raster W×H == round(world_extent * dpi / 300) ± 1 px
 evaluated at the artifact canvas level with the template §3 strip constant
@@ -16,7 +29,7 @@ in the pytest gate. PDF: ``%PDF`` magic, first-page extent == page world ×
 ± 48/side, Doc 14 §4). Every real artifact must be larger than the same
 export of an empty fixture (non-trivial guard, no hardcoded byte floor).
 
-Exit 0 iff zero failed rows / 1 otherwise (Doc 28 §4).
+Exit 0 iff zero failed rows / checks / 1 otherwise (Doc 28 §4).
 """
 
 from __future__ import annotations
@@ -41,6 +54,7 @@ if str(_REPO_ROOT) not in sys.path:
 from pc_agent.core.config_manager import AppConfig  # noqa: E402
 from pc_agent.engine.document_store import Artboard, CanvasDocument  # noqa: E402
 from pc_agent.engine.scene_graph import CanvasNode, NodeGeometry, NodeStyle  # noqa: E402
+from pc_agent.export.thumbnail_renderer import MAX_SIZE, render_thumbnail  # noqa: E402
 from pc_agent.export.tiled_raster_exporter import STRIP_PX, TiledRasterExporter  # noqa: E402
 from pc_agent.export.vector_pdf_exporter import UNIT_TO_PT, VectorPdfExporter  # noqa: E402
 
@@ -49,6 +63,27 @@ DPIS: tuple[int, ...] = (300, 600, 1200)
 #: Fixture world extents (Doc 28 §4 parentheticals).
 A5_WORLD = (1748.0, 2480.0)
 INFINITE_WORLD = (10000.0, 7500.0)
+#: Round-6 extent matrix (Doc 02 §10.4, issue-06): Doc 03 artboard sizes.
+A4_WORLD = (2480.0, 3508.0)
+LETTER_WORLD = (2550.0, 3300.0)
+#: Matrix presets (identical content) × the two matrix DPIs.
+MATRIX_WORLDS: dict[str, tuple[float, float]] = {
+    "A5": A5_WORLD,
+    "A4": A4_WORLD,
+    "LETTER": LETTER_WORLD,
+}
+MATRIX_DPIS: tuple[int, ...] = (300, 600)
+#: Frozen strip-padded canvas px per (preset, dpi) — Doc 02 §10.4. A4/Letter
+#: intentionally COINCIDE after strip-padding; their content px are distinct
+#: (checked below), which is what distinguishes artboard- vs content-extent.
+MATRIX_EXPECTED: dict[tuple[str, int], tuple[int, int]] = {
+    ("A5", 300): (2048, 4096),
+    ("A4", 300): (4096, 4096),
+    ("LETTER", 300): (4096, 4096),
+    ("A5", 600): (4096, 6144),
+    ("A4", 600): (6144, 8192),
+    ("LETTER", 600): (6144, 8192),
+}
 #: Doc 14 §4 page pad for INFINITE canvases (world units per side).
 _PDF_EXTENT_PAD = 48.0
 #: Doc 14 test tolerance for MediaBox sizes in points.
@@ -128,26 +163,7 @@ def _node(
 def build_a5_fixture(elements: list[CanvasNode] | None = None) -> CanvasDocument:
     """A5-bounded Doc 28 §4 fixture: strokes + GRAPH_AXES inside 1748×2480."""
     if elements is None:
-        graph_bbox = (274.0, 640.0, 1474.0, 1840.0)
-        elements = [
-            _node("STROKE", _A5_CHAIN, color="#E03030"),
-            _node("STROKE", _A5_ANCHORS, color="#1E1E1E", stroke_width=4.0),
-            _node(
-                "GRAPH_AXES",
-                [],
-                bbox=graph_bbox,
-                color="#2050C0",
-                stroke_width=2.0,
-                shape_type="CARTESIAN_2D",
-                graph_config={
-                    "origin": [874.0, 1240.0],
-                    "x_range": [-6.0, 6.0],
-                    "y_range": [-6.0, 6.0],
-                    "grid_step": 100.0,
-                    "show_labels": True,
-                },
-            ),
-        ]
+        elements = matrix_content()
     return CanvasDocument(
         canvas_id=f"qa-a5-{uuid4().hex[:8]}",
         title="qa A5 fixture",
@@ -157,6 +173,54 @@ def build_a5_fixture(elements: list[CanvasNode] | None = None) -> CanvasDocument
         content_bounds=dict(_ZERO_BOUNDS),
         elements=list(elements),
     )
+
+
+def build_preset_fixture(
+    preset: str,
+    board: tuple[float, float],
+    elements: list[CanvasNode] | None = None,
+) -> CanvasDocument:
+    """Bounded Doc 02 §10.4 fixture: artboard = ``preset`` table size.
+
+    ``elements`` defaults to the SAME content used by the A5 fixture so the
+    extent matrix proves extent comes from the artboard, not the content.
+    """
+    if elements is None:
+        elements = matrix_content()
+    width, height = board
+    return CanvasDocument(
+        canvas_id=f"qa-{preset.lower()}-{uuid4().hex[:8]}",
+        title=f"qa {preset} fixture",
+        created_at=0,
+        updated_at=0,
+        artboard=Artboard(preset=preset, width=width, height=height, is_infinite=False),
+        content_bounds=dict(_ZERO_BOUNDS),
+        elements=list(elements),
+    )
+
+
+def matrix_content() -> list[CanvasNode]:
+    """IDENTICAL element list shared by the A5/A4/LETTER matrix fixtures."""
+    graph_bbox = (274.0, 640.0, 1474.0, 1840.0)
+    return [
+        _node("STROKE", [list(p) for p in _A5_CHAIN], color="#E03030"),
+        _node("STROKE", [list(p) for p in _A5_ANCHORS], color="#1E1E1E", stroke_width=4.0),
+        _node(
+            "GRAPH_AXES",
+            [],
+            bbox=graph_bbox,
+            color="#2050C0",
+            stroke_width=2.0,
+            shape_type="CARTESIAN_2D",
+            graph_config={
+                "origin": [874.0, 1240.0],
+                "x_range": [-6.0, 6.0],
+                "y_range": [-6.0, 6.0],
+                "grid_step": 100.0,
+                "show_labels": True,
+            },
+        ),
+    ]
 
 
 def build_infinite_fixture(
@@ -358,6 +422,10 @@ def main(argv: list[str] | None = None) -> int:
 
     fixtures = [
         ("A5", build_a5_fixture(), build_a5_fixture(elements=[]), A5_WORLD, False),
+        ("A4", build_preset_fixture("A4", A4_WORLD),
+         build_preset_fixture("A4", A4_WORLD, []), A4_WORLD, False),
+        ("LETTER", build_preset_fixture("LETTER", LETTER_WORLD),
+         build_preset_fixture("LETTER", LETTER_WORLD, []), LETTER_WORLD, False),
         (
             "INFINITE",
             build_infinite_fixture(assets_dir=config.assets_dir),
@@ -370,8 +438,10 @@ def main(argv: list[str] | None = None) -> int:
     raster = TiledRasterExporter(config)
     vector = VectorPdfExporter(config)
     rows: list[dict] = []
-    # 2 fixtures × (3 DPI × 2 raster kinds × real+empty + PDF real+empty) = 28
-    total_steps = len(fixtures) * (len(DPIS) * 2 * 2 + 2)
+    # 4 fixtures × (3 DPI × 2 raster kinds × real+empty + PDF real+empty) = 56;
+    # matrix rows reuse these artifacts (A5/A4/LETTER/INFINITE PNG @300/600)
+    # and add only the 2 thumbnail renders.
+    total_steps = len(fixtures) * (len(DPIS) * 2 * 2 + 2) + 2
     counter = {"n": 0}
 
     def log(msg: str, t0: float) -> None:
@@ -476,7 +546,201 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
 
-    failed = [r for r in rows if r["result"] == "FAIL"]
+    # ------------------------------------------------------------------
+    # Round-6 extent matrix (Doc 02 §10.4, issue-06 regression gate) and
+    # thumbnail smoke (Doc 02 §10.6). The matrix rows reuse the ladder
+    # artifacts above — every row is a real export of a doc whose artboard
+    # (not content) must decide the extent.
+    # ------------------------------------------------------------------
+    docs_by_preset = {name: doc for name, doc, _e, _w, _inf in fixtures}
+    empties_by_preset = {name: empty for name, _d, empty, _w, _inf in fixtures}
+    matrix_paths: dict[tuple[str, int], Path] = {
+        (name, dpi): out_dir / f"{name.lower()}_{dpi}.png"
+        for name in MATRIX_WORLDS
+        for dpi in MATRIX_DPIS
+    }
+    inf_paths = {dpi: out_dir / f"infinite_{dpi}.png" for dpi in MATRIX_DPIS}
+
+    matrix_rows: list[dict] = []
+    got_map: dict[tuple[str, int], tuple[int, int]] = {}
+    content_map: dict[tuple[str, int], tuple[int, int]] = {}
+    for name, board in MATRIX_WORLDS.items():
+        slug = name.lower()
+        for dpi in MATRIX_DPIS:
+            path = matrix_paths[(name, dpi)]
+            got = _raster_size(path)
+            got_map[(name, dpi)] = got
+            exp = MATRIX_EXPECTED[(name, dpi)]
+            content = (expected_px(board[0], dpi), expected_px(board[1], dpi))
+            content_map[(name, dpi)] = content
+            dims_ok = abs(got[0] - exp[0]) <= 1 and abs(got[1] - exp[1]) <= 1
+            # frozen matrix table ⇄ formula px = world * dpi / 300, strip 2048
+            prop_ok = expected_canvas_px(board, dpi) == exp
+            head = _head(path, 4)
+            magic_ok = _magic_ok(head, "PNG")
+            size = path.stat().st_size
+            base = (out_dir / f"{slug}_{dpi}_empty.png").stat().st_size
+            bigger = size > base
+            passed = dims_ok and prop_ok and magic_ok and bigger
+            matrix_rows.append(
+                _row(
+                    name,
+                    "PNG",
+                    str(dpi),
+                    f"{got[0]}x{got[1]}",
+                    f"{exp[0]}x{exp[1]}",
+                    size,
+                    f"PNG {'ok' if magic_ok else 'BAD ' + head.hex()}",
+                    passed,
+                    detail=(
+                        f"content px {content[0]}x{content[1]}; empty {base} B; "
+                        f">empty={bigger}; prop={prop_ok}"
+                    ),
+                )
+            )
+
+    inf_rows: list[dict] = []
+    inf_got: dict[int, tuple[int, int]] = {}
+    for dpi in MATRIX_DPIS:
+        path = inf_paths[dpi]
+        got = _raster_size(path)
+        inf_got[dpi] = got
+        exp = expected_canvas_px(INFINITE_WORLD, dpi)
+        head = _head(path, 4)
+        magic_ok = _magic_ok(head, "PNG")
+        size = path.stat().st_size
+        base = (out_dir / f"infinite_{dpi}_empty.png").stat().st_size
+        bigger = size > base
+        dims_ok = abs(got[0] - exp[0]) <= 1 and abs(got[1] - exp[1]) <= 1
+        passed = dims_ok and magic_ok and bigger
+        inf_rows.append(
+            _row(
+                "INFINITE",
+                "PNG",
+                str(dpi),
+                f"{got[0]}x{got[1]}",
+                f"{exp[0]}x{exp[1]}",
+                size,
+                f"PNG {'ok' if magic_ok else 'BAD ' + head.hex()}",
+                passed,
+                detail=(
+                    f"content-derived {expected_px(INFINITE_WORLD[0], dpi)}x"
+                    f"{expected_px(INFINITE_WORLD[1], dpi)} px; empty {base} B; "
+                    f">empty={bigger}"
+                ),
+            )
+        )
+
+    # Distinctness assertions (Doc 02 §10.4): a content-extent bug collapses
+    # every preset to the same content-derived dims, so distinctness IS the
+    # issue-06 tripwire alongside the frozen per-row dims above.
+    distinct_checks: list[tuple[str, bool]] = [
+        (
+            "content px distinct per preset @300/600",
+            all(len(set(content_map[(n, d)] for n in MATRIX_WORLDS)) == 3 for d in MATRIX_DPIS),
+        ),
+        (
+            "A5 padded != A4/LETTER padded @300/600",
+            all(
+                got_map[("A5", d)] != got_map[(o, d)]
+                for d in MATRIX_DPIS
+                for o in ("A4", "LETTER")
+            ),
+        ),
+        (
+            "per-preset @300 != @600",
+            all(got_map[(n, 300)] != got_map[(n, 600)] for n in MATRIX_WORLDS),
+        ),
+        (
+            "INFINITE(content-derived) != every bounded row",
+            all(
+                inf_got[d] != got_map[(n, od)]
+                for d in MATRIX_DPIS
+                for n in MATRIX_WORLDS
+                for od in MATRIX_DPIS
+            ),
+        ),
+    ]
+
+    # Thumbnail smoke (Doc 02 §10.6) — PC render_thumbnail on the A4 fixture.
+    # Mobile coverage: mobile_app/test/thumbnail_pipeline_test.dart (cited by
+    # run_all; deliberately not re-run here).
+    t0 = time.monotonic()
+    counter["n"] += 1
+    thumb_path = render_thumbnail(docs_by_preset["A4"], out_dir / "matrix_a4_thumb.png")
+    log("A4 thumbnail smoke render", t0)
+    t0 = time.monotonic()
+    counter["n"] += 1
+    thumb_empty = render_thumbnail(
+        empties_by_preset["A4"], out_dir / "matrix_a4_thumb_empty.png"
+    )
+    log("A4 empty thumbnail render (baseline)", t0)
+
+    thumb_checks: list[tuple[str, bool, str]] = []
+    exists = thumb_path.is_file()
+    thumb_head = _head(thumb_path, 4) if exists else b""
+    thumb_magic_ok = exists and _magic_ok(thumb_head, "PNG")
+    try:
+        tw, th = _raster_size(thumb_path) if exists else (0, 0)
+    except ValueError:
+        tw, th = 0, 0
+    fits = 0 < tw <= MAX_SIZE and 0 < th <= MAX_SIZE and tw == th
+    thumb_size = thumb_path.stat().st_size if exists else 0
+    thumb_base = thumb_empty.stat().st_size if thumb_empty.is_file() else 0
+    thumb_bigger = thumb_size > thumb_base
+    thumb_checks.append(("file exists", exists, str(thumb_path)))
+    thumb_checks.append(
+        (f"dims <= {MAX_SIZE}^2 and square", fits, f"{tw}x{th} (max {MAX_SIZE}x{MAX_SIZE})")
+    )
+    thumb_checks.append(("PNG magic", thumb_magic_ok, thumb_head[:4].hex() or "missing"))
+    thumb_checks.append(
+        ("non-trivial vs empty thumbnail", thumb_bigger, f"{thumb_size} B > empty {thumb_base} B")
+    )
+
+    # ------------------------------------------------------------------
+    # Round-6 matrix + thumbnail report (compact), then the Doc 28 §4 table.
+    # ------------------------------------------------------------------
+    print()
+    print("EXTENT MATRIX - Doc 02 S10.4 issue-06 gate (identical content, artboard extent)")
+    m_hdr = (
+        f"{'PRESET':<9} | {'DPI':>3} | {'CONTENT PX':<12} | {'GOT (strip)':<12} | "
+        f"{'EXPECTED':<12} | {'BYTES':>9} | PASS/FAIL"
+    )
+    print(m_hdr)
+    print("-" * len(m_hdr))
+    for r in matrix_rows:
+        content = content_map[(r["fixture"], int(r["dpi"]))]
+        print(
+            f"{r['fixture']:<9} | {r['dpi']:>3} | {content[0]:<5}x{content[1]:<6} | "
+            f"{r['got']:<12} | {r['expected']:<12} | {r['bytes']:>9} | {r['result']}"
+        )
+    for r in inf_rows:
+        dpi = int(r["dpi"])
+        exp = expected_canvas_px(INFINITE_WORLD, dpi)
+        print(
+            f"{r['fixture']:<9} | {r['dpi']:>3} | "
+            f"{expected_px(INFINITE_WORLD[0], dpi):<5}x{expected_px(INFINITE_WORLD[1], dpi):<6} | "
+            f"{r['got']:<12} | {exp[0]}x{exp[1]} c-deriv | {r['bytes']:>9} | {r['result']}"
+        )
+    for label, ok in distinct_checks:
+        print(f"check: {label:<46} : {'PASS' if ok else 'FAIL'}")
+    print(
+        "THUMBNAIL SMOKE - Doc 02 S10.6 (pc render_thumbnail, A4 fixture; "
+        "mobile: thumbnail_pipeline_test.dart cited, not duplicated)"
+    )
+    t_hdr = f"{'CHECK':<34} | {'GOT':<44} | PASS/FAIL"
+    print(t_hdr)
+    print("-" * len(t_hdr))
+    for label, ok, detail in thumb_checks:
+        print(f"{label:<34} | {detail:<44} | {'PASS' if ok else 'FAIL'}")
+
+    all_rows = rows + matrix_rows + inf_rows
+    failed = [r for r in all_rows if r["result"] == "FAIL"]
+    n_checks = len(distinct_checks) + len(thumb_checks)
+    failed_checks: list[tuple[str, str]] = [
+        (label, "") for label, ok in distinct_checks if not ok
+    ] + [(label, detail) for label, ok, detail in thumb_checks if not ok]
+
     print()
     header = (
         f"{'FIXTURE':<12} | {'KIND':<4} | {'DPI':>4} | {'W×H got/expected':<30} | "
@@ -484,7 +748,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(header)
     print("-" * len(header))
-    for r in rows:
+    for r in all_rows:
         dims = f"{r['got']} / {r['expected']}"
         print(
             f"{r['fixture']:<12} | {r['kind']:<4} | {r['dpi']:>4} | {dims:<30} | "
@@ -492,9 +756,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         if r["detail"] and r["result"] == "FAIL":
             print(f"{'':<12} | detail: {r['detail']}")
+    for label, detail in failed_checks:
+        print(f"{'CHECK':<12} | detail: {label} {detail}")
+    n_total = len(all_rows) + n_checks
+    n_failed = len(failed) + len(failed_checks)
     print(
-        f"RESULT: {'PASS' if not failed else 'FAIL'} "
-        f"({len(rows) - len(failed)}/{len(rows)} rows; {len(failed)} failed)"
+        f"RESULT: {'PASS' if not n_failed else 'FAIL'} "
+        f"({n_total - n_failed}/{n_total} checks; {len(all_rows)} rows + "
+        f"{n_checks} matrix/thumb checks; {n_failed} failed)"
     )
 
     if args.json_out:
@@ -503,9 +772,15 @@ def main(argv: list[str] | None = None) -> int:
         out.write_text(
             json.dumps(
                 {
-                    "rows": rows,
-                    "failed": len(failed),
-                    "result": "PASS" if not failed else "FAIL",
+                    "rows": all_rows,
+                    "matrix_rows": matrix_rows,
+                    "infinite_rows": inf_rows,
+                    "distinct_checks": [{"check": c, "result": "PASS" if o else "FAIL"}
+                                        for c, o in distinct_checks],
+                    "thumbnail_checks": [{"check": c, "got": d, "result": "PASS" if o else "FAIL"}
+                                         for c, o, d in thumb_checks],
+                    "failed": n_failed,
+                    "result": "PASS" if not n_failed else "FAIL",
                 },
                 indent=2,
             )
@@ -513,7 +788,7 @@ def main(argv: list[str] | None = None) -> int:
             encoding="utf-8",
         )
 
-    return 0 if not failed else 1
+    return 0 if not n_failed else 1
 
 
 if __name__ == "__main__":

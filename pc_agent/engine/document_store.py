@@ -99,15 +99,68 @@ def _artboard_to_json(artboard: Artboard) -> dict:
     }
 
 
+def _coerce_bool(value: object, field: str) -> bool:
+    """Doc 03 boolean with legacy-string tolerance.
+
+    Real booleans and 0/1 numbers keep their old truthiness; the string forms
+    ``"true"/"false"/"1"/"0"/"yes"/"no"`` (any case, trimmed) map explicitly —
+    a naive ``bool("false")`` is ``True`` and would silently flip a bounded
+    artboard onto the content-derived extent path (§10.4 issue 06).  Anything
+    else violates the Doc 03 schema and is rejected.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in ("true", "1", "yes"):
+            return True
+        if token in ("false", "0", "no", ""):
+            return False
+    raise ValueError(f"{field} must be a boolean, got {value!r}")
+
+
 def _artboard_from_json(data: dict) -> Artboard:
+    preset = data["preset"]
+    width = data.get("width")
+    height = data.get("height")
+    is_infinite = _coerce_bool(data.get("is_infinite", False), "artboard.is_infinite")
+    if preset in _PRESETS:
+        # §10.4 (issue 06): the preset table is normative end-to-end.  Bounded
+        # presets always carry their exact artboard dims (backfilled when a
+        # sender dropped them) with ``is_infinite=False``; INFINITE always has
+        # null dims with ``is_infinite=True`` — a stale or mistyped flag can
+        # never send a bounded preset down the content-extent path.
+        if preset == "INFINITE":
+            width, height, is_infinite = None, None, True
+        else:
+            table_w, table_h = _PRESETS[preset]
+            if width is None:
+                width = table_w
+            if height is None:
+                height = table_h
+            is_infinite = False
     return Artboard(
-        preset=data["preset"],
-        width=data.get("width"),
-        height=data.get("height"),
-        is_infinite=bool(data.get("is_infinite", False)),
+        preset=preset,
+        width=width,
+        height=height,
+        is_infinite=is_infinite,
         background_style=data.get("background_style", "BLANK"),
         background_color=data.get("background_color", "#FFFFFF"),
     )
+
+
+def artboard_is_infinite(artboard: Artboard) -> bool:
+    """§10.4 boundedness rule used by the exporters and thumbnail renderer.
+
+    Known presets decide by table: ``A5/A4/LETTER`` are ALWAYS bounded (their
+    ``is_infinite`` flag is advisory) and ``INFINITE`` is always unbounded;
+    only an unknown preset string falls back to the raw flag.
+    """
+    if artboard.preset in _PRESETS:
+        return artboard.preset == "INFINITE"
+    return bool(artboard.is_infinite)
 
 
 def _style_to_json(style: NodeStyle) -> dict:

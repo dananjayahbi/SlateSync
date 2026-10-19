@@ -4,6 +4,7 @@
 // graph-config maps) plus callbacks. It never imports network or camera code —
 // the canvas page (Wave 3.A) wires sendRpc / ASSET_* / DELETE_NODE per Doc 02.
 
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
@@ -11,6 +12,7 @@ import 'package:flutter/rendering.dart' show OverflowBoxFit;
 import 'package:image_picker/image_picker.dart';
 import 'package:mobile_app/core/models/canvas_models.dart';
 import 'package:mobile_app/core/theme/studio_theme.dart';
+import 'package:mobile_app/features/tools/tool_property_panels.dart';
 
 /// Tools exposed by the dock rail (Doc 24 §4).
 enum StudioTool {
@@ -132,6 +134,49 @@ typedef ImagePickFn = Future<PickedImage?> Function();
 /// own screen-fit planner).
 typedef WorldRectPlanner = Rect Function(int widthPx, int heightPx);
 
+/// Doc 02 §10.7 (Round-6) per-tool defaults. Selection REPLACES the exposed
+/// `config.value` with a fresh instance of this (except the dock's boot-time
+/// active tool, which keeps the host's live instance):
+///
+/// | tool | color | width | opacity | notes |
+/// |---|---|---|---|---|
+/// | pen | `#1E1E1E` | 2.5 | 1.0 | frozen Doc 24 §6 defaults |
+/// | highlighter | `#F1C40F` | 8.0 | 0.4 | MULTIPLY |
+/// | eraser | `#1E1E1E` | 10.0 | 1.0 | 10 dp hit radius, precision mode |
+/// | line | `#1E1E1E` | 2.5 | 1.0 | snap on (dock-local `_snap`) |
+/// | rect/circle/triangle/arrow | `#1E1E1E` | 2.5 | 1.0 | |
+/// | cartesianGraph/numberLine | `#4F8EF7` | 2.0 | 1.0 | |
+/// | image | `#1E1E1E` | 2.5 | 1.0 | unchanged (import flow only) |
+ToolConfig defaultToolConfig(StudioTool tool) {
+  final ToolConfig cfg = ToolConfig();
+  switch (tool) {
+    case StudioTool.pen:
+    case StudioTool.line:
+    case StudioTool.rect:
+    case StudioTool.circle:
+    case StudioTool.triangle:
+    case StudioTool.arrow:
+    case StudioTool.image:
+      break; // Frozen Doc 24 §6 defaults: #1E1E1E / 2.5 / 1.0.
+    case StudioTool.highlighter:
+      cfg.color = '#F1C40F';
+      cfg.width = 8.0;
+      cfg.opacity = 0.4;
+      cfg.highlighter = true;
+      cfg.blendMode = 'MULTIPLY';
+      break;
+    case StudioTool.eraser:
+      cfg.width = 10.0; // Hit radius (ToolConfig.width); precision mode.
+      break;
+    case StudioTool.cartesianGraph:
+    case StudioTool.numberLine:
+      cfg.color = '#4F8EF7';
+      cfg.width = 2.0;
+      break;
+  }
+  return cfg;
+}
+
 /// Collapsible tool dock: fixed 48 dp left rail + per-tool sub-panel.
 ///
 /// [config] and [tool] are injected [ValueNotifier]s the canvas page also
@@ -147,12 +192,15 @@ class ToolDock extends StatefulWidget {
     this.onEraseRequest,
     this.onPickImage,
     this.onGraphCommitted,
+    this.onClearRequested,
     this.pickImage,
     this.planWorldRect,
     this.snapEnabled,
   });
 
-  /// Injected; dock mutates `value` in place (Doc 24 §4).
+  /// Injected; on tool switch the dock REPLACES `value` with the active
+  /// tool's stored config (Doc 02 §10.7); panel edits still mutate the live
+  /// instance in place and write it back into the per-tool store.
   final ValueNotifier<ToolConfig> config;
 
   /// Active tool; previews use `toolIdFor(tool)`.
@@ -168,6 +216,11 @@ class ToolDock extends StatefulWidget {
   final void Function(String shapeType, Map<String, dynamic> graphConfig)?
   onGraphCommitted;
 
+  /// Round-6 (Doc 02 §10.7): fired only after the dock's Clear-canvas
+  /// confirmation dialog is accepted. PRE-SEEDED contract — never remove;
+  /// the canvas page passes its clear handler.
+  final VoidCallback? onClearRequested;
+
   /// Gallery picker override; defaults to `image_picker`.
   final ImagePickFn? pickImage;
 
@@ -182,35 +235,36 @@ class ToolDock extends StatefulWidget {
 }
 
 class _ToolDockState extends State<ToolDock> {
-  static const double _panelWidth = 260.0;
+  static const double _panelWidth = toolPanelWidth;
   static const Duration _anim = Duration(milliseconds: 180);
   static const ValueKey<String> _toggleKey = ValueKey<String>('dock-toggle');
 
-  // Issue 02B tip-size control: 0.5–20 dp in 0.5 dp fine steps (39 gaps).
-  static const double _tipWidthMin = 0.5;
-  static const double _tipWidthMax = 20.0;
-  static const int _tipWidthDivisions = 39;
-  static const double _opacityMin = 0.1;
-  static const double _opacityMax = 1.0;
+  /// Doc 02 §10.7: press-and-hold duration. A CUSTOM [Timer] — Flutter's
+  /// ~500 ms `onLongPress` is intentionally never used for this flow.
+  static const Duration _holdDuration = Duration(milliseconds: 2000);
 
-  /// Issue 02B palette: 8 swatches — ink black, theme red, accent blue,
-  /// green, yellow, true red, purple, white (ring-protected below).
-  /// `#F0546F` stays (theme danger + existing test pin); no custom picker —
-  /// swatch-only selection, a native color picker is future work.
-  static const List<String> _swatchColors = <String>[
-    '#1E1E1E',
-    '#F0546F',
-    '#4F8EF7',
-    '#2ECC71',
-    '#F1C40F',
-    '#D64550',
-    '#9B59B6',
-    '#FFFFFF',
-  ];
+  /// Pointer-move slop that reclassifies a press as a scroll/drag and thus
+  /// cancels a pending hold.
+  static const double _holdSlop = 18.0;
 
   bool _expanded = false;
   late final ValueNotifier<bool> _snap;
   bool _ownsSnap = false;
+
+  /// Doc 02 §10.7 per-tool property store: one [ToolConfig] per
+  /// [StudioTool]. Tool selection replaces `widget.config.value` with the
+  /// stored instance; every panel edit writes back into this map.
+  late final Map<StudioTool, ToolConfig> _perTool;
+
+  // --- Round-6 hold-to-open gesture state ---
+  Timer? _holdTimer;
+  StudioTool? _holdPendingTool;
+  Offset? _holdStart;
+  StudioTool? _pressingTool;
+
+  // --- Round-6 property overlay state ---
+  OverlayEntry? _panelEntry;
+  StudioTool? _panelTool;
 
   @override
   void initState() {
@@ -222,55 +276,311 @@ class _ToolDockState extends State<ToolDock> {
       _snap = ValueNotifier<bool>(true);
       _ownsSnap = true;
     }
+    _perTool = <StudioTool, ToolConfig>{
+      for (final StudioTool t in StudioTool.values) t: defaultToolConfig(t),
+    };
+    // The host's boot-time live instance IS the active tool's entry, so any
+    // custom initial values survive until the first tool switch.
+    _perTool[widget.tool.value] = widget.config.value;
   }
 
   @override
   void dispose() {
+    _holdTimer?.cancel();
+    _panelEntry?.remove();
+    _panelEntry?.dispose();
+    _panelEntry = null;
     if (_ownsSnap) {
       _snap.dispose();
     }
     super.dispose();
   }
 
-  /// Doc 24 §4: mutate the injected config in place, then nudge listeners —
-  /// `ValueNotifier.value` only notifies on reference change.
+  /// Doc 24 §4 / Doc 02 §10.7: mutate the injected config in place, write it
+  /// back into the per-tool store, then nudge listeners — `ValueNotifier.value`
+  /// only notifies on reference change.
   void _commit(void Function(ToolConfig update) mutate) {
     mutate(widget.config.value);
+    _perTool[widget.tool.value] = widget.config.value;
     // ignore: invalid_use_of_protected_member, invalid_use_of_visible_for_testing_member
     widget.config.notifyListeners();
   }
 
   void _selectTool(StudioTool next) {
+    // Flush the outgoing tool's live instance into the store FIRST.
+    _perTool[widget.tool.value] = widget.config.value;
+    // A property panel is bound to the tool it was opened for; switching
+    // tools closes it so panel rows can never desync from `config.value`.
+    if (_panelTool != null && _panelTool != next) {
+      _closePropertyPanel();
+    }
     widget.tool.value = next;
+    // Doc 02 §10.7: REPLACE the notifier's value with the stored per-tool
+    // config — never mutate the old instance in place on a switch.
+    final ToolConfig cfg = _perTool[next] ??= defaultToolConfig(next);
     final bool wantHighlighter = next == StudioTool.highlighter;
-    _commit((ToolConfig cfg) {
-      cfg.highlighter = wantHighlighter;
-      cfg.blendMode = wantHighlighter ? 'MULTIPLY' : 'SRC_OVER';
-    });
+    cfg.highlighter = wantHighlighter;
+    cfg.blendMode = wantHighlighter ? 'MULTIPLY' : 'SRC_OVER';
+    widget.config.value = cfg;
   }
 
   void _toggleDock() {
+    _cancelHold();
+    // The panel is anchored to the dock's rect; collapsing/expanding moves
+    // it, so dismiss it (a tap on the dock is "outside the panel").
+    _closePropertyPanel();
     setState(() {
+      _pressingTool = null;
       _expanded = !_expanded;
     });
   }
 
-  double _clampTipWidth(double v) =>
-      v.clamp(_tipWidthMin, _tipWidthMax).toDouble();
+  /// Compact rail buttons: 13×40 dp + dividers must fit a 600 dp-tall
+  /// viewport (the round-6 clear button would otherwise overflow the rail).
+  static ButtonStyle _railButtonStyle({Color? background}) =>
+      IconButton.styleFrom(
+        minimumSize: const Size(40, 40),
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        backgroundColor: background,
+      );
 
-  double _clampOpacity(double v) =>
-      v.clamp(_opacityMin, _opacityMax).toDouble();
+  // ---------------------------------------------------------------------
+  // Round-6 (Doc 02 §10.7): tap = select instantly; press-and-hold for
+  // exactly 2000 ms (custom Timer armed on pointer-down — NOT Flutter's
+  // ~500 ms onLongPress) opens that tool's property panel. The timer is
+  // cancelled on pointer-up/cancel, on drag-slop, on any other pointer-down
+  // inside the dock rail, on toggle, and on dispose.
+  // ---------------------------------------------------------------------
 
-  /// Clamp to 0.5–20 dp, then snap to the nearest 0.5 dp fine step.
-  void _commitTipWidth(double v) {
-    final double snapped = (_clampTipWidth(v) * 2).round() / 2;
-    _commit((ToolConfig c) => c.width = snapped);
+  void _startHold(StudioTool tool, Offset position) {
+    // A new press anywhere in the rail cancels a hold pending elsewhere.
+    _cancelHold();
+    if (_panelTool == tool) {
+      // Panel already open for this tool: holding again is a no-op.
+      return;
+    }
+    _holdPendingTool = tool;
+    _holdStart = position;
+    setState(() => _pressingTool = tool); // subtle 2 s press affordance
+    _holdTimer = Timer(_holdDuration, () {
+      _holdTimer = null;
+      if (!mounted || _holdPendingTool != tool) {
+        return;
+      }
+      _holdPendingTool = null;
+      setState(() => _pressingTool = null);
+      _openPropertyPanel(tool);
+    });
   }
 
-  void _commitOpacity(double v) {
-    // 10–100% in 1% fine steps (matches the slider's 90 divisions).
-    final double snapped = (_clampOpacity(v) * 100).roundToDouble() / 100;
-    _commit((ToolConfig c) => c.opacity = snapped);
+  void _endHold(StudioTool tool) {
+    // Only the tool that OWNS the pending timer may cancel it — a second
+    // finger lifting must not abort an in-flight hold elsewhere.
+    if (_holdPendingTool == tool) {
+      _cancelHold();
+      // Release before 2000 ms resolves as a tap-select. The InkWell tap
+      // alone is not enough: after ~500 ms the button tooltip's long-press
+      // recognizer claims the gesture arena and sacrifices the tap, so the
+      // aborted hold must select explicitly to keep "tap = select" intact.
+      _selectTool(tool);
+    }
+    if (_pressingTool == tool && mounted) {
+      setState(() => _pressingTool = null);
+    }
+  }
+
+  void _cancelHold() {
+    _holdTimer?.cancel();
+    _holdTimer = null;
+    _holdPendingTool = null;
+    _holdStart = null;
+  }
+
+  /// Drag-slop reclassifies the press as a scroll/drag: cancel the pending
+  /// hold (owned by [tool] only; the button's tap still fires normally).
+  void _watchHoldMove(StudioTool tool, PointerMoveEvent event) {
+    final Offset? start = _holdStart;
+    if (_holdTimer == null || _holdPendingTool != tool || start == null) {
+      return;
+    }
+    if ((event.position - start).distance > _holdSlop) {
+      _cancelHold();
+      if (mounted && _pressingTool != null) {
+        setState(() => _pressingTool = null);
+      }
+    }
+  }
+
+  /// Doc 02 §10.7 design choice (documented): the 2000 ms hold ALSO SELECTS
+  /// the held tool first, then opens its property panel — so the overlay
+  /// can never show one tool's rows against another tool's config.
+  void _openPropertyPanel(StudioTool tool) {
+    _selectTool(tool); // may close a previous panel (bound to its tool)
+    if (!mounted || _panelTool == tool) {
+      return;
+    }
+    Offset anchor = Offset.zero;
+    Size dockSize = Size.zero;
+    final RenderObject? renderObject = context.findRenderObject();
+    if (renderObject is RenderBox && renderObject.hasSize) {
+      anchor = renderObject.localToGlobal(Offset.zero);
+      dockSize = renderObject.size;
+    }
+    // Anchor the panel to the right of the dock, clamped on-screen.
+    final Size screen = MediaQuery.sizeOf(context);
+    double left = anchor.dx + dockSize.width + 8;
+    final double maxLeft = screen.width - _panelWidth - 8;
+    if (left > maxLeft) {
+      left = maxLeft < 8 ? 8 : maxLeft;
+    }
+    double top = anchor.dy;
+    final double maxTop = screen.height - 64;
+    if (top > maxTop) {
+      top = maxTop < 8 ? 8 : maxTop;
+    }
+    final Rect dockRect = Rect.fromLTWH(
+      anchor.dx,
+      anchor.dy,
+      dockSize.width,
+      dockSize.height,
+    );
+    _panelEntry = OverlayEntry(
+      builder: (BuildContext overlayContext) => _buildPropertyOverlay(
+        tool,
+        Offset(left, top),
+        dockRect,
+        screen,
+      ),
+    );
+    Overlay.of(context).insert(_panelEntry!);
+    _panelTool = tool;
+  }
+
+  void _closePropertyPanel() {
+    final OverlayEntry? entry = _panelEntry;
+    _panelEntry = null;
+    _panelTool = null;
+    entry?.remove();
+    entry?.dispose();
+  }
+
+  /// Tap-outside barrier (ModalBarrier-free hit test): four strips cover
+  /// everything EXCEPT the dock's own rect, so taps that land on the dock
+  /// still reach its buttons (tap re-selects, hold re-opens/no-ops) while
+  /// any tap outside — panel included via its absorb wrapper — closes the
+  /// overlay. The panel itself absorbs taps so its controls keep working.
+  Widget _buildPropertyOverlay(
+    StudioTool tool,
+    Offset anchor,
+    Rect dockRect,
+    Size screen,
+  ) {
+    Widget barrier() => GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _closePropertyPanel,
+      child: const SizedBox.expand(),
+    );
+
+    double nn(double v) => v < 0 ? 0 : v;
+
+    return Stack(
+      children: <Widget>[
+        // Top strip (above the dock).
+        Positioned(
+          left: 0,
+          top: 0,
+          width: screen.width,
+          height: nn(dockRect.top),
+          child: barrier(),
+        ),
+        // Bottom strip (below the dock).
+        Positioned(
+          left: 0,
+          top: dockRect.bottom,
+          width: screen.width,
+          height: nn(screen.height - dockRect.bottom),
+          child: barrier(),
+        ),
+        // Left strip.
+        Positioned(
+          left: 0,
+          top: dockRect.top,
+          width: nn(dockRect.left),
+          height: dockRect.height,
+          child: barrier(),
+        ),
+        // Right strip (dock's vertical band, right of it).
+        Positioned(
+          left: dockRect.right,
+          top: dockRect.top,
+          width: nn(screen.width - dockRect.right),
+          height: dockRect.height,
+          child: barrier(),
+        ),
+        Positioned(
+          left: anchor.dx,
+          top: anchor.dy,
+          child: GestureDetector(
+            key: const ValueKey<String>('property-overlay-panel'),
+            behavior: HitTestBehavior.opaque,
+            child: Material(
+              color: StudioTheme.surface,
+              elevation: 8,
+              borderRadius: BorderRadius.circular(StudioTheme.radiusLarge),
+              clipBehavior: Clip.antiAlias,
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: toolPanelWidth),
+                child: SingleChildScrollView(
+                  child: ToolPropertyPanel(
+                    tool: tool,
+                    config: widget.config,
+                    snap: _snap,
+                    commit: _commit,
+                    onOpenCartesian: _showCartesianDialog,
+                    onOpenNumberLine: _showNumberLineDialog,
+                    onImportImage: _pickAndDeliverImage,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Round-6 (Doc 02 §10.7): Clear-canvas utility. The seeded
+  // onClearRequested callback fires ONLY after the confirmation dialog is
+  // accepted — never on the icon tap itself.
+  // ---------------------------------------------------------------------
+  Future<void> _confirmClear() async {
+    _cancelHold();
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (BuildContext dialogContext) => AlertDialog(
+        title: const Text('Clear entire canvas?'),
+        content: const Text(
+          'All content will be removed from every connected device.',
+        ),
+        actions: <Widget>[
+          TextButton(
+            key: const ValueKey<String>('clear-cancel'),
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            key: const ValueKey<String>('clear-confirm'),
+            style: FilledButton.styleFrom(backgroundColor: StudioTheme.danger),
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      widget.onClearRequested?.call();
+    }
   }
 
   void _showCartesianDialog() {
@@ -394,6 +704,7 @@ class _ToolDockState extends State<ToolDock> {
             key: _toggleKey,
             tooltip: _expanded ? 'Collapse tools' : 'Expand tools',
             onPressed: _toggleDock,
+            style: _railButtonStyle(),
             icon: Icon(
               _expanded ? Icons.chevron_left : Icons.chevron_right,
               size: 22,
@@ -404,6 +715,20 @@ class _ToolDockState extends State<ToolDock> {
           const SizedBox(height: 4),
           for (final StudioTool t in StudioTool.values) _buildToolButton(t),
           const SizedBox(height: 4),
+          // Round-6 utility row (Doc 02 §10.7): destructive clear, gated by
+          // a confirmation dialog before onClearRequested fires.
+          const Divider(height: 1, thickness: 1, indent: 6, endIndent: 6),
+          IconButton(
+            key: const ValueKey<String>('clear-canvas'),
+            tooltip: 'Clear canvas',
+            onPressed: _confirmClear,
+            style: _railButtonStyle(),
+            icon: const Icon(
+              Icons.layers_clear,
+              size: 22,
+              color: StudioTheme.danger,
+            ),
+          ),
         ],
       ),
     );
@@ -414,17 +739,30 @@ class _ToolDockState extends State<ToolDock> {
       valueListenable: widget.tool,
       builder: (BuildContext context, StudioTool active, Widget? child) {
         final bool selected = active == tool;
-        return IconButton(
-          key: ValueKey<String>('tool-${tool.name}'),
-          tooltip: _toolLabel(tool),
-          onPressed: () => _selectTool(tool),
-          style: selected
-              ? IconButton.styleFrom(backgroundColor: StudioTheme.bg)
-              : null,
-          icon: Icon(
-            _toolIcon(tool),
-            size: 22,
-            color: selected ? StudioTheme.accent : StudioTheme.text,
+        final bool pressing = _pressingTool == tool;
+        return Listener(
+          // Doc 02 §10.7: pointer-down arms the custom 2000 ms Timer;
+          // IconButton.onPressed still provides the instant tap-to-select.
+          onPointerDown: (PointerDownEvent e) => _startHold(tool, e.position),
+          onPointerUp: (PointerUpEvent e) => _endHold(tool),
+          onPointerCancel: (PointerCancelEvent e) => _endHold(tool),
+          onPointerMove: (PointerMoveEvent e) => _watchHoldMove(tool, e),
+          child: IconButton(
+            key: ValueKey<String>('tool-${tool.name}'),
+            tooltip: _toolLabel(tool),
+            onPressed: () => _selectTool(tool),
+            style: _railButtonStyle(
+              background: selected ? StudioTheme.bg : null,
+            ),
+            icon: Icon(
+              _toolIcon(tool),
+              size: 22,
+              color: selected
+                  ? StudioTheme.accent
+                  : (pressing
+                        ? StudioTheme.text.withValues(alpha: 0.4)
+                        : StudioTheme.text),
+            ),
           ),
         );
       },
@@ -435,339 +773,20 @@ class _ToolDockState extends State<ToolDock> {
     return ValueListenableBuilder<StudioTool>(
       valueListenable: widget.tool,
       builder: (BuildContext context, StudioTool tool, Widget? child) {
-        return ValueListenableBuilder<ToolConfig>(
-          valueListenable: widget.config,
-          builder: (BuildContext context, ToolConfig cfg, Widget? child) {
-            return _panelBody(tool, cfg);
-          },
+        return ToolPropertyPanel(
+          tool: tool,
+          config: widget.config,
+          snap: _snap,
+          commit: _commit,
+          onOpenCartesian: _showCartesianDialog,
+          onOpenNumberLine: _showNumberLineDialog,
+          onImportImage: _pickAndDeliverImage,
         );
       },
     );
   }
 
-  Widget _panelBody(StudioTool tool, ToolConfig cfg) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: <Widget>[
-          Row(
-            children: <Widget>[
-              Expanded(
-                child: Text(
-                  _toolLabel(tool),
-                  style: const TextStyle(
-                    color: StudioTheme.text,
-                    fontSize: StudioTheme.titleSize,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-              Text(
-                '0x${toolIdFor(tool).toRadixString(16).padLeft(2, '0')}',
-                style: const TextStyle(
-                  color: StudioTheme.accent,
-                  fontSize: StudioTheme.captionSize,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 8),
-          ..._panelRows(tool, cfg),
-        ],
-      ),
-    );
-  }
-
-  List<Widget> _panelRows(StudioTool tool, ToolConfig cfg) {
-    switch (tool) {
-      case StudioTool.pen:
-      case StudioTool.highlighter:
-        return _strokeRows(tool, cfg);
-      case StudioTool.eraser:
-        return <Widget>[
-          SegmentedButton<EraserMode>(
-            segments: const <ButtonSegment<EraserMode>>[
-              ButtonSegment<EraserMode>(
-                value: EraserMode.precision,
-                label: Text('precision'),
-              ),
-              ButtonSegment<EraserMode>(
-                value: EraserMode.stroke,
-                label: Text('stroke'),
-              ),
-            ],
-            selected: <EraserMode>{cfg.eraserMode},
-            showSelectedIcon: false,
-            onSelectionChanged: (Set<EraserMode> next) =>
-                _commit((ToolConfig c) => c.eraserMode = next.first),
-          ),
-          const SizedBox(height: 8),
-          _buildTipSizeRow(cfg, label: 'Hit radius'),
-          const SizedBox(height: 4),
-          const Text(
-            'Tap a node: DELETE_NODE of the hit-tested node. Drag: same '
-            'action per hit node. Hit radius writes ToolConfig.width; '
-            'hit-test and RPC live in the canvas page.',
-            style: _captionStyle,
-          ),
-        ];
-      case StudioTool.line:
-        return <Widget>[
-          ValueListenableBuilder<bool>(
-            valueListenable: _snap,
-            builder: (BuildContext context, bool enabled, Widget? child) {
-              return Row(
-                children: <Widget>[
-                  Switch(
-                    key: const ValueKey<String>('snap-toggle'),
-                    value: enabled,
-                    onChanged: (bool v) => _snap.value = v,
-                  ),
-                  const SizedBox(width: 8),
-                  const Expanded(child: Text('Snapping', style: _bodyStyle)),
-                ],
-              );
-            },
-          ),
-          const Text(
-            'Fixed 15° increment; cardinals 0/90/180/270° always included.',
-            style: _captionStyle,
-          ),
-        ];
-      case StudioTool.rect:
-      case StudioTool.circle:
-      case StudioTool.triangle:
-      case StudioTool.arrow:
-        return <Widget>[
-          Text(
-            '${_toolLabel(tool)} selected — drag on the canvas; the live '
-            'preview streams ToolId 0x04 (shapePreview).',
-            style: _captionStyle,
-          ),
-          const SizedBox(height: 8),
-          Text(
-            'Style: ${cfg.color} · ${cfg.width.toStringAsFixed(1)} dp · '
-            'opacity ${(cfg.opacity * 100).round()}% · ${cfg.blendMode}',
-            style: _captionStyle,
-          ),
-        ];
-      case StudioTool.cartesianGraph:
-        return <Widget>[
-          FilledButton(
-            key: const ValueKey<String>('open-cartesian'),
-            onPressed: _showCartesianDialog,
-            child: const Text('Open Graph Builder…'),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'Inserts CARTESIAN_2D with Doc 03 graph_config (origin, x_range, '
-            'y_range, grid_step, show_labels).',
-            style: _captionStyle,
-          ),
-        ];
-      case StudioTool.numberLine:
-        return <Widget>[
-          FilledButton(
-            key: const ValueKey<String>('open-numberline'),
-            onPressed: _showNumberLineDialog,
-            child: const Text('Open Number Line Builder…'),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'Inserts NUMBER_LINE with Doc 03 graph_config (range, step, '
-            'show_labels).',
-            style: _captionStyle,
-          ),
-        ];
-      case StudioTool.image:
-        return <Widget>[
-          FilledButton.icon(
-            key: const ValueKey<String>('pick-image'),
-            onPressed: _pickAndDeliverImage,
-            icon: const Icon(Icons.image, size: 18),
-            label: const Text('Import from gallery…'),
-          ),
-          const SizedBox(height: 8),
-          const Text(
-            'Bytes only — the canvas page streams ASSET_START/CHUNK/DONE then '
-            'ADD_IMAGE.',
-            style: _captionStyle,
-          ),
-        ];
-    }
-  }
-
-  List<Widget> _strokeRows(StudioTool tool, ToolConfig cfg) {
-    return <Widget>[
-      _buildTipSizeRow(cfg),
-      // Issue 02B: opacity is a highlighter-panel-only control (pen strokes
-      // commit without opacity in Doc 21's StrokeProcessor; opacity drives
-      // the highlighter's multiply blend).
-      if (tool == StudioTool.highlighter) ...<Widget>[
-        const SizedBox(height: 4),
-        _buildOpacityRow(cfg),
-      ],
-      const SizedBox(height: 4),
-      _buildPaletteRow(cfg),
-      if (tool == StudioTool.highlighter) ...<Widget>[
-        const SizedBox(height: 4),
-        _multiplyNote(),
-      ],
-    ];
-  }
-
-  /// Issue 02B: width slider (0.5–20 dp, 0.5 fine-step snapping) with a live
-  /// value label and a preview dot scaled to the current tip width. The
-  /// eraser panel reuses it for the precision hit radius (`ToolConfig.width`).
-  Widget _buildTipSizeRow(ToolConfig cfg, {String label = 'Width'}) {
-    final double width = _clampTipWidth(cfg.width);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: <Widget>[
-        Row(
-          children: <Widget>[
-            Expanded(
-              child: Text(
-                '$label ${width.toStringAsFixed(1)} dp',
-                key: const ValueKey<String>('tip-size-label'),
-                style: _captionStyle,
-              ),
-            ),
-            _buildTipPreviewDot(width, cfg.color),
-          ],
-        ),
-        Slider(
-          key: const ValueKey<String>('width-slider'),
-          value: width,
-          min: _tipWidthMin,
-          max: _tipWidthMax,
-          divisions: _tipWidthDivisions,
-          label: '${width.toStringAsFixed(1)} dp',
-          onChanged: _commitTipWidth,
-        ),
-      ],
-    );
-  }
-
-  /// Preview dot: a circle whose diameter equals the tip width in dp,
-  /// tinted with the current color, in a fixed 24 dp slot so the row
-  /// height never jumps while dragging.
-  Widget _buildTipPreviewDot(double width, String hex) {
-    return SizedBox(
-      width: 24,
-      height: 24,
-      child: Center(
-        child: Container(
-          key: const ValueKey<String>('tip-preview-dot'),
-          width: width,
-          height: width,
-          decoration: BoxDecoration(
-            color: _colorFromHex(hex),
-            shape: BoxShape.circle,
-            border: Border.all(color: StudioTheme.text, width: 0.5),
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// Issue 02B / Doc 24 §3: 10–100% opacity slider bound to
-  /// `ToolConfig.opacity`, shown on the highlighter panel only (pen strokes
-  /// commit without opacity in Doc 21's StrokeProcessor; opacity drives the
-  /// highlighter's multiply blend). The multiply note stays below.
-  Widget _buildOpacityRow(ToolConfig cfg) {
-    final double opacity = _clampOpacity(cfg.opacity);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: <Widget>[
-        Text(
-          'Opacity ${(opacity * 100).round()}%',
-          key: const ValueKey<String>('opacity-label'),
-          style: _captionStyle,
-        ),
-        Slider(
-          key: const ValueKey<String>('opacity-slider'),
-          value: opacity,
-          min: _opacityMin,
-          max: _opacityMax,
-          divisions: 90,
-          label: '${(opacity * 100).round()}%',
-          onChanged: _commitOpacity,
-        ),
-      ],
-    );
-  }
-
-  /// Swatch row with a selected-check indicator.
-  Widget _buildPaletteRow(ToolConfig cfg) {
-    return Wrap(
-      spacing: 8,
-      runSpacing: 8,
-      children: <Widget>[
-        for (final String hex in _swatchColors) _buildSwatch(hex, cfg),
-      ],
-    );
-  }
-
-  Widget _buildSwatch(String hex, ToolConfig cfg) {
-    final bool selected = cfg.color == hex;
-    // White gets a fixed gray ring so it stays visible on light surfaces.
-    final Color ring = hex == '#FFFFFF'
-        ? const Color(0xFF9E9E9E)
-        : StudioTheme.text;
-    return InkWell(
-      key: ValueKey<String>('swatch-$hex'),
-      borderRadius: BorderRadius.circular(StudioTheme.radiusSmall),
-      onTap: () => _commit((ToolConfig c) => c.color = hex),
-      child: Container(
-        width: 28,
-        height: 28,
-        alignment: Alignment.center,
-        decoration: BoxDecoration(
-          color: _colorFromHex(hex),
-          shape: BoxShape.circle,
-          border: Border.all(
-            color: selected ? StudioTheme.accent : ring,
-            width: selected ? 2 : 1,
-          ),
-        ),
-        child: selected
-            ? Icon(
-                Icons.check,
-                size: 16,
-                color: _colorFromHex(hex).computeLuminance() > 0.5
-                    ? Colors.black87
-                    : Colors.white,
-              )
-            : null,
-      ),
-    );
-  }
-
-  Widget _multiplyNote() {
-    return Container(
-      key: const ValueKey<String>('multiply-note'),
-      width: double.infinity,
-      padding: const EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: StudioTheme.bg,
-        borderRadius: BorderRadius.circular(StudioTheme.radiusSmall),
-      ),
-      child: const Text(
-        'Multiply blend (GL: GL_DST_COLOR,GL_ZERO / cairo: '
-        'CAIRO_OPERATOR_MULTIPLY)',
-        style: _captionStyle,
-      ),
-    );
-  }
 }
-
-const TextStyle _captionStyle = TextStyle(
-  color: StudioTheme.text,
-  fontSize: StudioTheme.captionSize,
-);
 
 const TextStyle _bodyStyle = TextStyle(
   color: StudioTheme.text,
@@ -783,9 +802,6 @@ Rect _defaultWorldRectPlanner(int widthPx, int heightPx) {
   final double scale = longSide / (widthPx >= heightPx ? widthPx : heightPx);
   return Rect.fromLTWH(0, 0, widthPx * scale, heightPx * scale);
 }
-
-Color _colorFromHex(String hex) =>
-    Color(int.parse(hex.substring(1), radix: 16) | 0xFF000000);
 
 String _toolLabel(StudioTool tool) => switch (tool) {
   StudioTool.pen => 'Pen',

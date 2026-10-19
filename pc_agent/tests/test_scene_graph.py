@@ -18,6 +18,7 @@ import pytest
 
 from pc_agent.core.events import (
     ARTBOARD_CHANGED,
+    CANVAS_CLEARED,
     COMMITTED_NODE,
     RPC_MESSAGE,
     EventBus,
@@ -507,3 +508,90 @@ def test_concurrent_mutations_and_queries_share_the_rlock(graph: SceneGraph) -> 
             "max_x": max(n.bbox[2] for n in survivors),
             "max_y": max(n.bbox[3] for n in survivors),
         }
+
+
+# ---------------------------------------------------------------------------
+# Round 6 (Doc 02 §10.1) — CLEAR_CANVAS → clear_all() + CANVAS_CLEARED
+# ---------------------------------------------------------------------------
+
+
+def _cleared_spy(bus: EventBus) -> list[dict]:
+    events: list[dict] = []
+    bus.on(CANVAS_CLEARED, lambda **kw: events.append(kw))
+    return events
+
+
+def test_clear_canvas_wipes_nodes_bounds_and_undo_history(
+    bus: EventBus, graph: SceneGraph
+) -> None:
+    _commit(bus, "ADD_STROKE", {"node_id": "c1", "bbox": [0.0, 0.0, 10.0, 10.0]})
+    _commit(bus, "ADD_SHAPE", {"node_id": "c2", "bbox": [50.0, 50.0, 60.0, 60.0]})
+    graph.undo()  # leave a redo entry — clear must drop BOTH stacks
+    assert graph.content_bounds() != _ZERO
+
+    events = _spy(bus)
+    cleared = _cleared_spy(bus)
+    _commit(bus, "CLEAR_CANVAS", {})
+
+    assert graph.nodes() == []
+    assert graph.get("c1") is None
+    assert graph.get("c2") is None
+    assert graph.query_bbox(-1000.0, -1000.0, 1000.0, 1000.0) == []
+    assert graph.content_bounds() == _ZERO
+    assert cleared == [{"canvas_id": "cv-test"}]
+    # No node-level sub-events from a clear; undo/redo history is discarded
+    # deliberately (clear_all docstring) — nothing can be restored afterwards.
+    assert events == []
+    assert graph.undo() is False
+    assert graph.redo() is False
+
+
+def test_clear_canvas_on_empty_graph_is_safe(bus: EventBus, graph: SceneGraph) -> None:
+    cleared = _cleared_spy(bus)
+    _commit(bus, "CLEAR_CANVAS", {})
+    assert cleared == [{"canvas_id": "cv-test"}]
+    assert graph.nodes() == []
+    assert graph.content_bounds() == _ZERO
+
+
+def test_add_after_clear_works_and_refolds_bounds(bus: EventBus, graph: SceneGraph) -> None:
+    _commit(bus, "ADD_STROKE", {"node_id": "old", "bbox": [0.0, 0.0, 1.0, 1.0]})
+    _commit(bus, "CLEAR_CANVAS", {})
+    cleared = _cleared_spy(bus)
+    _commit(bus, "ADD_STROKE", {"node_id": "new", "bbox": [5.0, 6.0, 7.0, 8.0]})
+
+    assert graph.get("new") is not None
+    assert graph.get("new").bbox == (5.0, 6.0, 7.0, 8.0)
+    assert graph.content_bounds() == {"min_x": 5.0, "min_y": 6.0, "max_x": 7.0, "max_y": 8.0}
+    found = {n.node_id for n in graph.query_bbox(0.0, 0.0, 10.0, 10.0)}
+    assert found == {"new"}
+    assert cleared == []  # ADD emits COMMITTED_NODE only, never CANVAS_CLEARED
+
+    # Fresh rtree item ids after the reset stay consistent for later mutations.
+    _commit(bus, "DELETE_NODE", {"node_id": "new"})
+    assert graph.nodes() == []
+    assert graph.content_bounds() == _ZERO
+
+
+def test_clear_for_foreign_canvas_id_applies_always_and_echoes_id(
+    bus: EventBus, graph: SceneGraph
+) -> None:
+    _commit(bus, "ADD_STROKE", {"node_id": "c1", "bbox": [0.0, 0.0, 1.0, 1.0]})
+    cleared = _cleared_spy(bus)
+    envelope = _envelope("ELEMENT_COMMIT", "CLEAR_CANVAS", {})
+    envelope["canvas_id"] = "not-the-open-document"
+    bus.emit(RPC_MESSAGE, msg=envelope)
+
+    # Doc 02 §10.2: the PC applies ALWAYS (the scene graph holds no open-canvas
+    # gating) and CANVAS_CLEARED echoes the envelope's canvas_id verbatim, even
+    # when it names a document this device does not have open.
+    assert graph.nodes() == []
+    assert cleared == [{"canvas_id": "not-the-open-document"}]
+
+    # Shell-invalid id type: still clears, event carries the "" sentinel.
+    cleared.clear()
+    _commit(bus, "ADD_STROKE", {"node_id": "c2"})
+    envelope["canvas_id"] = 42
+    bus.emit(RPC_MESSAGE, msg=envelope)
+    assert graph.nodes() == []
+    assert cleared == [{"canvas_id": ""}]

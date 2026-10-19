@@ -20,7 +20,7 @@ Generate resolution-independent vector PDFs of bounded or INFINITE canvases on t
 * Third-party: `pycairo` (Doc 04 requirements)
 
 ### Never touches (paths owned by concurrent docs — write-conflict guard)
-`pc_agent/viewport/**` (Docs 06–08) · `pc_agent/network/**` (Docs 11–12) · `pc_agent/engine/**` (Docs 09–10) · `pc_agent/gui/**` (Docs 16–17) · `pc_agent/core/**`, `pc_agent/main.py`, `pc_agent/requirements.txt` (Doc 04) · `pc_agent/export/__init__.py`, `tiled_raster_exporter.py` (Doc 13) · `pc_agent/export/export_coordinator.py` (Doc 15) · `pc_agent/installer/**` · `mobile_app/**` · `shared_specs/**` · `docs/**` except this file.
+`pc_agent/viewport/**` (Docs 06–08) · `pc_agent/network/**` (Docs 11–12) · `pc_agent/engine/**` (Docs 09–10) · `pc_agent/gui/**` (Docs 16–17) · `pc_agent/core/**`, `pc_agent/main.py`, `pc_agent/requirements.txt` (Doc 04) · `pc_agent/export/__init__.py`, `tiled_raster_exporter.py`, `thumbnail_renderer.py` (Doc 13) · `pc_agent/export/export_coordinator.py` (Doc 15) · `pc_agent/installer/**` · `mobile_app/**` · `shared_specs/**` · `docs/**` except this file.
 
 ## 3. Contract References
 
@@ -106,8 +106,11 @@ class CanvasDocument:
 UNIT_TO_PT: float = 72 / 300                           # points = world_units * 72/300
 PAGE_PT_LIMIT: int = 14400                             # PDF maximum page dimension (pt)
 def page_size_pt(doc: CanvasDocument) -> tuple[float, float]:
-    # bounded ⇒ (width * 72/300, height * 72/300); INFINITE ⇒ content_bounds padded
-    # +48 world units per side, then * 72/300
+    # bounded ⇒ (width * 72/300, height * 72/300) — EXACT artboard page, never
+    #   content-derived; boundedness via artboard_is_infinite (Doc 10 preset table,
+    #   Doc 02 §10.4): A5/A4/LETTER ALWAYS bounded whatever is_infinite says, so each
+    #   preset yields a distinct, proportionally-correct page in points
+    # INFINITE ⇒ content_bounds padded +48 world units per side, then * 72/300
 def _tile_pages(w_pt: float, h_pt: float) -> list[tuple[int, int, float, float]]: ...
     # single page iff w_pt <= 14400 and h_pt <= 14400; else split along the long axis into
     # (page_index, page_count, offset_world_x, offset_world_y) tiles
@@ -122,7 +125,7 @@ def _draw_node(ctx, node: CanvasNode, assets_root: Path) -> None: ... # HIGHLIGH
 ## 5. Implementation Plan
 
 1. **Module scaffold + constants** — `vector_pdf_exporter.py`; `UNIT_TO_PT = 72/300`, `PAGE_PT_LIMIT = 14400`; `.part` temp sibling in `config.export_dir`; module docstring states "pycairo-only; reportlab declared but unused".
-2. **Page policy** — `page_size_pt(doc)`: bounded ⇒ one page = artboard in points (`w*0.24 × h*0.24`); INFINITE ⇒ single page = `content_bounds` padded `48` units/side × `72/300`; degenerate INFINITE bounds ⇒ `raise ValueError("empty canvas")` (same frozen policy as Doc 13).
+2. **Page policy** — `page_size_pt(doc)`: bounded ⇒ one page = artboard in points (`w*0.24 × h*0.24`); INFINITE ⇒ single page = `content_bounds` padded `48` units/side × `72/300`; degenerate INFINITE bounds ⇒ `raise ValueError("empty canvas")` (same frozen policy as Doc 13). **§10.4 rules:** boundedness comes from `artboard_is_infinite(artboard)` (Doc 10 preset table — `A5/A4/LETTER` ALWAYS bounded, `INFINITE` always unbounded; the raw `is_infinite` flag is only consulted for unknown presets), and Doc 10's loader normalizes `preset/width/height/is_infinite` end-to-end so the exact artboard survives every load path — a bounded page that resolved to content size would be a bug; A5/A4/Letter pages stay distinct and proportionally correct.
 3. **Tiling fallback** — if either page dimension would exceed `14400 pt`, split along the long axis (`_tile_pages`); one `PDFSurface` with the tile page size, `show_page()` per tile; each node is drawn on **every** page it intersects, with `ctx.translate(-offset_x, -offset_y)` in world units so strokes crossing seams are drawn once per page — vector seams are invisible.
 4. **Surface setup** — `surface = cairo.PDFSurface(tmp, w_pt, h_pt)`; `ctx.scale(72/300, 72/300)` so all drawing happens in world units; per node batch: pre-filter `doc.elements` by bbox ∩ page world-rect (layer order preserved).
 5. **Backgrounds & boundary** — fill `background_color`; pattern helper for `RULED/DOT_GRID/ISO_GRID` (small local duplication of Doc 08 grid math is OK); for bounded docs stroke the artboard rectangle boundary line (1 pt, `SRC_OVER`).
@@ -138,6 +141,7 @@ Owned test file (pytest): `pc_agent/tests/test_vector_pdf_exporter.py`
 3. `test_infinite_page_points` — fixture `content_bounds` padded `±48` units, × `72/300`, matches file page size (±0.5).
 4. `test_nontrivial_size` — file with ≥1 stroke is > 1 KB (real content, not an empty header).
 5. `test_tiling_fallback` — synthetic extent whose pt size exceeds `14400` ⇒ `_tile_pages` splits along the long axis into >1 page.
+6. **Extent rule (§10.4)** — A5/A4/Letter produce distinct, proportionally-correct pages (`1748×2480 → 419.5×595.2 pt`, `2480×3508 → 595.2×841.9 pt`, `2550×3300 → 612×792 pt` ±0.5) regardless of a stale/mistyped `is_infinite` flag; INFINITE pages remain content_bounds-derived (padded 48 units).
 
 Acceptance: progress monotonic ending at `1.0`, throttled ≤10 Hz; bounded docs carry the artboard boundary line; highlighter uses `CAIRO_OPERATOR_MULTIPLY`; PDF zooms to `6400%` vector-sharp (Doc 28); `.part` temp removed on success and failure.
 

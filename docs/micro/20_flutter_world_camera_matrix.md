@@ -95,7 +95,9 @@ class CameraController {                                        // Doc 20
    non-finite `d.scale`/focal values are ignored; focal coords are viewport-local from the canvas
    `GestureDetector`, never global screen pixels.
 7. **`zoomToFit`:** compute `s` per §4 with the +96 padding, set center to `bounds.center`,
-   fire `onCameraChanged`. Doc 26/22 call it on first open of a preset rect.
+   fire `onCameraChanged`. The **canvas page** calls it after the first layout frame when a document
+   opens (Doc 02 §10.5 fit-on-open); target rect: bounded ⇒ `(0, 0, width, height)`, infinite ⇒
+   `content_bounds` (empty ⇒ fallback `(-500, -500, 1000, 1000)`).
 8. **`applyRemote`:** clamp + assign only, silent (no callback) — distinguishes local gesture frames
    from PC/loopback-driven frames (echo protection for frames this device already sent).
 9. **Tests** (`test/camera_controller_test.dart`) — see §6; pure Dart (`flutter_test`), no widgets.

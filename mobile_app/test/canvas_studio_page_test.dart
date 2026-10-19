@@ -179,7 +179,10 @@ Future<void> _flushReal(WidgetTester tester, {int rounds = 4}) async {
   }
 }
 
-Future<void> _settleIo(WidgetTester tester, {int rounds = 16}) async {
+Future<void> _settleIo(WidgetTester tester, {int rounds = 32}) async {
+  // Generous real-async budget: since Doc 02 §10.6, `saveDocument` also
+  // rasterizes the thumbnail (engine `toImage` + PNG encode) before the
+  // save future — and therefore before the studio pops — completes.
   await _flushReal(tester, rounds: rounds);
   await tester.pump(const Duration(milliseconds: 500));
   await _flushReal(tester, rounds: 2);

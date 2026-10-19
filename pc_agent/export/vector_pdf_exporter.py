@@ -27,7 +27,7 @@ from uuid import uuid4
 import cairo
 
 from pc_agent.core.config_manager import AppConfig
-from pc_agent.engine.document_store import Artboard, CanvasDocument
+from pc_agent.engine.document_store import Artboard, CanvasDocument, artboard_is_infinite
 from pc_agent.engine.scene_graph import CanvasNode
 
 #: Points = world_units × 72/300 (template §3).
@@ -55,9 +55,14 @@ def _part_path(out_path: Path) -> Path:
 
 def _page_extent(doc: CanvasDocument) -> tuple[float, float, float, float]:
     """World extent of the PDF page(s): bounded ⇒ ``(0, 0, w, h)``; INFINITE ⇒
-    ``content_bounds`` padded 48 units/side; degenerate ⇒ ``ValueError``."""
+    ``content_bounds`` padded 48 units/side; degenerate ⇒ ``ValueError``.
+
+    §10.4 (issue 06): boundedness comes from the preset table
+    (:func:`artboard_is_infinite`) — the page of a bounded preset is always its
+    artboard in points, whatever the ``is_infinite`` flag says.
+    """
     artboard = doc.artboard
-    infinite = artboard.is_infinite or artboard.preset == "INFINITE"
+    infinite = artboard_is_infinite(artboard)
     if not infinite:
         w, h = artboard.width, artboard.height
         if w is None or h is None or w <= 0 or h <= 0:
@@ -509,7 +514,7 @@ class VectorPdfExporter:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         part = _part_path(out_path)
         artboard = doc.artboard
-        bounded = not (artboard.is_infinite or artboard.preset == "INFINITE")
+        bounded = not artboard_is_infinite(artboard)
         board_w = float(artboard.width or 0.0)
         board_h = float(artboard.height or 0.0)
         elements = sorted(doc.elements, key=lambda n: n.layer)

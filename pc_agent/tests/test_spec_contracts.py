@@ -5,7 +5,7 @@
   corrupted action sets are rejected, consistently-removed ones still pass.
 * The embedded JSON body in Doc 02 §5 (Step 8) stays byte-identical with the
   schema file (mechanical sync required by §8.5).
-* ``pc_agent.core.protocol.RPC_ACTIONS`` mirrors the schema's 19 actions.
+* ``pc_agent.core.protocol.RPC_ACTIONS`` mirrors the schema's 20 actions.
 """
 
 from __future__ import annotations
@@ -55,9 +55,9 @@ def test_real_schema_validates_clean() -> None:
     assert _VALIDATOR.main([str(_SCHEMA_PATH.parent)]) == 0
 
 
-def test_nineteen_actions_in_enum_and_canvas_lifecycle_group(schema: dict) -> None:
+def test_twenty_actions_in_enum_and_canvas_lifecycle_group(schema: dict) -> None:
     actions = schema["envelope"]["action"]["enum"]
-    assert len(actions) == 19
+    assert len(actions) == 20
     assert set(actions) == set(RPC_ACTIONS)
     canvas_actions = set(schema["type_actions"]["CANVAS_LIFECYCLE"])
     assert canvas_actions == {
@@ -74,6 +74,27 @@ def test_nineteen_actions_in_enum_and_canvas_lifecycle_group(schema: dict) -> No
     assert union == set(actions)
 
 
+def test_clear_canvas_lands_in_element_commit_group(schema: dict) -> None:
+    """§10.1: action 19 → 20 — CLEAR_CANVAS joins ELEMENT_COMMIT, payload {}."""
+    assert "CLEAR_CANVAS" in schema["envelope"]["action"]["enum"]
+    element_actions = set(schema["type_actions"]["ELEMENT_COMMIT"])
+    assert element_actions == {
+        "ADD_STROKE",
+        "ADD_GRAPH",
+        "ADD_SHAPE",
+        "ADD_IMAGE",
+        "DELETE_NODE",
+        "CLEAR_CANVAS",
+    }
+    # One action, one group: CLEAR_CANVAS appears exactly once across type_actions.
+    placements = [
+        group
+        for group, members in schema["type_actions"].items()
+        if "CLEAR_CANVAS" in members
+    ]
+    assert placements == ["ELEMENT_COMMIT"]
+
+
 def test_payload_schemas_cover_the_canvas_sync_actions(schema: dict) -> None:
     schemas = schema["payload_schemas"]
     assert set(schemas) == {
@@ -83,6 +104,8 @@ def test_payload_schemas_cover_the_canvas_sync_actions(schema: dict) -> None:
         "CANVAS_OPEN_REQUEST",
         "CANVAS_PUT",
         "CANVAS_PULL",
+        # Doc 02 §10.1 — round 6 clear.
+        "CLEAR_CANVAS",
     }
     open_canvas = schemas["OPEN_CANVAS"]
     assert open_canvas["discriminator"] == "canvas"
@@ -97,6 +120,10 @@ def test_payload_schemas_cover_the_canvas_sync_actions(schema: dict) -> None:
     assert schemas["CANVAS_PULL"]["direction"] == "any_to_any"
     assert schemas["CANVAS_PULL"]["required"] == ["canvas_id", "have_updated_at"]
     assert schemas["CANVAS_PULL"]["properties"]["have_updated_at"]["unit"] == "unix_seconds"
+    # §10.1 payload schema: CLEAR_CANVAS is an EMPTY object payload {}.
+    assert schemas["CLEAR_CANVAS"]["type"] == "object"
+    assert schemas["CLEAR_CANVAS"]["properties"] == {}
+    assert schemas["CLEAR_CANVAS"]["required"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +199,24 @@ def test_round5_action_missing_from_enum_is_rejected() -> None:
     assert any("missing ['CANVAS_PULL']" in e for e in errors)
 
 
+def test_round6_action_dropped_from_group_is_rejected() -> None:
+    """§10.1: losing CLEAR_CANVAS from ELEMENT_COMMIT ⇔ an unexpected enum action."""
+
+    def mutate(spec: dict) -> None:
+        spec["type_actions"]["ELEMENT_COMMIT"].remove("CLEAR_CANVAS")
+
+    errors = _validate(mutate)
+    assert any("unexpected ['CLEAR_CANVAS']" in e for e in errors)
+
+
+def test_round6_action_missing_from_enum_is_rejected() -> None:
+    def mutate(spec: dict) -> None:
+        spec["envelope"]["action"]["enum"].remove("CLEAR_CANVAS")
+
+    errors = _validate(mutate)
+    assert any("missing ['CLEAR_CANVAS']" in e for e in errors)
+
+
 def test_payload_schema_for_unknown_action_is_rejected() -> None:
     def mutate(spec: dict) -> None:
         spec["payload_schemas"]["CANVAS_LIST_X"] = {"type": "object"}
@@ -213,11 +258,12 @@ def test_doc02_step5_body_is_byte_identical_to_schema_file() -> None:
     )
 
 
-def test_doc02_embedded_body_parses_and_carries_the_19_actions() -> None:
+def test_doc02_embedded_body_parses_and_carries_the_20_actions() -> None:
     embedded = json.loads(_embedded_body())
     assert embedded == json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
-    assert len(embedded["envelope"]["action"]["enum"]) == 19
+    assert len(embedded["envelope"]["action"]["enum"]) == 20
     assert set(embedded["type_actions"]["CANVAS_LIFECYCLE"]) >= {
         "CANVAS_PUT",
         "CANVAS_PULL",
     }
+    assert "CLEAR_CANVAS" in embedded["type_actions"]["ELEMENT_COMMIT"]

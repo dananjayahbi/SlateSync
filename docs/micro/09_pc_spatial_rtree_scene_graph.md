@@ -3,9 +3,9 @@
 ## 1. Objective & Scope
 * Owns the authoritative PC-side spatial index: an `rtree.Index` keyed by node bbox with `node_id` as payload, paired with a parallel `dict[node_id, CanvasNode]` that is the **source of truth** (the index never holds geometry).
 * Provides instant `query_bbox` frustum culling for Docs 06/08, incremental global `content_bounds`, §4.4 non-destructive artboard upgrade validation, and a bounded undo/redo command stack.
-* Subscribes `RPC_MESSAGE` and routes `ELEMENT_COMMIT` / `ARTBOARD_RESIZE` envelopes through `apply_rpc`; emits `COMMITTED_NODE` and `ARTBOARD_CHANGED` on the Doc 04 `EventBus`.
+* Subscribes `RPC_MESSAGE` and routes `ELEMENT_COMMIT` (incl. `CLEAR_CANVAS`) / `ARTBOARD_RESIZE` envelopes through `apply_rpc`; emits `COMMITTED_NODE`, `ARTBOARD_CHANGED` and `CANVAS_CLEARED` on the Doc 04 `EventBus`.
 * Thread safety: one `threading.RLock` guards every mutation and query — the WS thread (Doc 11 handlers) inserts/deletes while the Tk thread calls `query_bbox`/`content_bounds`; `EventBus.emit` itself stays synchronous on the caller's thread (template threading model).
-* v1 limitations (frozen): **no ACK/NACK envelopes** — a refused `UPGRADE_SIZE` is logged and emits nothing; artboard changes are not undoable; undo history caps at 200 commands and is discarded on document reload.
+* v1 limitations (frozen): **no ACK/NACK envelopes** — a refused `UPGRADE_SIZE` is logged and emits nothing; artboard changes are not undoable; undo history caps at 200 commands and is discarded on document reload and on `CLEAR_CANVAS` (`clear_all()` drops both stacks — history loss is deliberate).
 
 ## 2. File Ownership
 ### Creates (implementation subagent writes these paths)
@@ -26,7 +26,7 @@
 ## 3. Contract References
 * `overview.md` §4.2 (envelope types/actions), §4.3 (element JSON), §4.4 (upgrade rule), §5 Doc 09 entry, §6 Wave 1.B.
 * `_micro_doc_template.md` §3 (artboard presets `1748×2480`/`2480×3508`/`2550×3300`/INFINITE, upgrade rule, RPC types/actions), §4 (SceneGraph + data models reproduced verbatim below; `EventBus` from Doc 04), §6 ownership matrix.
-* Envelopes arrive from Doc 11 (bus). Emits consumed by: Doc 06 (`COMMITTED_NODE`), Docs 06/08/16 (`ARTBOARD_CHANGED`). Doc 10 persists via `nodes()`, `content_bounds()`, `replace_all()`, `set_artboard()`.
+* Envelopes arrive from Doc 11 (bus). Emits consumed by: Doc 06 (`COMMITTED_NODE`), Docs 06/08/16 (`ARTBOARD_CHANGED`), and `CANVAS_CLEARED` (`{canvas_id: str}`, Doc 02 §10.1) for viewport/list refresh subscribers on `clear_all`. Doc 10 persists via `nodes()`, `content_bounds()`, `replace_all()`, `set_artboard()`.
 
 ## 4. Interface Freeze
 **Verbatim from template §4 — data models + `SceneGraph`, do not modify:**
@@ -69,6 +69,7 @@ class SceneGraph:
 # SceneGraph.__init__ registers: bus.on("RPC_MESSAGE", self.apply_rpc)
 def nodes(self) -> list[CanvasNode]: ...            # all nodes sorted (layer, node_id) — Doc 10 save() source of truth
 def replace_all(self, nodes: list[CanvasNode]) -> None: ...   # Doc 10 open(): fresh rtree.Index; clears dict, bounds, undo+redo; emits nothing
+def clear_all(self) -> None: ...                              # Doc 02 §10.1: wipe EVERY element (fresh rtree, dict, zero bounds, both stacks); artboard untouched; emits nothing
 def set_artboard(self, artboard: Artboard) -> None: ...       # Doc 10 new()/open(): shares the live doc.artboard instance (mutated in place)
 MAX_UNDO = 200                                      # command cap; oldest dropped when exceeded
 # emissions (EventBus.emit kwargs — frozen sub-event contract):
@@ -77,6 +78,7 @@ MAX_UNDO = 200                                      # command cap; oldest droppe
 #   undo/redo   → re-emit the matching COMMITTED_NODE sub-event (add-style or delete-style)
 #   upgrade ok  → emit("ARTBOARD_CHANGED", artboard=<Artboard>, content_bounds=<dict>)
 #   upgrade refused → log warning only, NO emit (v1 has no ACK envelope)
+#   CLEAR_CANVAS → clear_all() then emit("CANVAS_CLEARED", canvas_id=<str>)   # 13 event constants in Doc 04 events.py
 ```
 
 **`apply_rpc` routing table (frozen):**
@@ -88,6 +90,7 @@ MAX_UNDO = 200                                      # command cap; oldest droppe
 | `ELEMENT_COMMIT` | `ADD_SHAPE` | build `kind="SHAPE"` (payload may set `LINE`), insert, emit add |
 | `ELEMENT_COMMIT` | `ADD_IMAGE` | build `kind="IMAGE"`, insert, emit add |
 | `ELEMENT_COMMIT` | `DELETE_NODE` | `delete(payload.node_id)`, emit `node=None, deleted_node_id=` |
+| `ELEMENT_COMMIT` | `CLEAR_CANVAS` | `clear_all()` then emit `CANVAS_CLEARED(canvas_id=<envelope canvas_id>)` — wipes ALL elements (artboard/background/title preserved); PC applies always (no open-doc gating, Doc 02 §10.1) |
 | `ARTBOARD_RESIZE` | `UPGRADE_SIZE` | `validate_artboard_upgrade(...)` → mutate + emit / log-only |
 
 * **Style change (undoable):** an `ADD_*` whose `payload.node_id` already exists is an in-place update (style/geometry/bbox patch + re-index) recorded as a style-change command.
@@ -96,13 +99,14 @@ MAX_UNDO = 200                                      # command cap; oldest droppe
 * Other envelope types (`EXPORT_JOB`, `ASSET_UPLOAD`, `CANVAS_LIFECYCLE`) are ignored here — their subscribers are Docs 15/10.
 * `content_bounds()` returns `{min_x, min_y, max_x, max_y}` floats: union fold on insert, targeted recompute on delete, zeros when empty — Doc 10 writes this dict into `document.json` verbatim.
 * `replace_all` is deliberately **not** undoable and emits nothing, so Doc 10's `open()` cannot pollute undo history or re-trigger dirty marks.
+* `clear_all` mirrors that contract: fresh `rtree.Index` + empty dict + zero bounds + both stacks dropped, **no** `COMMITTED_NODE` emissions (only the `CANVAS_CLEARED` emitted by `apply_rpc` follows); the bound artboard is untouched — only elements are cleared.
 
 ## 5. Implementation Plan
 1. **Scaffold state.** `self._nodes: dict[str, CanvasNode]`, `self._index = rtree.Index()`, `self._boxes: dict[str, tuple]` (exact boxes required by `rtree.delete`), `self._bounds`, `self._artboard`, `self._undo/_redo: list[Command]`, `self._bus`, `self._lock = threading.RLock()` (guards all index/dict/bounds/stack access); register `RPC_MESSAGE` subscription.
 2. **insert/delete/get.** insert: dict-set + `self._index.insert(box, obj=node_id)` + fold into `_bounds`. delete: `self._index.delete(box, obj=node_id)`; if removed box touches `_bounds`, recompute union over remaining nodes; empty ⇒ zeros.
 3. **query_bbox.** `self._index.intersection((minx, miny, maxx, maxy))` → map ids through `_nodes` → `sorted(key=lambda n: (n.layer, n.node_id))`.
 4. **Command stack.** `Command` holds `do`/`undo` closures; `_push` clears `_redo`, appends, drops oldest past `MAX_UNDO`; `undo()`/`redo()` run inverse, re-emit `COMMITTED_NODE`, return `bool`.
-5. **Routing — adds.** Filter `type=="ELEMENT_COMMIT"`; build node per table; existing id ⇒ style-change command, else insert-command; emit `COMMITTED_NODE(node=...)`.
+5. **Routing — adds.** Filter `type=="ELEMENT_COMMIT"`; build node per table; existing id ⇒ style-change command, else insert-command; emit `COMMITTED_NODE(node=...)`. `CLEAR_CANVAS` (same type, Doc 02 §10.1) ⇒ `clear_all()` then emit `CANVAS_CLEARED(canvas_id=...)`.
 6. **Routing — delete.** Capture node, apply delete, emit delete sub-event; inverse command re-inserts the exact `CanvasNode`.
 7. **Artboard upgrade.** Resolve preset/w/h; on `True` mutate shared `_artboard` (`preset/width/height/is_infinite`) and emit `ARTBOARD_CHANGED`; on `False` `logging.getLogger("slatesync.scene_graph").warning(...)` and return with no emit.
 8. **Doc 10 hand-off.** Implement `nodes()` / `replace_all()` / `set_artboard()` exactly as frozen; `replace_all` swaps in a fresh `rtree.Index` and resets bounds + both stacks (no stale undo history after load).
@@ -113,6 +117,7 @@ MAX_UNDO = 200                                      # command cap; oldest droppe
 * **Bounds union:** empty ⇒ `{0,0,0,0}`; incremental unions across inserts; deleting an extreme node recomputes; deleting an interior node preserves bounds.
 * **Upgrade matrix (§4.4):** A5→A4 allowed; A4→A5 refused when content exceeds A5; any→INFINITE always allowed; INFINITE→Letter refused when content lies outside `2550×3300` (incl. negative coords); empty doc → any target allowed; unknown preset refused.
 * **Event contract:** adds emit `node=<CanvasNode>`; delete emits `node=None, deleted_node_id`; refused upgrade emits nothing (bus spy).
+* **Clear (Doc 02 §10.1):** `ELEMENT_COMMIT`/`CLEAR_CANVAS` empties dict, index, bounds and both undo/redo stacks while the bound artboard stays intact; it emits `CANVAS_CLEARED` with the envelope's `canvas_id` verbatim (empty id tolerated) and never `COMMITTED_NODE`; other actions never emit `CANVAS_CLEARED`.
 * **Undo/redo sequences:** insert→undo→empty→redo→restored; delete→undo→query finds node; style change→undo reverts queryable bbox; cap drops oldest beyond 200; new command clears redo; `replace_all` empties both stacks.
 * **Concurrency smoke:** a worker thread inserts/deletes while the main thread runs `query_bbox`/`content_bounds` — no exceptions, no torn bounds (RLock coverage).
 * **Bbox derivation:** payload `bbox` wins; otherwise min/max over `geometry.pts` (empty ⇒ `(0,0,0,0)`) — index and brute-force reference agree on every query.

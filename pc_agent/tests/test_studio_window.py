@@ -103,13 +103,20 @@ def _make_root() -> ctk.CTk:
     return root
 
 
+def _noop_thumbnail(row: dict, out_path: Any, size: int) -> None:
+    """Gallery §10.6 fake: keep the gray placeholder, never touch disk."""
+    return None
+
+
 @contextmanager
 def _studio() -> Iterator[tuple[Any, StudioWindow, _RecordingBus, _FakeGLHost, _SubmitSpy]]:
     root = _make_root()
     bus = _RecordingBus()
     gl_host = _FakeGLHost()
     submit = _SubmitSpy()
-    win = StudioWindow(AppConfig(), bus, gl_host, submit)
+    win = StudioWindow(
+        AppConfig(), bus, gl_host, submit, thumbnail_fn=_noop_thumbnail
+    )
     win.build(root)
     try:
         yield root, win, bus, gl_host, submit
@@ -487,7 +494,12 @@ def test_open_synced_canvas_dialog_lists_rows_and_requests_selection() -> None:
     root = _make_root()
     bus = _RecordingBus()
     win = StudioWindow(
-        AppConfig(), bus, _FakeGLHost(), _SubmitSpy(), open_request=requested.append
+        AppConfig(),
+        bus,
+        _FakeGLHost(),
+        _SubmitSpy(),
+        open_request=requested.append,
+        thumbnail_fn=_noop_thumbnail,
     )
     win.build(root)
     try:

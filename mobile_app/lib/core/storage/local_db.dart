@@ -20,7 +20,19 @@ import 'package:archive/archive.dart'; // Doc 05 pubspec
 import 'package:path_provider/path_provider.dart'; // Doc 05 pubspec
 import 'package:sqflite/sqflite.dart'; // Doc 05 pubspec
 
+import 'package:mobile_app/canvas_engine/thumbnail_renderer.dart'
+    show saveDocThumbnail; // Doc 02 §10.6 FROZEN (read-only import)
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
+
+/// Doc 02 §10.6 seam: thumbnail generator signature used by the save path
+/// and the gallery backfill. Implementations MUST write the PNG to [outPath]
+/// (canonical `<base>/thumbs/<canvas_id>.png`) and return the path written.
+/// Tests inject fakes here for determinism; production defaults to the
+/// frozen `saveDocThumbnail`.
+typedef ThumbGenerator = Future<String> Function(
+  CanvasDocumentModel doc,
+  String outPath,
+);
 
 /// One gallery row of the `canvases` table (Doc 26 §4).
 class CanvasRecord {
@@ -142,6 +154,24 @@ class LocalDb {
   Future<void> delete(String id) =>
       _db.delete(table, where: 'id = ?', whereArgs: <Object?>[id]);
 
+  /// Thumbnail path stored on the row (Doc 02 §10.6): `null` when the row is
+  /// unknown or `thumb_path` is empty (legacy row awaiting gallery backfill).
+  Future<String?> thumbPath(String id) async {
+    final CanvasRecord? record = await get(id);
+    final String path = record?.thumbPath ?? '';
+    return path.isEmpty ? null : path;
+  }
+
+  /// Patch ONLY `thumb_path` for one row — used by the gallery backfill so a
+  /// slow thumbnail job can never clobber a concurrent title/preset write
+  /// (row rewrites from rename/upgrade keep racing the other way).
+  Future<void> setThumbPath(String id, String thumbPath) => _db.update(
+        table,
+        <String, Object?>{'thumb_path': thumbPath},
+        where: 'id = ?',
+        whereArgs: <Object?>[id],
+      );
+
   Future<void> close() => _db.close();
 }
 
@@ -159,6 +189,32 @@ Future<String> _defaultBaseDir() async {
 Future<String> slatesyncFilePath(String id, {String? baseDir}) async {
   final String dir = baseDir ?? await _defaultBaseDir();
   return '$dir/$id.slatesync';
+}
+
+/// Resolve the canonical thumbnail path `<base>/thumbs/<id>.png`
+/// (Doc 02 §10.6) without touching disk. `baseDir` defaults to
+/// `path_provider` app-documents/SlateSync (test-injectable).
+Future<String> thumbFilePath(String id, {String? baseDir}) async {
+  final String dir = baseDir ?? await _defaultBaseDir();
+  return '$dir/thumbs/$id.png';
+}
+
+/// Generate (or refresh) the Doc 02 §10.6 thumbnail PNG for [doc] at the
+/// canonical `<base>/thumbs/<canvas_id>.png` and return the path written.
+/// [generator] defaults to the frozen `saveDocThumbnail`; tests inject a
+/// fake through this seam for deterministic call counts.
+Future<String> ensureThumbnail(
+  CanvasDocumentModel doc, {
+  String? baseDir,
+  ThumbGenerator? generator,
+}) async {
+  final String dirPath = baseDir ?? await _defaultBaseDir();
+  final String outPath = await thumbFilePath(
+    doc.canvasId,
+    baseDir: dirPath,
+  );
+  final ThumbGenerator gen = generator ?? saveDocThumbnail;
+  return gen(doc, outPath);
 }
 
 String _assetFileName(String assetRef) {
@@ -182,11 +238,18 @@ String _assetDir(String baseDir, String canvasId) =>
 /// `"assets/img.png"`) when given, otherwise from the per-canvas extracted
 /// directory populated by [loadDocument]. Refs whose bytes are unavailable
 /// are skipped so autosave can never fail on a missing attachment.
-/// Returns the absolute file path written.
+///
+/// Doc 02 §10.6: AFTER the archive lands, the save path (re)generates the
+/// thumbnail PNG at `<base>/thumbs/<canvas_id>.png` so every
+/// create/open/back-save/upgrade/rename refreshes it — unless [thumbGenerator]
+/// overrides the generator (tests). Thumbnail failures are best-effort and
+/// never fail the document save itself.
+/// Returns the absolute `.slatesync` file path written.
 Future<String> saveDocument(
   CanvasDocumentModel doc, {
   String? baseDir,
   Map<String, List<int>>? assets,
+  ThumbGenerator? thumbGenerator,
 }) async {
   final String dirPath = baseDir ?? await _defaultBaseDir();
   final String filePath = await slatesyncFilePath(
@@ -214,6 +277,18 @@ Future<String> saveDocument(
 
   final Uint8List zipBytes = ZipEncoder().encodeBytes(archive);
   await File(filePath).writeAsBytes(zipBytes, flush: true);
+
+  // Doc 02 §10.6 — save-time thumbnail (best-effort: a rasterization
+  // failure must never break document persistence).
+  try {
+    await ensureThumbnail(
+      doc,
+      baseDir: dirPath,
+      generator: thumbGenerator,
+    );
+  } catch (_) {
+    // Missing engine/headless environment — gallery backfill retries later.
+  }
   return filePath;
 }
 

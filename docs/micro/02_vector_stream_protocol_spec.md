@@ -149,12 +149,13 @@ Doc-specific frozen contract (top-level keys of the two files this doc creates):
       "DELETE_NODE", "UPGRADE_SIZE", "START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS",
       "EXPORT_FINISHED", "ASSET_START", "ASSET_CHUNK", "ASSET_DONE",
       "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
-      "CANVAS_PUT", "CANVAS_PULL"]}
+      "CANVAS_PUT", "CANVAS_PULL", "CLEAR_CANVAS"]}
   },
   "type_actions": {
     "CANVAS_LIFECYCLE": ["OPEN_CANVAS", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
       "CANVAS_PUT", "CANVAS_PULL"],
-    "ELEMENT_COMMIT": ["ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE", "DELETE_NODE"],
+    "ELEMENT_COMMIT": ["ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE", "DELETE_NODE",
+      "CLEAR_CANVAS"],
     "ARTBOARD_RESIZE": ["UPGRADE_SIZE"],
     "ASSET_UPLOAD": ["ASSET_START", "ASSET_CHUNK", "ASSET_DONE"],
     "EXPORT_JOB": ["START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS", "EXPORT_FINISHED"]
@@ -241,6 +242,13 @@ Doc-specific frozen contract (top-level keys of the two files this doc creates):
         "have_updated_at": {"type": "integer", "unit": "unix_seconds"}
       },
       "description": "receiver replies CANVAS_PUT only if its stored copy has updated_at > have_updated_at"
+    },
+    "CLEAR_CANVAS": {
+      "direction": "cross_device",
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "description": "EMPTY payload {} (Doc 02 §10.1) — the target document is the envelope's canvas_id; the receiver wipes ALL elements of its open document (artboard/background/title preserved), bumps updated_at, persists (LWW), refreshes lists"
     }
   },
   "asset_upload": {
@@ -424,3 +432,40 @@ Add to `envelope.action.enum` + `type_actions.CANVAS_LIFECYCLE` (and Doc 02 §5 
 * **Mobile bridge agent:** `lib/features/sync/canvas_sync_bridge.dart` (+ pre-seeded `hubChanged` notifier contract) and sync tests only.
 * **Mobile shell agent:** `lib/main.dart`, `lib/features/home/**` and their tests.
 * Envelope top-level keys, frame layout, `type` enum and §4.2 payloads (other than 9.1/9.2 additions) remain unchanged.
+
+---
+
+## 10. Round-6 Extension — Clear, Live Relay, View/Export/Thumbnail Freezes (NORMATIVE)
+
+### 10.1 Action-set (19 → 20)
+Add `CLEAR_CANVAS` to `envelope.action.enum` under `type_actions.ELEMENT_COMMIT`. Payload `{}` (target identified by `canvas_id`). Receiver wipes ALL elements of the open document (artboard/background/title preserved), bumps `updated_at`, persists (LWW), refreshes lists.
+
+### 10.2 Live mutation relay (multi-device real-time)
+`WsStreamServer` must, AFTER local dispatch, re-broadcast to every **OTHER** connected device connection (sender excluded) any incoming message with `type == "ELEMENT_COMMIT"` (incl. `CLEAR_CANVAS`) or `type == "ARTBOARD_RESIZE"`. API freeze: `WsStreamStreamServer`'s `broadcast_json(msg: dict, exclude=None)` gains the additive optional `exclude` parameter (existing callers unchanged). Receiving endpoints: **PC applies always**; **devices apply only when `msg.canvas_id` equals their currently-open document** (else ignore silently).
+
+### 10.3 Shape & graph geometry conventions
+The NORMATIVE source for `geometry.pts` of `LINE | RECT | CIRCLE | TRIANGLE | ARROW | CARTESIAN_2D | NUMBER_LINE` is the PC implementation: `pc_agent/viewport/primitive_renderer.py` + `pc_agent/export/tiled_raster_exporter.py` + `vector_pdf_exporter.py` shape-drawing code (read-only reference). The mobile app MUST emit and preview the exact same point conventions — do not invent new layouts. (Thumbnails may approximate shapes; normative rendering may not.)
+
+### 10.4 Export extent rule (issue 06 fix)
+* Bounded preset ⇒ extent = EXACT artboard rect; `px = world * dpi / 300`, then strip-padded to the 2048 grid. A5/A4/Letter/Infinite must yield DISTINCT, proportionally-correct sizes per DPI.
+* Infinite ⇒ content_bounds padded 64 world units (unchanged).
+* Every loader/index path MUST preserve `artboard.preset/width/height/is_infinite` end-to-end; an extent resolving to content-size for a bounded doc is a bug.
+
+### 10.5 View-fit-on-open (issue 03, both platforms)
+On opening a document: zoom-to-fit with **48 world-unit padding**, centered via the §3 transform. Target rect: bounded ⇒ `(0, 0, width, height)`; infinite ⇒ `content_bounds` (empty ⇒ fallback `(-500,-500,1000,1000)`).
+* PC: `GLCanvasHost.fit_viewport() -> None` + `@property camera_scale -> float` (frozen); `main.py` calls it after `DOCUMENT_LOADED` then refreshes `window.update_hud(...)`.
+* Mobile: `CameraController.zoomToFit(rect, viewport)` after first layout frame in the canvas page.
+
+### 10.6 Thumbnail contract (issue 07)
+* Mobile (PRE-SEEDED, implemented): `Future<Uint8List> renderDocThumbnail(CanvasDocumentModel doc, {int size = 256})` and `Future<String> saveDocThumbnail(CanvasDocumentModel doc, String outPath, {int size = 256})` in `mobile_app/lib/canvas_engine/thumbnail_renderer.dart`.
+* PC: `render_thumbnail(doc, out_path: Path, size: int = 192) -> Path` in `pc_agent/export/thumbnail_renderer.py`.
+* Preset badges (A5/A4/LETTER/INFINITE) are **UI overlays**, never baked into the image. Local save paths must generate a thumbnail (mobile: inside `saveDocument`; PC: on-demand from the gallery panel, cached under `%APPDATA%/SlateSync/thumbs/`).
+
+### 10.7 Tool-dock API freezes (issue 04)
+* Per-tool property store: the exposed `config` notifier's `value` is **replaced** with the active tool's config on tool switch (existing host wiring keeps working unchanged); all round-5 ctor params preserved.
+* Tool buttons: **tap = select**; **press-and-hold 2000 ms (custom Timer — Flutter's ~500 ms long-press is NOT used) = open that tool's property panel** (overlay; tap-outside closes).
+* `onClearRequested` (VoidCallback?) — PRE-SEEDED in the ctor — fires only after the dock's confirmation dialog is accepted.
+* Existing `onEraseRequest` / `onPickImage` / `onGraphCommitted` / `pickImage` / `planWorldRect` / `snapEnabled` semantics unchanged.
+
+### 10.8 Round-6 ownership matrix (write-conflict guard)
+PC: viewport+fit (`pc_agent/viewport/**`) · export+thumbnail renderer+extents (`pc_agent/export/**`, `engine/document_store.py`) · clear/relay/protocol mirrors+`engine/scene_graph.py`+`network/ws_stream_server.py`+`main.py`+spec JSONs (`shared_specs/**`, Doc 02 §5 body, `core/**`, `network/**`, `engine/scene_graph.py`, `main.py`) · gallery+studio (`pc_agent/gui/**`, its tests). Mobile: engine (`mobile_app/lib/canvas_engine/**` EXCEPT thumbnail_renderer which is frozen) · canvas page (`mobile_app/lib/features/canvas/**`) · dock (`mobile_app/lib/features/tools/**`) · home (`mobile_app/lib/features/home/**`, `core/storage/**`). Docs agent: `docs/overview.md` + `docs/micro/**` EXCEPT Doc 02. Contract tests: new `mobile_app/test/contract_*` files only.

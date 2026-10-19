@@ -131,7 +131,7 @@ Used for reliable state mutations, committed strokes, graph/shape creation, canv
 {
   "id": "uuid-v4",
   "type": "CANVAS_LIFECYCLE | ELEMENT_COMMIT | ARTBOARD_RESIZE | ASSET_UPLOAD | EXPORT_JOB",
-  "action": "OPEN_CANVAS | ADD_STROKE | ADD_GRAPH | ADD_SHAPE | ADD_IMAGE | DELETE_NODE | UPGRADE_SIZE | START_EXPORT | CANCEL_EXPORT | EXPORT_PROGRESS | EXPORT_FINISHED | ASSET_START | ASSET_CHUNK | ASSET_DONE",
+  "action": "OPEN_CANVAS | ADD_STROKE | ADD_GRAPH | ADD_SHAPE | ADD_IMAGE | DELETE_NODE | UPGRADE_SIZE | START_EXPORT | CANCEL_EXPORT | EXPORT_PROGRESS | EXPORT_FINISHED | ASSET_START | ASSET_CHUNK | ASSET_DONE | CANVAS_LIST_REQUEST | CANVAS_LIST | CANVAS_OPEN_REQUEST | CANVAS_PUT | CANVAS_PULL | CLEAR_CANVAS",
   "canvas_id": "canvas-uuid-v4",
   "payload": {},
   "timestamp": 1760760000
@@ -139,6 +139,8 @@ Used for reliable state mutations, committed strokes, graph/shape creation, canv
 ```
 
 **Transport handshake & asset transfer:** clients connect to `ws://<ipv4>:50606/ws?token=<session_token>`; the server closes with code `4001` on token mismatch. Finished-export pushes and image attachments use `type: ASSET_UPLOAD` with `ASSET_START` (transfer_id, filename, total_chunks, size_bytes), `ASSET_CHUNK` (transfer_id, index, data_b64 — ≤ 262144 bytes raw per chunk), and `ASSET_DONE`/abort semantics. `EXPORT_JOB` + `CANCEL_EXPORT` aborts a running export.
+
+**Live mutation relay & hub persistence:** the full action set is **20 actions** (Doc 02 §8.1/§9.1/§10.1). After local dispatch, the PC hub re-broadcasts every `ELEMENT_COMMIT` (incl. `CLEAR_CANVAS`) and `ARTBOARD_RESIZE` message to all **other** connected devices — `broadcast_json(msg, exclude=None)` with the sender excluded (Doc 02 §10.2); devices apply a relayed mutation only when its `canvas_id` equals their currently-open document. A peer receiving `OPEN_CANVAS {canvas}` MUST persist it locally (LWW per Doc 02 §9.3: apply only if `canvas.updated_at >= local.updated_at`) **before** switching UI, while `CANVAS_PUT` persists silently with no UI switch.
 
 ### 4.3 Canvas Document & Artboard Schema (`canvas_document_schema.json`)
 Defines page presets (at $300\text{ DPI}$ world-unit baseline) and vector elements:

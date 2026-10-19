@@ -51,7 +51,7 @@
 | FrameType | `0x01` LIVE_POINT (f1=x, f2=y, f3=width_pressure_factor), `0x02` LIVE_END (all 0.0), `0x03` CAMERA (f1=scale, f2=tx, f3=ty), `0x04` LASER (f1=x, f2=y, f3=0.0) |
 | ToolId | `0x01` Pen, `0x02` Highlighter, `0x03` Eraser, `0x04` Line/Shape Preview |
 | Seq rule | u16 **single per-connection counter shared by ALL frame types** (client increments once per frame sent); receivers keep one `last_seq` per connection and drop frames whose seq is not newer (mod 2^16 window) |
-| RPC envelope | `overview.md` §4.2 incl. actions `OPEN_CANVAS, ADD_STROKE, ADD_GRAPH, ADD_SHAPE, ADD_IMAGE, DELETE_NODE, UPGRADE_SIZE, START_EXPORT, CANCEL_EXPORT, EXPORT_PROGRESS, EXPORT_FINISHED, ASSET_START, ASSET_CHUNK, ASSET_DONE`; types `CANVAS_LIFECYCLE, ELEMENT_COMMIT, ARTBOARD_RESIZE, ASSET_UPLOAD, EXPORT_JOB` |
+| RPC envelope | `overview.md` §4.2 + **Doc 02 §8/§9/§10 (NORMATIVE)**. Action enum authority = `shared_specs/ws_rpc_schema.json` (**20 as of Round-6**: the 14 base + `CANVAS_LIST_REQUEST/CANVAS_LIST/CANVAS_OPEN_REQUEST` + `CANVAS_PUT/CANVAS_PULL` + `CLEAR_CANVAS`); NEVER hardcode a count here. types: `CANVAS_LIFECYCLE, ELEMENT_COMMIT, ARTBOARD_RESIZE, ASSET_UPLOAD, EXPORT_JOB` |
 | Asset chunks | `data_b64` ≤ `262144` bytes raw per chunk; fields `transfer_id, filename, total_chunks, size_bytes, index, data_b64` (`transfer_id` required on START, CHUNK and DONE for correlation) |
 | Artboard presets (300 DPI world units, **top-left origin (0,0)→(w,h)**) | A5 `1748×2480`, A4 `2480×3508`, Letter `2550×3300`, INFINITE unbounded |
 | Upgrade rule (§4.4) | allow iff `target==INFINITE` OR (`min_x>=0 AND min_y>=0 AND max_x<=target.w AND max_y<=target.h`) |
@@ -99,10 +99,10 @@ class EventBus:                      # synchronous emit on the CALLER'S thread
     def on(self, event: str, handler: Callable[..., None]) -> None: ...
     def off(self, event: str, handler: Callable[..., None]) -> None: ...
     def emit(self, event: str, **payload) -> None: ...
-# Event name constants (same module):
+# Event name constants (same module) — 13 as of Round-6:
 # "LIVE_FRAME" "CAMERA_DELTA" "RPC_MESSAGE" "CONNECTION_STATE" "DOCUMENT_LOADED"
 # "COMMITTED_NODE" "ARTBOARD_CHANGED" "EXPORT_STARTED" "EXPORT_PROGRESS"
-# "EXPORT_FINISHED" "PAIRING_INFO"
+# "EXPORT_FINISHED" "PAIRING_INFO" "CANVAS_LIST_UPDATED" "CANVAS_CLEARED"
 
 # pc_agent/core/protocol.py (Doc 04 — mirrors Doc 02; import, never re-declare)
 FRAME_LIVE_POINT, FRAME_LIVE_END, FRAME_CAMERA, FRAME_LASER = 0x01, 0x02, 0x03, 0x04
@@ -182,7 +182,7 @@ class WsStreamServer:                                   # Doc 11
     def stop(self) -> None: ...
     @property
     def port(self) -> int: ...
-    def broadcast_json(self, msg: dict) -> None: ...     # thread-safe push to all clients
+    def broadcast_json(self, msg: dict, exclude=None) -> None: ...  # push to clients; exclude=sender conn (Round-6 relay §10.2)
 # binary  → unpack_live_frame → emit("CAMERA_DELTA") if 0x03 else emit("LIVE_FRAME", frame=...)
 # text    → json envelope      → emit("RPC_MESSAGE", msg=...)
 # emits CONNECTION_STATE(connected: bool, peer: str | None)
@@ -209,6 +209,9 @@ class GLCanvasHost:                                     # Doc 06
     def set_camera(self, scale: float, tx: float, ty: float) -> None: ...
     def request_redraw(self) -> None: ...                # thread-safe, coalesced
     def resize(self, w: int, h: int) -> None: ...
+    def fit_viewport(self) -> None: ...                 # Round-6 §10.5 zoom-fit+center
+    @property
+    def camera_scale(self) -> float: ...                # Round-6 §10.5 (HUD refresh)
     def shutdown(self) -> None: ...
 class ProgramRegistry:                                  # Doc 06 (generic stem loader)
     def get(self, stem: str) -> "moderngl.Program": ...  # pairs <stem>.vert + <stem>.frag in config.shader_dir
@@ -283,6 +286,8 @@ class TrayDaemon:                                       # Doc 17
 | `ARTBOARD_CHANGED(artboard, content_bounds)` | Doc 09 | Docs 06, 08, 16 |
 | `EXPORT_STARTED / EXPORT_PROGRESS / EXPORT_FINISHED` | Doc 15 | Doc 16 (GUI); tablet receives via `broadcast_json` envelope |
 | `PAIRING_INFO(ipv4, port, token, qr_png_path)` | Doc 12 | Doc 16 |
+| `CANVAS_LIST_UPDATED(canvases, devices)` | CanvasSyncManager (Round-5) | Doc 16 (gallery + Pair/QR visibility) |
+| `CANVAS_CLEARED(canvas_id)` | Doc 09 (`clear_all` via CLEAR_CANVAS) | Doc 06 (GL host wipes scene) |
 
 **Threading model (all PC docs):**
 * Tk **main thread** owns GUI + **all GL calls** + pyglet event pump (`after(16, tick)` — never `pyglet.app.run()`).

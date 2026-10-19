@@ -11,6 +11,8 @@ dual-layer `RepaintBoundary` widget separating static tiles from live strokes. D
 ### Creates (implementation subagent writes these paths)
 - `mobile_app/lib/canvas_engine/tiled_canvas_painter.dart`
 - `mobile_app/test/tiled_canvas_painter_test.dart`
+- `mobile_app/test/engine_add_node_test.dart` (round-6 — `addNode`)
+- `mobile_app/test/engine_clear_all_test.dart` (round-6 — `clearAll`)
 
 ### Read-only dependencies (imports, each cited as "Doc NN")
 - `mobile_app/lib/core/models/canvas_models.dart` — `TileKey` inputs `CanvasNodeModel`,
@@ -48,6 +50,8 @@ class SpatialRTree {                                              // Doc 22 (in-
 class TiledCanvasEngine {                                         // Doc 22
   TiledCanvasEngine({required CameraController camera});
   void addCommitted(ProcessedStroke s);                           // index + dirty-tile rebake
+  void addNode(CanvasNodeModel n);                                // round-6 (Doc 02 §10.1/§10.3): index ANY kind + dirty-tile rebake
+  void clearAll();                                                // round-6 (Doc 02 §10.1): wipe index + cache (artboard/camera untouched)
   void setDocument(CanvasDocumentModel doc);
   List<CanvasNodeModel> queryVisible(Rect worldRect);
 }
@@ -80,6 +84,21 @@ class TiledCanvasEngine {                                         // Doc 22
   (`worldRect(s.bbox)` ∩ tile rects); rebakes exactly that dirty set; `void onScaleBucketChanged()`
   re-bakes the hot window at the new bucket; `@visibleForTesting int get rebakeCount` (per-operation
   counter, reset at op start — the ≤4-tiles/commit assertion hook).
+* **Round-6 APIs (Doc 02 §10.1):** `void addNode(CanvasNodeModel node)` indexes any node kind
+  (`STROKE/HIGHLIGHT/LINE/SHAPE/GRAPH_AXES/IMAGE`) through the same per-kind `_drawNode` dispatch
+  `setDocument` uses, dirtying only `tilesCovering(node.bbox)` (≤ 4 tiles — never a full-cache
+  invalidation); re-inserting an existing `nodeId` **replaces** it (union of previous + new tiles
+  force-rebaked so no ghost ink survives). `void clearAll()` wipes the spatial index, dirty set,
+  per-tile bucket map and every cached picture (disposal via `TileCache.invalidateAll` — no picture
+  leaks) while deliberately preserving camera/viewport hot-window state and the cumulative
+  `bakeStats`; subsequent `addCommitted`/`addNode`/`setDocument` behave exactly as on a fresh engine.
+  RPC/broadcast of `CLEAR_CANVAS` stays with the canvas page — the engine only clears state.
+* **Per-kind draw dispatch (Doc 02 §10.3):** `_drawNode` switches on `kind` — `SHAPE` → `_drawShape`
+  (`RECT`/`CIRCLE`/`TRIANGLE`/`ARROW` [shaft `pts[0]→pts[-1]` + head, PC convention], and
+  `CARTESIAN_2D`/`NUMBER_LINE` dispatch to the graph renderer even under kind `SHAPE`, matching the
+  PC exporters); `GRAPH_AXES` → `_drawGraph` (axes/grid/ticks/labels from `geometry.graphConfig`);
+  `IMAGE` → bbox rect; `LINE` → straight segment first→last anchor (intermediates ignored);
+  default → polyline. Mobile emits/preview the exact same point conventions as the PC renderer.
 * **Rendering (dual-layer widget):** `class TiledCanvasView extends StatefulWidget` builds
   `Stack[ RepaintBoundary(StaticTilePainter(engine, cache)), RepaintBoundary(ForegroundStrokePainter) ]`;
   static painter draws `engine.queryVisible(worldRectOfViewport)` tiles via `cache.get` + picture
@@ -98,10 +117,14 @@ class TiledCanvasEngine {                                         // Doc 22
    over all tiles containing nodes plus the 5×5 hot window; reset counters.
 6. **Bake core:** `ui.Picture _bakeTile(TileKey k, int bucket)` — replay `tree.query(k.worldRect)`
    clipped to the tile, scaled by `bucket`; store picture + bucket.
-7. **`addCommitted(s)`:** `tree.insert`-style index from `s` (convert to `CanvasNodeModel` via
+7. **`addCommitted(s)` / `addNode(n)` / `clearAll()`:** `addCommitted` — `tree.insert`-style index from `s` (convert to `CanvasNodeModel` via
    Doc 05 models + `toRpcPayload`); compute dirty tile set from `s.bbox` (≤ 4 for normal strokes);
    `_bakeTile` each dirty tile at the current bucket; increment `rebakeCount` per tile — **no**
-   full-canvas redraw anywhere (event-driven anti-quadratic core).
+   full-canvas redraw anywhere (event-driven anti-quadratic core). `addNode(n)` (round-6, Doc 02
+   §10.2/§10.3) — same dirty-set rule for ANY node kind through the per-kind `_drawNode` dispatch;
+   existing `nodeId` replaces (union of old+new tiles rebaked). `clearAll()` (round-6, Doc 02 §10.1) —
+   `tree.clear()` + dirty/bucket maps cleared + `cache.invalidateAll()` (pictures disposed); camera
+   window and `bakeStats` preserved; no RPC side effects.
 8. **`queryVisible(worldRect)`:** `tree.query` + filter bbox to viewport (static layer culling).
 9. **`TiledCanvasView` painters:** static painter draws visible tiles (picture + `scale(scale/b)`
    correction under `camera.viewMatrix`); foreground painter repaints on each `livePoints` tick via
@@ -118,6 +141,15 @@ class TiledCanvasEngine {                                         // Doc 22
 - **Dirty-set bound:** one `addCommitted` of a bbox crossing ≤ 2 tile boundaries ⇒
   `rebakeCount <= 4`; a commit never invalidates tiles outside its bbox range; `setDocument` then
   one commit rebakes ≤ 4 tiles (not the full document).
+- **`addNode` (`test/engine_add_node_test.dart`):** each kind (`SHAPE`, `GRAPH_AXES`, `IMAGE`,
+  `LINE`, stroke) indexes and renders through the shared per-kind draw path with `rebakeCount <= 4`;
+  re-inserting the same `nodeId` replaces without ghost ink; `ARROW`/`CARTESIAN_2D`/`NUMBER_LINE`
+  follow the PC point conventions (Doc 02 §10.3).
+- **`clearAll` (`test/engine_clear_all_test.dart`):** after a populated engine, `clearAll()` leaves
+  tree queries empty, `cache.approxBytes() == 0` (all pictures disposed), bucket/dirty maps empty and
+  `rebakeCount` reset, while the camera hot-window state and cumulative `bakeStats` survive; a
+  subsequent `addNode`/`addCommitted` behaves as on a fresh engine; `clearAll` emits no RPC and never
+  mutates the document/artboard (§10.1 split of duties).
 - **Acceptance:** `flutter test` green; `flutter analyze` clean; static/foreground split present in
   `TiledCanvasView` (two `RepaintBoundary` children).
 

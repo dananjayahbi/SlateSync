@@ -956,6 +956,11 @@ class PrimitiveRenderer:
     ) -> None:
         geometry = getattr(node, "geometry", None)
         style = getattr(node, "style", None)
+        if str(getattr(node, "kind", "") or "") == "LINE":
+            # r6-pc-line-gl: kind LINE (shape_type null per Doc 03) is a
+            # straight stroke — GLCanvasHost._commit_node tessellates it via
+            # the stroke mesh path. Never fall into shape-ring/circle fills.
+            return
         shape_type = str(getattr(geometry, "shape_type", "") or "")
         stroke_width = float(getattr(style, "stroke_width", 0.0) or 0.0)
         rgba = parse_color(getattr(style, "color", "#1E1E1E"), getattr(style, "opacity", 1.0))

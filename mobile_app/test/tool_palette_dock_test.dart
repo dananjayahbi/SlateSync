@@ -206,7 +206,11 @@ void main() {
         final Slider opacity = tester.widget<Slider>(find.byKey(opacitySlider));
         expect(opacity.min, 0.1);
         expect(opacity.max, 1.0);
-        expect(opacity.value, 1.0, reason: 'default opacity');
+        // Round-6 (Doc 02 §10.7): per-tool defaults — the highlighter's
+        // stored config is #F1C40F / 8.0 / 0.4-multiply, so selection
+        // REPLACES config.value with 0.4 (was 1.0 under round-5 in-place
+        // mutation where no per-tool store existed).
+        expect(opacity.value, 0.4, reason: 'round-6 per-tool default');
 
         opacity.onChanged!(0.05);
         await tester.pump();
@@ -246,9 +250,13 @@ void main() {
       final Slider slider = tester.widget<Slider>(find.byKey(widthSlider));
       expect(slider.min, 0.5);
       expect(slider.max, 20.0);
+      // Round-6 (Doc 02 §10.7): eraser default is a 10 dp hit radius (was
+      // 2.5 in round-5, which had no per-tool store and inherited the pen
+      // width); the panel now REPLACES config.value with the eraser's
+      // stored config on selection.
       expect(
         tester.widget<Text>(find.byKey(tipLabel)).data,
-        'Hit radius 2.5 dp',
+        'Hit radius 10.0 dp',
       );
 
       slider.onChanged!(8);

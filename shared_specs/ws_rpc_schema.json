@@ -14,12 +14,13 @@
       "DELETE_NODE", "UPGRADE_SIZE", "START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS",
       "EXPORT_FINISHED", "ASSET_START", "ASSET_CHUNK", "ASSET_DONE",
       "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
-      "CANVAS_PUT", "CANVAS_PULL"]}
+      "CANVAS_PUT", "CANVAS_PULL", "CLEAR_CANVAS"]}
   },
   "type_actions": {
     "CANVAS_LIFECYCLE": ["OPEN_CANVAS", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
       "CANVAS_PUT", "CANVAS_PULL"],
-    "ELEMENT_COMMIT": ["ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE", "DELETE_NODE"],
+    "ELEMENT_COMMIT": ["ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE", "DELETE_NODE",
+      "CLEAR_CANVAS"],
     "ARTBOARD_RESIZE": ["UPGRADE_SIZE"],
     "ASSET_UPLOAD": ["ASSET_START", "ASSET_CHUNK", "ASSET_DONE"],
     "EXPORT_JOB": ["START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS", "EXPORT_FINISHED"]
@@ -106,6 +107,13 @@
         "have_updated_at": {"type": "integer", "unit": "unix_seconds"}
       },
       "description": "receiver replies CANVAS_PUT only if its stored copy has updated_at > have_updated_at"
+    },
+    "CLEAR_CANVAS": {
+      "direction": "cross_device",
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "description": "EMPTY payload {} (Doc 02 §10.1) — the target document is the envelope's canvas_id; the receiver wipes ALL elements of its open document (artboard/background/title preserved), bumps updated_at, persists (LWW), refreshes lists"
     }
   },
   "asset_upload": {
