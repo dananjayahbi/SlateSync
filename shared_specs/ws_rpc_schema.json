@@ -12,14 +12,76 @@
     "type": {"enum": ["CANVAS_LIFECYCLE", "ELEMENT_COMMIT", "ARTBOARD_RESIZE", "ASSET_UPLOAD", "EXPORT_JOB"]},
     "action": {"enum": ["OPEN_CANVAS", "ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE",
       "DELETE_NODE", "UPGRADE_SIZE", "START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS",
-      "EXPORT_FINISHED", "ASSET_START", "ASSET_CHUNK", "ASSET_DONE"]}
+      "EXPORT_FINISHED", "ASSET_START", "ASSET_CHUNK", "ASSET_DONE",
+      "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST"]}
   },
   "type_actions": {
-    "CANVAS_LIFECYCLE": ["OPEN_CANVAS"],
+    "CANVAS_LIFECYCLE": ["OPEN_CANVAS", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST"],
     "ELEMENT_COMMIT": ["ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE", "DELETE_NODE"],
     "ARTBOARD_RESIZE": ["UPGRADE_SIZE"],
     "ASSET_UPLOAD": ["ASSET_START", "ASSET_CHUNK", "ASSET_DONE"],
     "EXPORT_JOB": ["START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS", "EXPORT_FINISHED"]
+  },
+  "payload_schemas": {
+    "OPEN_CANVAS": {
+      "description": "dual dialect, discriminated by the presence of the 'canvas' key (exactly one dialect per message)",
+      "discriminator": "canvas",
+      "dialects": {
+        "canvas": {
+          "direction": "cross_device",
+          "required": ["canvas"],
+          "canvas": {
+            "type": "object",
+            "description": "complete Doc 03 CanvasDocumentModel document.json body (snake_case wire keys): canvas_id, title, created_at, updated_at, artboard, content_bounds, elements[...] — the receiver MUST load it as the currently-open document (replace scene/canvas state) and switch its UI to it"
+          }
+        },
+        "path": {
+          "direction": "pc_internal_only",
+          "required": ["path"],
+          "path": {
+            "type": "string",
+            "description": "filesystem path of a PC-local .slatesync file — MUST NEVER be sent over the wire; CanvasSyncManager (PC) ignores OPEN_CANVAS payloads lacking 'canvas', and the tablet never sends this dialect"
+          }
+        }
+      }
+    },
+    "CANVAS_LIST_REQUEST": {
+      "direction": "pc_to_tablet",
+      "type": "object",
+      "properties": {},
+      "description": "request the tablet's canvas list (empty payload)"
+    },
+    "CANVAS_LIST": {
+      "direction": "tablet_to_pc",
+      "type": "object",
+      "required": ["canvases"],
+      "properties": {
+        "canvases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "title", "preset", "background", "updated_at"],
+            "properties": {
+              "id": {"type": "string"},
+              "title": {"type": "string"},
+              "preset": {"type": "string"},
+              "background": {"type": "string"},
+              "updated_at": {"type": "integer", "unit": "unix_seconds"}
+            }
+          },
+          "description": "may be EMPTY; sorted updated_at DESC; pushed unsolicited on (re)connect and after create/rename/delete, and sent in reply to CANVAS_LIST_REQUEST"
+        }
+      }
+    },
+    "CANVAS_OPEN_REQUEST": {
+      "direction": "pc_to_tablet",
+      "type": "object",
+      "required": ["canvas_id"],
+      "properties": {
+        "canvas_id": {"type": "string"}
+      },
+      "description": "asks the tablet to load that document, switch its own UI to it, and broadcast OPEN_CANVAS {canvas: <full doc>}"
+    }
   },
   "asset_upload": {
     "encoding": "base64",

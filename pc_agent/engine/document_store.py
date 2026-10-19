@@ -269,6 +269,27 @@ class DocumentStore:
         self._bus.emit(DOCUMENT_LOADED, doc=doc)  # state set BEFORE emit (Doc 10 §4)
         return doc
 
+    def open_payload(self, data: dict) -> CanvasDocument:
+        """Load a full Doc 03 document from a wire dict (Doc 02 §8.2 dialect).
+
+        Same rebuild path as :meth:`open` minus the ZIP: parse → replace the
+        injected SceneGraph contents + artboard → mark clean → emit
+        ``DOCUMENT_LOADED`` exactly once (state set before the emit). The
+        document came off the wire, so ``current_path`` becomes ``None`` — a
+        tablet canvas is never autosaved into a PC-local archive.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("open_payload() needs a document object")
+        doc = _doc_from_json(data)
+        self._scene.replace_all(doc.elements)
+        self._scene.set_artboard(doc.artboard)
+        with self._lock:
+            self._current = doc
+            self._current_path = None
+            self._dirty = False
+        self._bus.emit(DOCUMENT_LOADED, doc=doc)  # state set BEFORE emit (Doc 10 §4)
+        return doc
+
     def save(self, doc: CanvasDocument, path: Path | None = None) -> Path:
         """Atomic ZIP write; ``path`` falls back to ``current_path``, else
         ``ValueError`` — never a silent destination. Failure logs + re-raises."""
@@ -317,6 +338,11 @@ class DocumentStore:
         action = msg.get("action")
         if envelope_type == "CANVAS_LIFECYCLE" and action == "OPEN_CANVAS":
             payload = msg.get("payload")
+            if isinstance(payload, dict) and "canvas" in payload:
+                # Cross-device dialect (Doc 02 §8.2): CanvasSyncManager owns it
+                # and routes the body through open_payload() — never this path.
+                logger.debug("OPEN_CANVAS canvas dialect routed by CanvasSyncManager")
+                return
             raw_path = payload.get("path") if isinstance(payload, dict) else None
             if not raw_path:
                 logger.error(

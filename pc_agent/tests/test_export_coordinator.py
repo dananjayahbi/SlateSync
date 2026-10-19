@@ -32,12 +32,12 @@ from pc_agent.export.export_coordinator import (
 
 CANVAS = str(uuid4())
 
-# template §3 "RPC envelope" row — exactly 14 actions, incl. EXPORT_FINISHED
-ACTIONS_14 = [
+# Doc 02 §8 action set (17) — mirrored from shared_specs/ws_rpc_schema.json
+ACTIONS_17 = [
     "OPEN_CANVAS", "ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE",
     "DELETE_NODE", "UPGRADE_SIZE", "START_EXPORT", "CANCEL_EXPORT",
     "EXPORT_PROGRESS", "EXPORT_FINISHED", "ASSET_START", "ASSET_CHUNK",
-    "ASSET_DONE",
+    "ASSET_DONE", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
 ]
 ENVELOPE_KEYS = {"id", "type", "action", "canvas_id", "payload", "timestamp"}
 
@@ -298,8 +298,8 @@ def test_chunk_boundaries(build, tmp_path: Path, size, expected_sizes) -> None:
 def test_envelope_schema_matches_doc02(build) -> None:
     spec_path = Path(__file__).resolve().parents[2] / "shared_specs" / "ws_rpc_schema.json"
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
-    assert spec["envelope"]["action"]["enum"] == ACTIONS_14
-    assert len(ACTIONS_14) == 14 and "EXPORT_FINISHED" in ACTIONS_14
+    assert spec["envelope"]["action"]["enum"] == ACTIONS_17
+    assert len(ACTIONS_17) == 17 and "EXPORT_FINISHED" in ACTIONS_17
     assert spec["envelope"]["required"] == ["id", "type", "action", "canvas_id", "payload",
                                             "timestamp"]
 
@@ -311,7 +311,7 @@ def test_envelope_schema_matches_doc02(build) -> None:
     seen_actions = set()
     for env in h.push.envelopes("EXPORT_JOB"):
         assert set(env) == ENVELOPE_KEYS
-        assert env["action"] in ACTIONS_14
+        assert env["action"] in ACTIONS_17
         assert env["action"] in {"START_EXPORT", "EXPORT_PROGRESS", "EXPORT_FINISHED"}
         assert env["type"] == "EXPORT_JOB"
         assert UUID(env["id"]).version == 4

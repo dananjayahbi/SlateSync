@@ -28,7 +28,10 @@ void main() {
         float ly = smoothstep(o - f, o, v_world.y);
         float ry = 1.0 - smoothstep(u_pageSize.y + o, u_pageSize.y + o + f, v_world.y);
         float outside = 1.0;
-        if (v_world.x < u_pageSize.x && v_world.y < u_pageSize.y) {
+        if (v_world.x > 0.0 && v_world.y > 0.0 &&
+            v_world.x < u_pageSize.x && v_world.y < u_pageSize.y) {
+            // Only the page INTERIOR is masked — the feather band left of / below
+            // the page (world x < 0 or y < 0) must still paint.
             outside = 0.0;
         }
         color = u_shadowColor.rgb;

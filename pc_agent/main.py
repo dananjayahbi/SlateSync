@@ -63,6 +63,7 @@ def run_full() -> int:
     from pc_agent.export.vector_pdf_exporter import VectorPdfExporter
     from pc_agent.gui.studio_window import StudioWindow
     from pc_agent.gui.tray_daemon import TrayDaemon
+    from pc_agent.network.canvas_sync import CanvasSyncManager
     from pc_agent.network.discovery_pairing import DiscoveryPairing
     from pc_agent.network.ws_stream_server import WsStreamServer
     from pc_agent.viewport import GLCanvasHost
@@ -95,6 +96,15 @@ def run_full() -> int:
     scene_graph = SceneGraph(bus)
     document_store = DocumentStore(bus, config, scene_graph)
 
+    # --- 3b. canvas sync (Doc 02 §8): list cache + OPEN_CANVAS canvas dialect;
+    # pushes go through the same broadcast_json fan-out as the exporters. -----
+    canvas_sync = CanvasSyncManager(
+        bus=bus,
+        config=config,
+        push=server.broadcast_json,
+        store=document_store,
+    )
+
     # --- 4. exports (Doc 15); output files land in config.export_dir --------
     current_doc: dict[str, CanvasDocument | None] = {"doc": None}
 
@@ -121,7 +131,13 @@ def run_full() -> int:
     # --- 5. Tk root → StudioWindow → GL host (Doc 16 layout) ----------------
     root = tk.Tk()  # visible at launch (withdrawn=False)
     gl_host = GLCanvasHost(root, config, bus)
-    window = StudioWindow(config, bus, gl_host, export_submit=coordinator.submit)
+    window = StudioWindow(
+        config,
+        bus,
+        gl_host,
+        export_submit=coordinator.submit,
+        open_request=canvas_sync.request_open,  # File → Open synced canvas…
+    )
     window.build(root)  # gridded layout; build() mounts the GL host (Doc 16 §5.4)
     if pairing_info:  # replay the pre-GUI PAIRING_INFO for the window
         bus.emit(PAIRING_INFO, **pairing_info)
@@ -186,6 +202,7 @@ def run_full() -> int:
                 return
             state["torn_down"] = True
         tray.stop()  # skips its own thread when called from pystray (Doc 17)
+        canvas_sync.shutdown()  # symmetric with its constructor subscription
         server.stop()
         pairing.stop()
         if threading.current_thread() is threading.main_thread():

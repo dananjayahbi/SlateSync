@@ -30,6 +30,7 @@ from PIL import Image
 from pc_agent.core.config_manager import AppConfig
 from pc_agent.core.events import (
     ARTBOARD_CHANGED,
+    CANVAS_LIST_UPDATED,
     CONNECTION_STATE,
     DOCUMENT_LOADED,
     EXPORT_FINISHED,
@@ -111,11 +112,17 @@ class StudioWindow:
         bus: EventBus,
         gl_host: "GLCanvasHost",
         export_submit: Callable[[dict], str],
+        open_request: Callable[[str], None] | None = None,
     ) -> None:
+        """``open_request`` (round 4, optional): injected File → "Open synced
+        canvas…" callback wired by main.py to
+        ``CanvasSyncManager.request_open(canvas_id)`` — the window only ever
+        passes the picked id; the manager owns the wire envelope."""
         self._config = config
         self._bus = bus
         self._gl_host = gl_host
         self._export_submit = export_submit
+        self._open_request = open_request
 
         # Tk scaffolding — set by build(); None until then.
         self._root: tk.Misc | None = None
@@ -146,6 +153,11 @@ class StudioWindow:
         self._qr_token_label: ctk.CTkLabel | None = None
         self._qr_image: ctk.CTkImage | None = None
 
+        # Round 4 (Doc 02 §8): cached tablet canvas list + picker dialog state.
+        self._canvases: list[dict] = []
+        self._sync_dialog: ctk.CTkToplevel | None = None
+        self._sync_listbox: tk.Listbox | None = None
+
         # Data (Doc 16 §5.1)
         self._pairing: dict | None = None
         self._canvas_id: str | None = None
@@ -167,7 +179,7 @@ class StudioWindow:
         self._save: Callable[[], None] | None = None
         self._zoom_to_fit: Callable[[], None] | None = None
 
-        # Template §4 event matrix — exactly these seven subscriptions.
+        # Template §4 event matrix (seven) + round-4 CANVAS_LIST_UPDATED (§8).
         self._subscriptions: list[tuple[str, Callable[..., None]]] = [
             (CONNECTION_STATE, self._on_connection_state),
             (DOCUMENT_LOADED, self._on_document_loaded),
@@ -176,6 +188,7 @@ class StudioWindow:
             (EXPORT_PROGRESS, self._on_export_progress),
             (EXPORT_FINISHED, self._on_export_finished),
             (PAIRING_INFO, self._on_pairing_info),
+            (CANVAS_LIST_UPDATED, self._on_canvas_list_updated),
         ]
         for event, handler in self._subscriptions:
             bus.on(event, handler)
@@ -395,7 +408,8 @@ class StudioWindow:
         menubar = tk.Menu(self._root)
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="New…", command=self._menu_new)
-        file_menu.add_command(label="Open…", command=self._menu_open)
+        file_menu.add_command(label="Open synced canvas…", command=self._menu_open_synced)
+        file_menu.add_command(label="Open local file…", command=self._menu_open)
         file_menu.add_separator()
         file_menu.add_command(label="Save", command=self._menu_save)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -433,6 +447,9 @@ class StudioWindow:
         self, ipv4=None, port=None, token=None, qr_png_path=None, **_extra
     ) -> None:
         self.after(0, self._apply_pairing_info, ipv4, port, token, qr_png_path)
+
+    def _on_canvas_list_updated(self, canvases=None, **_extra) -> None:
+        self.after(0, self._apply_canvas_list, canvases)
 
     # ------------------------------------------------------------------
     # Tk-thread appliers
@@ -483,6 +500,10 @@ class StudioWindow:
         dialog = self._qr_dialog
         if dialog is not None and dialog.winfo_exists():
             self._render_qr()  # re-render while open (§5.7)
+
+    def _apply_canvas_list(self, canvases) -> None:
+        """Tk-thread cache of the tablet's CANVAS_LIST rows (Doc 02 §8.1)."""
+        self._canvases = [dict(row) for row in canvases] if isinstance(canvases, list) else []
 
     # ------------------------------------------------------------------
     # Export bar actions (§5.5–5.6, §5.11)
@@ -595,6 +616,86 @@ class StudioWindow:
                 "CANVAS_LIFECYCLE", "OPEN_CANVAS", None, {"path": str(path)}
             )
         )
+
+    def _menu_open_synced(self) -> None:
+        """File → "Open synced canvas…" (Doc 02 §8.3 flow 3).
+
+        Lists the cached CANVAS_LIST rows (`title · preset · updated`); picking
+        one calls the injected ``open_request(canvas_id)`` (main.py wires it to
+        ``CanvasSyncManager.request_open``, which pushes CANVAS_OPEN_REQUEST).
+        An empty cache gets the connect hint instead of a dialog.
+        """
+        if self._root is None:
+            return
+        rows = self._canvases
+        if not rows:
+            messagebox.showinfo(
+                "Open synced canvas",
+                "Connect a tablet to browse its canvases",
+                parent=self._root,
+            )
+            return
+        if self._open_request is None:
+            logger.warning("Open synced canvas: no open_request callback wired")
+            return
+        dialog = ctk.CTkToplevel(self._root)
+        dialog.title("Open synced canvas")
+        dialog.geometry("440x300")
+        dialog.transient(self._root)
+        dialog.protocol("WM_DELETE_WINDOW", self._close_sync_dialog)
+        self._sync_dialog = dialog
+        listbox = tk.Listbox(dialog, exportselection=False)
+        for row in rows:
+            listbox.insert(tk.END, self._canvas_row_label(row))
+        listbox.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+        listbox.bind("<Double-Button-1>", lambda _event: self._confirm_sync_open())
+        self._sync_listbox = listbox
+        buttons = tk.Frame(dialog)
+        buttons.pack(fill="x", padx=12, pady=(0, 12))
+        tk.Button(buttons, text="Cancel", command=self._close_sync_dialog).pack(
+            side="right", padx=(6, 0)
+        )
+        tk.Button(buttons, text="Open", command=self._confirm_sync_open).pack(
+            side="right"
+        )
+
+    def _confirm_sync_open(self) -> None:
+        """Dialog Open/double-click: hand the selected row's id to the manager."""
+        dialog, listbox = self._sync_dialog, self._sync_listbox
+        rows = self._canvases
+        if dialog is None or not dialog.winfo_exists() or listbox is None:
+            return
+        selection = listbox.curselection()
+        if not selection:
+            return
+        index = int(selection[0])
+        if not 0 <= index < len(rows):
+            return
+        row = rows[index]
+        canvas_id = row.get("id") or row.get("canvas_id")
+        self._close_sync_dialog()
+        if canvas_id and self._open_request is not None:
+            self._open_request(str(canvas_id))
+
+    def _close_sync_dialog(self) -> None:
+        dialog = self._sync_dialog
+        self._sync_dialog = None
+        self._sync_listbox = None
+        if dialog is not None and dialog.winfo_exists():
+            dialog.destroy()
+
+    @staticmethod
+    def _canvas_row_label(row: dict) -> str:
+        """``title · preset · updated`` display string for one CANVAS_LIST row."""
+        title = str(row.get("title") or "Untitled")
+        preset = str(row.get("preset") or "?")
+        try:
+            stamp = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(int(row.get("updated_at")))
+            )
+        except (TypeError, ValueError, OSError, OverflowError):
+            stamp = "?"
+        return f"{title} · {preset} · {stamp}"
 
     def _menu_save(self) -> None:
         if self._save is not None:

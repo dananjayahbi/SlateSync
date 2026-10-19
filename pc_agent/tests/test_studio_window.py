@@ -1,7 +1,8 @@
 """Doc 16 acceptance tests — StudioWindow on a withdrawn ``CTk`` root.
 
-Smoke-constructs the shell around a duck-typed GL host, asserts the seven
-event-matrix subscriptions, drives the Start button into the injected
+Smoke-constructs the shell around a duck-typed GL host, asserts the event
+matrix (seven frozen subscriptions + round-4 ``CANVAS_LIST_UPDATED``), drives
+the Start button into the injected
 ``export_submit`` envelope, flips the badge/zoom/preset HUD, exercises the
 export-bar rules (PDF → no DPI, progress, finished → Open-in-Explorer), and
 verifies bus handlers marshal worker-thread emits through ``root.after(0)``
@@ -25,6 +26,7 @@ from PIL import Image
 from pc_agent.core.config_manager import AppConfig
 from pc_agent.core.events import (
     ARTBOARD_CHANGED,
+    CANVAS_LIST_UPDATED,
     CONNECTION_STATE,
     DOCUMENT_LOADED,
     EXPORT_FINISHED,
@@ -43,6 +45,7 @@ _MATRIX_EVENTS = [
     EXPORT_PROGRESS,
     EXPORT_FINISHED,
     PAIRING_INFO,
+    CANVAS_LIST_UPDATED,
 ]
 
 _GREEN, _GREY, _RED = "#2ECC71", "#9E9E9E", "#E74C3C"
@@ -438,3 +441,120 @@ def test_qr_dialog_renders_pairing_info_and_refreshes_while_open() -> None:
             _QR_FILE.unlink()
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# 9. File → Open synced canvas… (Doc 02 §8.3 flow 3)
+# ---------------------------------------------------------------------------
+
+
+def _file_menu(win: StudioWindow, root: Any) -> Any:
+    menubar = win._menubar
+    for index in range(menubar.index("end") + 1):
+        if (
+            menubar.type(index) == "cascade"
+            and str(menubar.entrycget(index, "label")) == "File"
+        ):
+            return root.nametowidget(menubar.entrycget(index, "menu"))
+    raise AssertionError("File cascade not found in the menu bar")
+
+
+def _menu_labels(menu: Any) -> list[str]:
+    labels = []
+    for index in range(menu.index("end") + 1):
+        if menu.type(index) == "command":
+            labels.append(str(menu.entrycget(index, "label")))
+    return labels
+
+
+def test_menu_splits_synced_canvas_from_local_file() -> None:
+    with _studio() as (root, win, _bus, _gl, _submit):
+        labels = _menu_labels(_file_menu(win, root))
+        assert "Open synced canvas…" in labels
+        assert "Open local file…" in labels
+        assert "Open…" not in labels
+        assert "New…" in labels and "Save" in labels
+
+
+def test_open_synced_canvas_dialog_lists_rows_and_requests_selection() -> None:
+    rows = [
+        {"id": "c-1", "title": "Control Systems 04", "preset": "A4",
+         "background": "RULED", "updated_at": 1760763600},
+        {"id": "c-2", "title": "Scribbles", "preset": "INFINITE",
+         "background": "DOT_GRID", "updated_at": 1760760000},
+    ]
+    requested: list[str] = []
+    root = _make_root()
+    bus = _RecordingBus()
+    win = StudioWindow(
+        AppConfig(), bus, _FakeGLHost(), _SubmitSpy(), open_request=requested.append
+    )
+    win.build(root)
+    try:
+        # The cache is fed through the event-matrix subscription + after(0).
+        bus.emit(CANVAS_LIST_UPDATED, canvases=rows)
+        assert _pump_until(root, lambda: len(win._canvases) == 2)
+        assert win._canvases[0]["id"] == "c-1"
+
+        win._menu_open_synced()
+        assert win._sync_dialog is not None and win._sync_dialog.winfo_exists()
+        assert win._sync_listbox is not None
+        expected = [
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(row["updated_at"]))
+            for row in rows
+        ]
+        labels = list(win._sync_listbox.get(0, "end"))
+        assert labels == [
+            f"Control Systems 04 · A4 · {expected[0]}",
+            f"Scribbles · INFINITE · {expected[1]}",
+        ]
+
+        # No selection → no request; then select row 2 → request carries its id.
+        win._confirm_sync_open()
+        assert requested == []
+        win._sync_listbox.selection_set(1)
+        win._confirm_sync_open()
+        assert requested == ["c-2"]
+        assert win._sync_dialog is None
+
+        # The dialog destroy path (Cancel) is symmetric.
+        win._menu_open_synced()
+        assert win._sync_dialog is not None
+        win._close_sync_dialog()
+        assert win._sync_dialog is None and win._sync_listbox is None
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def test_open_synced_canvas_empty_list_shows_connect_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _studio() as (root, win, bus, _gl, _submit):
+        shown: list[tuple[str, str]] = []
+
+        def fake_showinfo(title: str, message: str, **_kwargs: Any) -> None:
+            shown.append((title, message))
+
+        monkeypatch.setattr(
+            "pc_agent.gui.studio_window.messagebox.showinfo", fake_showinfo
+        )
+        win._menu_open_synced()
+        assert shown == [
+            ("Open synced canvas", "Connect a tablet to browse its canvases")
+        ]
+        assert win._sync_dialog is None
+        assert bus.on_calls  # sanity: the recording bus is wired
+
+
+def test_open_request_unbound_is_logged_not_crashing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _studio() as (root, win, _bus, _gl, _submit):
+        win._canvases = [{"id": "c-9", "title": "T", "preset": "A5", "updated_at": 1}]
+        with caplog.at_level("WARNING", logger="pc_agent.gui.studio_window"):
+            win._menu_open_synced()  # no open_request wired → warn, no dialog
+        assert win._sync_dialog is None
+        assert any("open_request" in r.getMessage() for r in caplog.records)

@@ -212,6 +212,7 @@ class HomeCanvasDashboard extends StatefulWidget {
     this.db,
     this.baseDir,
     this.client,
+    this.onListChanged,
   });
 
   /// Canvas route hand-off (Doc 26 §4, wired in Wave 3.A).
@@ -228,6 +229,11 @@ class HomeCanvasDashboard extends StatefulWidget {
   /// App-lifetime Doc 25 client; when provided, the app bar shows the
   /// "Connect" entry point to [PairingScreen] (Issue 03).
   final VectorSyncClient? client;
+
+  /// Doc 02 §8.1 round-4 hook: invoked after create/rename/delete (once
+  /// the row change is persisted and the grid refreshed) so the shell can
+  /// push a fresh `CANVAS_LIST`. `null` ⇒ no-op (existing callers/tests).
+  final VoidCallback? onListChanged;
 
   @override
   State<HomeCanvasDashboard> createState() => _HomeCanvasDashboardState();
@@ -342,6 +348,7 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
       ),
     );
     await _refresh();
+    widget.onListChanged?.call(); // Doc 02 §8.1 — push CANVAS_LIST
   }
 
   // ----- Open / rename / delete / upgrade ---------------------------------
@@ -416,6 +423,7 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
         await _refresh();
       }
     }
+    widget.onListChanged?.call(); // Doc 02 §8.1 — push CANVAS_LIST
   }
 
   Future<void> _delete(CanvasRecord record) async {
@@ -438,6 +446,7 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
     if (mounted) {
       await _refresh();
     }
+    widget.onListChanged?.call(); // Doc 02 §8.1 — push CANVAS_LIST
   }
 
   Future<void> _upgradePrompt(CanvasRecord record) async {

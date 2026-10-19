@@ -66,7 +66,8 @@ class CanvasStudioPage extends StatefulWidget {
   State<CanvasStudioPage> createState() => _CanvasStudioPageState();
 }
 
-class _CanvasStudioPageState extends State<CanvasStudioPage> {
+class _CanvasStudioPageState extends State<CanvasStudioPage>
+    with WidgetsBindingObserver {
   // -- Frozen collaborators (Docs 20–23) ----------------------------------
   late final CanvasDocumentModel _doc;
   late final CameraController _camera;
@@ -97,6 +98,10 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
   bool _fitDone = false;
   bool _cameraEngaged = false;
   bool _dirty = false;
+
+  /// Last observed engine zoom bucket (Issue 05 §3) — crossings evict
+  /// every non-current bucket in the tile cache.
+  int? _lastBucket;
 
   // -- Persistence ---------------------------------------------------------
   LocalDb? _activeDb;
@@ -130,6 +135,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
 
     _engine.setDocument(_doc);
     _camera.onCameraChanged = _onCameraChanged;
+    // Issue 05 §4 — OS memory pressure → aggressive tile-cache trim.
+    WidgetsBinding.instance.addObserver(this);
     _tool.addListener(_onToolStateChanged);
     _toolConfig.addListener(_onToolStateChanged);
     _events = widget.client.events.listen(_onSyncEvent);
@@ -151,6 +158,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
     _toolConfig.dispose();
     _snap.dispose();
     _canvasTick.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
@@ -184,6 +192,26 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
       snap.tx,
       snap.ty,
     );
+    // Issue 05 §3 — zoom-bucket crossings evict every stale bucket from
+    // the tile cache and backfill the hot window at the new factor.
+    final int bucket = _engine.currentBucket;
+    if (_lastBucket != null && bucket != _lastBucket) {
+      _engine.onScaleBucketChanged();
+    }
+    _lastBucket = bucket;
+    setState(() {});
+  }
+
+  /// Issue 05 §4 — the OS is under memory pressure: trim the tile cache to
+  /// the pressure watermark (~64 MB), invalidate offscreen tiles, and force
+  /// a repaint (visible tiles re-bake lazily through the get-path).
+  @override
+  void didHaveMemoryPressure() {
+    if (!mounted) {
+      return;
+    }
+    _engine.handleMemoryPressure();
+    _canvasTick.value++;
     setState(() {});
   }
 
@@ -208,6 +236,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
     final double fit = zx < zy ? zx : zy;
     // Silent assign (no Doc 20 hook) — we are inside build.
     _camera.applyRemote(fit, target.center.dx, target.center.dy);
+    _lastBucket = _engine.currentBucket; // Issue 05 §3 baseline
   }
 
   Rect? _boundsRectOrNull() {
@@ -567,9 +596,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
 
   void _deleteNode(String nodeId) {
     _doc.elements.removeWhere((CanvasNodeModel n) => n.nodeId == nodeId);
-    // Adapter: Doc 22 exposes no single-node remove on TiledCanvasEngine, so
-    // reindex the document (bulk-load path) instead of editing Doc 22.
-    _engine.setDocument(_doc);
+    // Issue 05 §2: incremental single-node removal — dirty only the tiles
+    // the node occupied instead of a full `setDocument` reindex.
+    _engine.removeCommitted(nodeId);
     _dirty = true;
     unawaited(
       widget.client.sendRpc(

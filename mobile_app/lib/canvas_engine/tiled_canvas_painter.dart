@@ -19,6 +19,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
+import 'package:mobile_app/canvas_engine/tile_chunks.dart'; // Issue 05
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,10 @@ const int defaultCacheMaxBytes = 120 * 1048576;
 /// Eviction hysteresis floor: overflow evicts LRU entries down to ~96 MB
 /// (80 % of the cap, Doc 22 §4).
 const int defaultCacheEvictToBytes = 96 * 1048576;
+
+/// Aggressive trim target on OS memory pressure (Issue 05 §4): drop the
+/// tile cache to ~64 MB and invalidate offscreen tiles.
+const int defaultCachePressureBytes = 64 * 1048576;
 
 /// Base retained bytes per baked tile: RGBA `1024·1024·4` with the 4:1
 /// picture-retention factor ⇒ 1 MB (Doc 22 §4 `approxBytes` formula).
@@ -95,14 +100,16 @@ class TileKey {
 // ---------------------------------------------------------------------------
 
 class _CacheEntry {
-  _CacheEntry(this.key, this.picture, this.bucket, this.bytes);
+  _CacheEntry(this.key, ui.Picture picture, this.bucket, int bytes)
+      : chunks = TileChunkEntry.single(picture, bytes: bytes);
 
   final TileKey key;
-  final ui.Picture picture;
 
-  /// Zoom-bucket exponent recorded when the picture was put (Doc 22 §4).
+  /// Issue 05 §1 — one consolidated base picture + ≤ K tail pictures.
+  final TileChunkEntry chunks;
+
+  /// Zoom-bucket exponent recorded when the entry was put (Doc 22 §4).
   final int bucket;
-  final int bytes;
 
   /// Recency chain: `prev` ⇒ newer (towards MRU head), `next` ⇒ older
   /// (towards LRU tail).
@@ -117,10 +124,24 @@ class TileCache {
   TileCache({
     this.maxBytes = defaultCacheMaxBytes,
     this.evictToBytes = defaultCacheEvictToBytes,
-  }) : assert(evictToBytes <= maxBytes);
+    this.pressureBytes = defaultCachePressureBytes,
+  }) : assert(evictToBytes <= maxBytes) {
+    policy = CacheMemoryPolicy(
+      highWaterBytes: maxBytes,
+      lowWaterBytes: evictToBytes,
+      pressureBytes: pressureBytes,
+    );
+  }
 
   final int maxBytes;
   final int evictToBytes;
+
+  /// Issue 05 §4 — watermark used by [trimTo] under OS memory pressure.
+  final int pressureBytes;
+
+  /// Issue 05 §3 — shared watermark math for [TrimOutcome]-style reporting
+  /// (high/low/pressure triples are only coherent as one policy object).
+  late final CacheMemoryPolicy policy;
 
   /// Zoom-bucket exponent used for entries [put] from now on: pictures put
   /// while this is `k` count `approxBytes` as `1 MB / 4^max(0,-k)` bytes
@@ -153,7 +174,58 @@ class TileCache {
       return null;
     }
     _promote(e);
-    return e.picture;
+    // Issue 05 §1: base picture when the tail is empty (identity-stable —
+    // frozen `put`/`get` contract), combined base∘tail snapshot otherwise.
+    return e.chunks.snapshot;
+  }
+
+  /// Issue 05 §1 — pictures a painter replays for [k] (≤ K+1: one base
+  /// plus the stroke tail). Empty on a miss.
+  List<ui.Picture> picturesOf(TileKey k) {
+    final _CacheEntry? e = _entries[k];
+    if (e == null) {
+      return const <ui.Picture>[];
+    }
+    _promote(e);
+    return e.chunks.pictures;
+  }
+
+  /// Issue 05 §1 — append one stroke picture to [k]'s tail (O(1) bookkeeping).
+  /// Returns the new tail length (0 on a miss, for flush decisions).
+  int appendStroke(TileKey k, ui.Picture p, int pictureBytes) {
+    final _CacheEntry? e = _entries[k];
+    if (e == null) {
+      return 0;
+    }
+    e.chunks.append(p, pictureBytes);
+    _totalBytes += pictureBytes;
+    _promote(e);
+    _generation++;
+    _enforceBudget();
+    return e.chunks.tailLength;
+  }
+
+  /// Issue 05 §1 — fold [k]'s full tail into the base picture (O(K); over a
+  /// K-commit window the amortized cost is O(1) per commit).
+  void consolidate(TileKey k, {required int mergedBaseBytes}) {
+    final _CacheEntry? e = _entries[k];
+    if (e == null) {
+      return;
+    }
+    final int before = e.chunks.bytes;
+    e.chunks.consolidate(mergedBaseBytes: mergedBaseBytes);
+    _totalBytes += e.chunks.bytes - before;
+    _generation++;
+    _enforceBudget();
+  }
+
+  /// Issue 05 §1 — longest current tail across entries (proof/tests).
+  int maxTailLength() {
+    int max = 0;
+    for (final _CacheEntry e in _entries.values) {
+      if (e.chunks.tailLength > max) max = e.chunks.tailLength;
+    }
+    return max;
   }
 
   /// Non-promoting membership test used by the engine's bake paths.
@@ -162,18 +234,14 @@ class TileCache {
   void put(TileKey k, ui.Picture p) {
     final _CacheEntry? old = _entries[k];
     if (old != null) {
-      _drop(old, disposePicture: !identical(old.picture, p));
+      _drop(old, disposePicture: !identical(old.chunks.base, p));
     }
     final _CacheEntry entry =
         _CacheEntry(k, p, bucket, bytesForBucket(bucket));
     _entries[k] = entry;
     _pushHead(entry);
-    _totalBytes += entry.bytes;
-    if (_totalBytes > maxBytes) {
-      while (_totalBytes > evictToBytes && _tail != null) {
-        _drop(_tail!, disposePicture: true);
-      }
-    }
+    _totalBytes += entry.chunks.bytes;
+    _enforceBudget();
   }
 
   void invalidate(TileKey k) {
@@ -183,15 +251,59 @@ class TileCache {
     }
   }
 
+  /// Issue 05 §3 — drop every zoom bucket except [keepBucket] wholesale: a
+  /// scale step makes all other buckets useless, so retaining their bytes
+  /// (and re-baking on the way back) is not worth it.
+  void invalidateExceptBucket(int keepBucket) {
+    final List<_CacheEntry> stale = _entries.values
+        .where((_CacheEntry e) => e.bucket != keepBucket)
+        .toList();
+    for (final _CacheEntry e in stale) {
+      _drop(e, disposePicture: true);
+    }
+  }
+
+  /// Issue 05 §4 — drop every tile outside [keep] (offscreen invalidation
+  /// under memory pressure).
+  void invalidateOutside(Set<TileKey> keep) {
+    final List<_CacheEntry> stale = _entries.values
+        .where((_CacheEntry e) => !keep.contains(e.key))
+        .toList();
+    for (final _CacheEntry e in stale) {
+      _drop(e, disposePicture: true);
+    }
+  }
+
+  /// Issue 05 §4 — evict LRU entries until [approxBytes] ≤ [targetBytes].
+  /// Returns the number of entries dropped.
+  int trimTo(int targetBytes) {
+    int dropped = 0;
+    while (_totalBytes > targetBytes && _tail != null) {
+      _drop(_tail!, disposePicture: true);
+      dropped++;
+    }
+    return dropped;
+  }
+
   void invalidateAll() {
     for (final _CacheEntry e in _entries.values) {
-      e.picture.dispose();
+      e.chunks.disposeAll();
     }
     _entries.clear();
     _head = null;
     _tail = null;
     _totalBytes = 0;
     _generation++;
+  }
+
+  /// Issue 05 §3 — single enforcement point: over the high watermark evict
+  /// LRU entries down to the low watermark (same hysteresis `put` used).
+  void _enforceBudget() {
+    if (_totalBytes > maxBytes) {
+      while (_totalBytes > evictToBytes && _tail != null) {
+        _drop(_tail!, disposePicture: true);
+      }
+    }
   }
 
   int approxBytes() => _totalBytes;
@@ -237,10 +349,13 @@ class TileCache {
     if (identical(_entries[e.key], e)) {
       _entries.remove(e.key);
     }
-    _totalBytes -= e.bytes;
-    if (disposePicture) {
-      e.picture.dispose();
-    }
+    _totalBytes -= e.chunks.bytes;
+    // Tail/combined pictures are exclusively owned ⇒ always disposed; the
+    // base is kept only when the caller says it is shared with an
+    // incoming picture (legacy `put` identity case).
+    e.chunks.disposeAll(
+      keepBase: disposePicture ? null : e.chunks.base,
+    );
     _generation++;
   }
 }
@@ -342,6 +457,11 @@ class SpatialRTree {
     _refit(leaf);
     _splitOverflow(leaf);
   }
+
+  /// Id-table read (Issue 05 §2): the indexed model for [nodeId], or null —
+  /// lets [TiledCanvasEngine.removeCommitted] compute a removal's tiles
+  /// without a full reindex.
+  CanvasNodeModel? nodeById(String nodeId) => _byId[nodeId]?.node;
 
   void remove(String nodeId) {
     final _RtEntry? entry = _byId.remove(nodeId);
@@ -662,6 +782,13 @@ class TiledCanvasEngine {
   int _rebakeCount = 0;
   Rect? _lastViewport;
 
+  /// Issue 05 §5 — cumulative bake instrumentation for the bounded-rebuild
+  /// proofs (`strokeReplays` per committed stroke must stay O(1) amortized,
+  /// never quadratic). Lives for the engine's lifetime; tests snapshot
+  /// deltas around the operation they measure.
+  @visibleForTesting
+  final BakeInstrumentation bakeStats = BakeInstrumentation();
+
   /// Per-operation rebake counter, reset at op start — the ≤4-tiles-per-
   /// commit assertion hook (Doc 22 §4, `@visibleForTesting`).
   @visibleForTesting
@@ -707,32 +834,86 @@ class TiledCanvasEngine {
   /// (Doc 21's `ProcessedStroke`); see the library doc.
   void addCommitted(dynamic s) {
     _rebakeCount = 0;
-    final dynamic payload = s.toRpcPayload();
-    final CanvasNodeModel node = CanvasNodeModel.fromJson(
-      Map<String, dynamic>.from(payload as Map),
-    );
+    final CanvasNodeModel node = _nodeFrom(s);
     _tree.remove(node.nodeId);
     _tree.insert(node);
-    markDirtyFor(s);
+    _dirtyCommit(node);
   }
 
   /// Compute the tiles intersecting `s.bbox` and rebake that dirty set only
   /// (Doc 22 §4 `markDirtyFor`).
+  ///
+  /// Issue 05 §1: tiles already baked at the current bucket take the O(1)
+  /// chunk-append path — one recorded stroke picture (+ an O(K) fold only
+  /// when the tail hits K=32) instead of re-walking every stroke in the
+  /// tile; missing/stale tiles fall back to a full bake.
   void markDirtyFor(dynamic s) {
     _rebakeCount = 0;
-    final dynamic b = s.bbox;
-    final Rect r = Rect.fromLTRB(
-      (b[0] as num).toDouble(),
-      (b[1] as num).toDouble(),
-      (b[2] as num).toDouble(),
-      (b[3] as num).toDouble(),
+    _dirtyCommit(_nodeFrom(s));
+  }
+
+  CanvasNodeModel _nodeFrom(dynamic s) {
+    final dynamic payload = s.toRpcPayload();
+    return CanvasNodeModel.fromJson(
+      Map<String, dynamic>.from(payload as Map),
     );
+  }
+
+  void _dirtyCommit(CanvasNodeModel node) {
+    final Rect r = _rectOfNode(node);
     _dirty
       ..clear()
       ..addAll(tilesCovering(r));
     final int bucket = currentBucket;
+    final double b = bucketFactorForExponent(bucket);
     for (final TileKey k in _dirty) {
-      _bakeAndStore(k, bucket, force: true);
+      if (cache.contains(k) && bakedBucketOf(k) == bucket) {
+        final ui.Picture pic = _recordStrokeForTile(node, k, bucket);
+        bakeStats.strokeReplays++;
+        bakeStats.chunkAppends++;
+        _rebakeCount++;
+        final int tailLength = cache.appendStroke(
+          k,
+          pic,
+          TileChunkPolicy.strokePictureBytes(
+            factor: b,
+            worldExtent: r,
+            tile: k.worldRect,
+          ),
+        );
+        if (tailLength >= TileChunkPolicy.flushThreshold) {
+          cache.consolidate(
+            k,
+            mergedBaseBytes: TileCache.bytesForBucket(bucket),
+          );
+          bakeStats.consolidations++;
+        }
+      } else {
+        _ensureBaked(k, bucket); // miss/stale ⇒ full bake (includes node)
+      }
+    }
+  }
+
+  /// Issue 05 §2 — incremental eraser: remove ONE node from the spatial
+  /// index and force-rebake only the tiles it occupies (cached + current
+  /// bucket). No document reindex, no cache wipe: [rebakeCount] after this
+  /// call is bounded by `tilesCovering(nodeRect)`.
+  void removeCommitted(String nodeId) {
+    _rebakeCount = 0;
+    final CanvasNodeModel? node = _tree.nodeById(nodeId);
+    if (node == null) {
+      return;
+    }
+    final Rect r = _rectOfNode(node);
+    _tree.remove(nodeId);
+    final int bucket = currentBucket;
+    _dirty
+      ..clear()
+      ..addAll(tilesCovering(r));
+    for (final TileKey k in _dirty) {
+      if (cache.contains(k) && bakedBucketOf(k) == bucket) {
+        _ensureBaked(k, bucket, force: true); // re-record WITHOUT the node
+      }
     }
   }
 
@@ -754,20 +935,53 @@ class TiledCanvasEngine {
   }
 
   /// Re-bake the hot window at the new zoom bucket after a bucket-boundary
-  /// zoom; the bucket storm wipes stale pictures first (Doc 22 §4).
+  /// zoom (Doc 22 §4). Issue 05 §3: evict every NON-current-bucket entry
+  /// wholesale — a scale step makes those buckets useless — while keeping
+  /// still-valid current-bucket tiles (the old full wipe re-baked them
+  /// for nothing); the hot window then backfills synchronously.
   void onScaleBucketChanged() {
     _rebakeCount = 0;
-    cache.invalidateAll();
-    _bakedBucket.clear();
+    final int bucket = currentBucket;
+    cache.invalidateExceptBucket(bucket);
+    _bakedBucket.removeWhere(
+      (TileKey k, int b) => b != bucket || !cache.contains(k),
+    );
     final Rect hot =
         _lastViewport ?? Rect.fromLTWH(0, 0, tileSize, tileSize);
-    _bakeWindow(hot, currentBucket);
+    _bakeWindow(hot, bucket);
   }
 
   /// Synchronous get-path: cached picture at the current bucket, otherwise a
   /// single-tile bake (Doc 22 §4 "misses fall back to synchronous
   /// single-tile bake in the get-path").
-  ui.Picture getTile(TileKey k) => _bakeAndStore(k, currentBucket);
+  ui.Picture getTile(TileKey k) {
+    _ensureBaked(k, currentBucket);
+    return cache.get(k)!;
+  }
+
+  /// Issue 05 §1 — the painter's replay list for [k]: ≤ K+1 pictures
+  /// (one consolidated base + the ≤32-stroke tail), not one picture per
+  /// stroke in the tile.
+  List<ui.Picture> tilePictures(TileKey k) {
+    _ensureBaked(k, currentBucket);
+    return cache.picturesOf(k);
+  }
+
+  void _ensureBaked(TileKey k, int bucket, {bool force = false}) {
+    if (!force) {
+      final int? baked = _bakedBucket[k];
+      if (baked == bucket && cache.contains(k)) {
+        cache.get(k); // LRU promote (legacy `_bakeAndStore` behavior)
+        return;
+      }
+    }
+    final ui.Picture picture = _bakeTile(k, bucket);
+    cache.bucket = bucket;
+    cache.put(k, picture);
+    _bakedBucket[k] = bucket;
+    _rebakeCount++;
+    bakeStats.fullTileBakes++;
+  }
 
   /// Tiles whose interior intersects [r] — degenerate right/bottom edges
   /// sitting exactly on a tile boundary do not spill into the next tile.
@@ -792,21 +1006,8 @@ class TiledCanvasEngine {
   }
 
   ui.Picture _bakeAndStore(TileKey k, int bucket, {bool force = false}) {
-    if (!force) {
-      final int? baked = _bakedBucket[k];
-      if (baked == bucket && cache.contains(k)) {
-        final ui.Picture? hit = cache.get(k);
-        if (hit != null) {
-          return hit;
-        }
-      }
-    }
-    final ui.Picture picture = _bakeTile(k, bucket);
-    cache.bucket = bucket;
-    cache.put(k, picture);
-    _bakedBucket[k] = bucket;
-    _rebakeCount++;
-    return picture;
+    _ensureBaked(k, bucket, force: force);
+    return cache.get(k)!;
   }
 
   void _bakeWindow(Rect worldViewport, int bucket) {
@@ -819,10 +1020,64 @@ class TiledCanvasEngine {
     }
   }
 
-  /// Record the tile's nodes scaled by the bucket factor `b` into a
-  /// `ui.Picture` (Doc 22 §4 "bake core"): clip to the tile, translate to
-  /// tile-local world coords, scale so ≈1 device px per world unit at that
-  /// zoom, replay nodes in layer order.
+  /// Issue 05 §1 — record ONE stroke into a tile-local picture using the
+  /// exact transform/clip sequence of [_bakeTile], so it composes with the
+  /// tile's base picture pixel-identically. O(1) work per commit — the tile's
+  /// other strokes are never re-walked.
+  ui.Picture _recordStrokeForTile(
+    CanvasNodeModel node,
+    TileKey k,
+    int bucket,
+  ) {
+    final ui.PictureRecorder recorder = ui.PictureRecorder();
+    final Canvas canvas = Canvas(recorder);
+    final Rect origin = k.worldRect;
+    canvas.save();
+    canvas.scale(bucketFactorForExponent(bucket));
+    canvas.translate(-origin.left, -origin.top);
+    canvas.clipRect(origin);
+    _drawNode(canvas, node);
+    canvas.restore();
+    return recorder.endRecording();
+  }
+
+  /// Issue 05 §4 — OS memory pressure callback: trim the cache to
+  /// [maxBytes] (default 64 MB) and drop every tile outside the 5×5 hot
+  /// window around the last viewport. Offscreen tiles re-bake lazily
+  /// through the normal get-path; visible tiles stay resident.
+  void handleMemoryPressure({int maxBytes = defaultCachePressureBytes}) {
+    _rebakeCount = 0;
+    cache.trimTo(maxBytes);
+    final Rect? vp = _lastViewport;
+    if (vp == null) {
+      return;
+    }
+    final TileKey c = TileKey.forPoint(vp.center.dx, vp.center.dy);
+    final Set<TileKey> keep = <TileKey>{
+      for (int dy = -2; dy <= 2; dy++)
+        for (int dx = -2; dx <= 2; dx++) TileKey(c.tx + dx, c.ty + dy),
+    };
+    cache.invalidateOutside(keep);
+    _bakedBucket.removeWhere(
+      (TileKey k, int b) => !keep.contains(k) || !cache.contains(k),
+    );
+  }
+
+  /// Record the tile's nodes scaled by the bucket factor `b = 2^bucket` into
+  /// a `ui.Picture` (Doc 22 §4 "bake core"): translate to tile-local world
+  /// coords, scale so ≈1 device px per world unit at that zoom, clip to the
+  /// tile, replay nodes in layer order.
+  ///
+  /// Issue 02 root cause: the clip rect passed to [Canvas.clipRect] is
+  /// expressed in the canvas's USER space — the same space the node
+  /// geometry lives in (WORLD). `scale · translate(−origin)` maps world→device
+  /// for drawing *and* clipping equally, so it never re-anchors the clip;
+  /// the historic `Rect.fromLTWH(0, 0, tileSize, tileSize)` therefore cut
+  /// EVERY tile picture down to the fixed world rect `(0,0,1024,1024)` (the
+  /// origin tile), and committed strokes vanished outside it — "caps the
+  /// content" on pen-up. Clipping with the tile's world [origin] rect is
+  /// correct for every tile and every bucket (the recorded device extent
+  /// becomes `[0, 1024·b]²` automatically).
   ui.Picture _bakeTile(TileKey k, int bucket) {
     final ui.PictureRecorder recorder = ui.PictureRecorder();
     final Canvas canvas = Canvas(recorder);
@@ -830,13 +1085,14 @@ class TiledCanvasEngine {
     canvas.save();
     canvas.scale(bucketFactorForExponent(bucket));
     canvas.translate(-origin.left, -origin.top);
-    canvas.clipRect(Rect.fromLTWH(0, 0, tileSize, tileSize));
+    canvas.clipRect(origin);
     final List<CanvasNodeModel> nodes = _tree.query(origin);
     nodes.sort((CanvasNodeModel a, CanvasNodeModel b) =>
         a.layer.compareTo(b.layer));
     for (final CanvasNodeModel n in nodes) {
       _drawNode(canvas, n);
     }
+    bakeStats.strokeReplays += nodes.length;
     canvas.restore();
     return recorder.endRecording();
   }
@@ -999,14 +1255,20 @@ void _paintTiles(
   final Rect world = _worldRectOfViewport(viewMatrix, size);
   final int fallbackBucket = bucketExponentForScale(scale);
   for (final TileKey k in engine.tilesCovering(world)) {
-    final ui.Picture picture = engine.getTile(k);
+    // Issue 05 §1: replay ≤ K+1 pictures per tile (base + stroke tail).
+    final List<ui.Picture> pictures = engine.tilePictures(k);
+    if (pictures.isEmpty) {
+      continue;
+    }
     canvas.save();
     canvas.transform(viewMatrix.storage);
     final Rect tileRect = k.worldRect;
     canvas.translate(tileRect.left, tileRect.top);
     final int baked = engine.bakedBucketOf(k) ?? fallbackBucket;
     canvas.scale(1.0 / bucketFactorForExponent(baked));
-    canvas.drawPicture(picture);
+    for (final ui.Picture picture in pictures) {
+      canvas.drawPicture(picture);
+    }
     canvas.restore();
   }
 }

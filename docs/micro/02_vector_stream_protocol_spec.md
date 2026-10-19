@@ -147,14 +147,76 @@ Doc-specific frozen contract (top-level keys of the two files this doc creates):
     "type": {"enum": ["CANVAS_LIFECYCLE", "ELEMENT_COMMIT", "ARTBOARD_RESIZE", "ASSET_UPLOAD", "EXPORT_JOB"]},
     "action": {"enum": ["OPEN_CANVAS", "ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE",
       "DELETE_NODE", "UPGRADE_SIZE", "START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS",
-      "ASSET_START", "ASSET_CHUNK", "ASSET_DONE"]}
+      "EXPORT_FINISHED", "ASSET_START", "ASSET_CHUNK", "ASSET_DONE",
+      "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST"]}
   },
   "type_actions": {
-    "CANVAS_LIFECYCLE": ["OPEN_CANVAS"],
+    "CANVAS_LIFECYCLE": ["OPEN_CANVAS", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST"],
     "ELEMENT_COMMIT": ["ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE", "DELETE_NODE"],
     "ARTBOARD_RESIZE": ["UPGRADE_SIZE"],
     "ASSET_UPLOAD": ["ASSET_START", "ASSET_CHUNK", "ASSET_DONE"],
-    "EXPORT_JOB": ["START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS"]
+    "EXPORT_JOB": ["START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS", "EXPORT_FINISHED"]
+  },
+  "payload_schemas": {
+    "OPEN_CANVAS": {
+      "description": "dual dialect, discriminated by the presence of the 'canvas' key (exactly one dialect per message)",
+      "discriminator": "canvas",
+      "dialects": {
+        "canvas": {
+          "direction": "cross_device",
+          "required": ["canvas"],
+          "canvas": {
+            "type": "object",
+            "description": "complete Doc 03 CanvasDocumentModel document.json body (snake_case wire keys): canvas_id, title, created_at, updated_at, artboard, content_bounds, elements[...] — the receiver MUST load it as the currently-open document (replace scene/canvas state) and switch its UI to it"
+          }
+        },
+        "path": {
+          "direction": "pc_internal_only",
+          "required": ["path"],
+          "path": {
+            "type": "string",
+            "description": "filesystem path of a PC-local .slatesync file — MUST NEVER be sent over the wire; CanvasSyncManager (PC) ignores OPEN_CANVAS payloads lacking 'canvas', and the tablet never sends this dialect"
+          }
+        }
+      }
+    },
+    "CANVAS_LIST_REQUEST": {
+      "direction": "pc_to_tablet",
+      "type": "object",
+      "properties": {},
+      "description": "request the tablet's canvas list (empty payload)"
+    },
+    "CANVAS_LIST": {
+      "direction": "tablet_to_pc",
+      "type": "object",
+      "required": ["canvases"],
+      "properties": {
+        "canvases": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "title", "preset", "background", "updated_at"],
+            "properties": {
+              "id": {"type": "string"},
+              "title": {"type": "string"},
+              "preset": {"type": "string"},
+              "background": {"type": "string"},
+              "updated_at": {"type": "integer", "unit": "unix_seconds"}
+            }
+          },
+          "description": "may be EMPTY; sorted updated_at DESC; pushed unsolicited on (re)connect and after create/rename/delete, and sent in reply to CANVAS_LIST_REQUEST"
+        }
+      }
+    },
+    "CANVAS_OPEN_REQUEST": {
+      "direction": "pc_to_tablet",
+      "type": "object",
+      "required": ["canvas_id"],
+      "properties": {
+        "canvas_id": {"type": "string"}
+      },
+      "description": "asks the tablet to load that document, switch its own UI to it, and broadcast OPEN_CANVAS {canvas: <full doc>}"
+    }
   },
   "asset_upload": {
     "encoding": "base64",
@@ -246,3 +308,49 @@ Doc-specific frozen contract (top-level keys of the two files this doc creates):
 **Never touches (write-conflict guard):** `.gitignore`, `pytest.ini`, `ruff.toml`, `shared_specs/validate_specs.py` (Doc 01); `shared_specs/canvas_document_schema.json` (Doc 03); `pc_agent/**` incl. `core/protocol.py`, `core/events.py`, `main.py`, `pc_agent/tests/*` (Docs 04+); `mobile_app/**` incl. `lib/core/models/canvas_models.dart`, `mobile_app/test/*` (Docs 05+); `qa/**` (Doc 28); `docs/overview.md`, `docs/_micro_doc_template.md`, `docs/micro/*` (Phase 0 orchestrator).
 
 **No-overlap confirmation:** Creates paths match template §6 row 02 exactly and appear in no other Wave 1.A row; Docs 04/05 *mirror* these contracts (read-only from Doc 02's perspective — they may never edit these JSONs); `validate_specs.py` (Doc 01) reads both files only after the Wave 1.A barrier.
+
+---
+
+## 8. Canvas Sync Extension (Round 4 — NORMATIVE, amends §4.2)
+
+Round 4 adds **bidirectional canvas synchronization** (user issue 04). This section is binding over any earlier text in this doc. Implementation agents: apply this diff to `shared_specs/ws_rpc_schema.json` (PC sync agent), to the Python mirror `pc_agent/core/protocol.py`, to the Dart send-side validation (mobile sync agent), and to the embedded JSON body in §5 of this doc.
+
+### 8.1 Action-set extension (14 → 17)
+
+Add to `envelope.action.enum` and to `type_actions.CANVAS_LIFECYCLE`:
+
+| Action | Direction | Payload schema |
+|---|---|---|
+| `CANVAS_LIST_REQUEST` | PC → Tablet | `{}` (request the tablet's canvas list) |
+| `CANVAS_LIST` | Tablet → PC | `{canvases: [{id, title, preset, background, updated_at}]}` — may be EMPTY; sorted `updated_at` DESC; pushed unsolicited on (re)connect and after create/rename/delete, and sent in reply to `CANVAS_LIST_REQUEST` |
+| `CANVAS_OPEN_REQUEST` | PC → Tablet | `{canvas_id}` — asks the tablet to broadcast that document and switch both sides to it |
+
+Full action list after this extension (17): `OPEN_CANVAS, ADD_STROKE, ADD_GRAPH, ADD_SHAPE, ADD_IMAGE, DELETE_NODE, UPGRADE_SIZE, START_EXPORT, CANCEL_EXPORT, EXPORT_PROGRESS, EXPORT_FINISHED, ASSET_START, ASSET_CHUNK, ASSET_DONE, CANVAS_LIST_REQUEST, CANVAS_LIST, CANVAS_OPEN_REQUEST`.
+
+### 8.2 `OPEN_CANVAS` dual dialect (critical)
+
+`OPEN_CANVAS` now has two mutually exclusive payload dialects, discriminated by the presence of the `canvas` key:
+
+* **`payload.path`** (legacy, PC-internal ONLY): a filesystem path for a PC-local `.slatesync` file. **Must never be sent over the wire** — `CanvasSyncManager` (PC) ignores `OPEN_CANVAS` messages whose payload lacks `canvas`; the tablet never sends this dialect.
+* **`payload.canvas`** (cross-device): the **complete Doc 03 `CanvasDocumentModel` document** (`document.json` body: canvas_id, title, created_at, updated_at, artboard, content_bounds, elements[...] — snake_case wire keys). A peer receiving this MUST load it as the currently-open document (replace scene/canvas state) and switch its UI to it.
+
+### 8.3 Canonical flows
+
+1. **Tablet opens/creates/switches a canvas** (while connected) → broadcasts `OPEN_CANVAS {canvas: <full doc>}` → PC loads it into `DocumentStore` (new `open_payload()` path) → mirror switches (boundary, background, elements).
+2. **Connect handshake** → tablet pushes `CANVAS_LIST` (current rows); PC also sends `CANVAS_LIST_REQUEST` on `CONNECTION_STATE(connected)`; PC caches the list for its File → "Open canvas…" dialog.
+3. **PC opens a canvas** → dialog (from cached list) → `CANVAS_OPEN_REQUEST {canvas_id}` → tablet loads the document from its local store, **switches its own UI to it**, and broadcasts `OPEN_CANVAS {canvas: <full doc>}` → PC loads → both sides converged.
+4. **Mutations** (`ELEMENT_COMMIT`, `ARTBOARD_RESIZE/UPGRADE_SIZE`, asset chunks) behave exactly as §4.2 against the currently-open document on both sides. PC is a full participant for OPEN/switch; drawing input remains tablet-originated in v1.
+
+### 8.4 Example messages
+
+```json
+{"id":"…","type":"CANVAS_LIFECYCLE","action":"CANVAS_LIST","canvas_id":"","payload":{"canvases":[{"id":"c-1","title":"Control Systems 04","preset":"A4","background":"RULED","updated_at":1760763600}]},"timestamp":1760763601}
+{"id":"…","type":"CANVAS_LIFECYCLE","action":"CANVAS_OPEN_REQUEST","canvas_id":"","payload":{"canvas_id":"c-1"},"timestamp":1760763602}
+{"id":"…","type":"CANVAS_LIFECYCLE","action":"OPEN_CANVAS","canvas_id":"c-1","payload":{"canvas":{"canvas_id":"c-1","title":"Control Systems 04","created_at":1760760000,"updated_at":1760763600,"artboard":{"preset":"A4","width":2480.0,"height":3508.0,"is_infinite":false,"background_style":"RULED","background_color":"#FFFFFF"},"content_bounds":{"min_x":0,"min_y":0,"max_x":0,"max_y":0},"elements":[]}},"timestamp":1760763603}
+```
+
+### 8.5 Ownership of this round (write-conflict guard)
+
+* **PC sync agent:** `shared_specs/ws_rpc_schema.json` (apply §8.1–8.2), the embedded JSON body inside THIS file's §5, `shared_specs/validate_specs.py` (make it derive the expected action set from `ws_rpc_schema.json` itself instead of any hardcoded count), `pc_agent/core/protocol.py` (`RPC_ACTIONS` = 17), plus its pc_agent modules/tests.
+* **Mobile sync agent:** Dart send-side action validation (in `lib/network/`), receive tolerance for unknown incoming actions (never reject the three new ones), plus its mobile files.
+* **Neither** may change envelope top-level keys, the 16-byte frame, `type` enum (still 5), or §4.2's existing payload shapes other than the `OPEN_CANVAS` dialect rule above.

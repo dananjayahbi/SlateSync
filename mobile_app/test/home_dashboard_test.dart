@@ -761,6 +761,76 @@ void main() {
       expect(find.byKey(const Key('canvas_card_del-1')), findsNothing);
       expect(find.byKey(const Key('empty_gallery')), findsOneWidget);
     });
+
+    // Doc 02 §8.1 (Issue 04, round 4): the optional onListChanged hook —
+    // wired by the shell to CanvasSyncBridge.publishList — fires after
+    // create/rename/delete. Additive: default-null keeps existing callers
+    // untouched.
+    testWidgets(
+        'onListChanged fires after create, rename and delete (Doc 02 §8.1)',
+        (WidgetTester tester) async {
+      final LocalDb db = await openDbInTester(tester, 'list_changed');
+      int calls = 0;
+      await tester.pumpWidget(
+        MaterialApp(
+          home: HomeCanvasDashboard(
+            onOpenDocument: (_) {},
+            db: db,
+            baseDir: cacheDir,
+            onListChanged: () => calls += 1,
+          ),
+        ),
+      );
+      await flushReal(tester);
+      expect(calls, 0); // not fired by init/refresh alone
+
+      // Flush until the callback fires: the create/rename/delete chains do
+      // real sqflite/file IO and the suite runs test files in parallel, so
+      // a fixed pump budget can be starved under load.
+      Future<void> settleUntil(int expected) async {
+        for (int i = 0; i < 20 && calls < expected; i++) {
+          await flushReal(tester, rounds: 3);
+          await tester.pump();
+        }
+      }
+
+      // Create → one push.
+      await tester.tap(find.byKey(const Key('new_canvas_fab')));
+      await tester.pumpAndSettle();
+      await tester.enterText(
+        find.byKey(const Key('new_title_field')),
+        'Push Hook',
+      );
+      await tester.tap(find.byKey(const Key('create_canvas')));
+      await settleUntil(1);
+      expect(calls, 1);
+
+      final List<CanvasRecord>? rows = await tester.runAsync(() => db.list());
+      expect(rows, hasLength(1));
+      final String id = rows!.single.id;
+
+      // Rename → second push.
+      await tester.tap(find.byKey(Key('card_menu_$id')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Rename'));
+      await tester.pumpAndSettle();
+      expect(find.byKey(const Key('rename_field')), findsOneWidget);
+      await tester.enterText(
+        find.byKey(const Key('rename_field')),
+        'Push Hook v2',
+      );
+      await tester.tap(find.byKey(const Key('rename_confirm')));
+      await settleUntil(2);
+      expect(calls, 2);
+
+      // Delete → third push.
+      await tester.tap(find.byKey(Key('card_menu_$id')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Delete'));
+      await settleUntil(3);
+      expect(calls, 3);
+      expect(find.byKey(const Key('empty_gallery')), findsOneWidget);
+    });
   });
 
   // -------------------------------------------------------------------------

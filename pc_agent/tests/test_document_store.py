@@ -516,6 +516,59 @@ def test_oversized_chunk_discards_transfer(env: _Env) -> None:
     assert not (store.assets_dir(canvas_id) / "big.bin").exists()
 
 
+def test_open_payload_roundtrip_replaces_scene_clean_and_emits(env: _Env) -> None:
+    """Round 4 (Doc 02 §8.2): wire dict → same rebuild path as open() minus ZIP."""
+    bus, _config, graph, store = env
+    doc = store.new("A4", "Wire")
+    graph.insert(_element("n-wire", (10.0, 20.0, 30.0, 40.0)))
+    path = store.save(doc)
+    payload = json.loads(_read_doc_json(path).decode("utf-8"))
+    assert payload["canvas_id"] == doc.canvas_id
+
+    # Diverge first: another preset, another node, a dirty flag — open_payload
+    # must replace ALL of it (scene, artboard, current, clean state).
+    store.new("A5", "Other")
+    graph.insert(_element("n-old", (1.0, 1.0, 2.0, 2.0)))
+    store._mark_dirty()
+    assert store.is_dirty is True
+
+    observed: list[tuple[CanvasDocument, bool]] = []
+    bus.on(DOCUMENT_LOADED, lambda doc: observed.append((doc, store.is_dirty)))
+
+    loaded = store.open_payload(payload)
+
+    # Roundtrip: the rebuilt document equals the saved document.json body.
+    assert loaded.canvas_id == doc.canvas_id
+    assert loaded.title == "Wire"
+    assert loaded.artboard == doc.artboard
+    assert loaded.content_bounds == doc.content_bounds
+    assert [n.node_id for n in loaded.elements] == ["n-wire"]
+    # Scene replacement: the A5 doc's node is gone, the wire elements are in.
+    assert [n.node_id for n in graph.nodes()] == ["n-wire"]
+    assert graph._artboard is loaded.artboard  # noqa: SLF001 — artboard binding
+    # Clean + no PC-local path (a tablet canvas is never autosaved).
+    assert store.is_dirty is False
+    assert store.current_path is None
+    # DOCUMENT_LOADED exactly once, state clean BEFORE the emit.
+    assert observed == [(loaded, False)]
+
+
+def test_open_payload_rejects_non_document_without_state_change(env: _Env) -> None:
+    bus, _config, _graph, store = env
+    store.new("A4", "Kept")
+    seen: list[dict] = []
+    bus.on(DOCUMENT_LOADED, lambda **kw: seen.append(kw))
+
+    with pytest.raises(ValueError):
+        store.open_payload("not-a-dict")  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        store.open_payload({"canvas_id": "x"})  # missing required keys
+
+    assert seen == []
+    assert store.is_dirty is True
+    assert store.current_path is not None  # untouched
+
+
 def test_save_without_any_path_raises_value_error(env: _Env) -> None:
     bus, config, _graph, store = env
     bus.emit(COMMITTED_NODE, node=None)  # dirty via subscription, no document yet

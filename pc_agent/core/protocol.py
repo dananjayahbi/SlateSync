@@ -42,6 +42,10 @@ RPC_ACTIONS: Final = frozenset(
         "ASSET_START",
         "ASSET_CHUNK",
         "ASSET_DONE",
+        # Doc 02 §8.1 — Canvas Sync Extension (17 actions).
+        "CANVAS_LIST_REQUEST",
+        "CANVAS_LIST",
+        "CANVAS_OPEN_REQUEST",
     }
 )
 

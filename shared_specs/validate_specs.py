@@ -49,25 +49,41 @@ WS_URL_TEMPLATE = "ws://<ipv4>:50606/ws?token=<session_token>"
 WS_CLOSE_CODE = 4001
 RAW_CAP_BYTES_PER_CHUNK = 262144
 RPC_TYPES = ["CANVAS_LIFECYCLE", "ELEMENT_COMMIT", "ARTBOARD_RESIZE", "ASSET_UPLOAD", "EXPORT_JOB"]
-# Doc 01 section 6 counts 13 actions (the Doc 02 locked body); template section 3
-# lists the same 13 plus EXPORT_FINISHED (14 values). Accept either exact set so
-# both locked spellings validate; anything else is a violation.
-RPC_ACTIONS_13 = [
-    "OPEN_CANVAS",
-    "ADD_STROKE",
-    "ADD_GRAPH",
-    "ADD_SHAPE",
-    "ADD_IMAGE",
-    "DELETE_NODE",
-    "UPGRADE_SIZE",
-    "START_EXPORT",
-    "CANCEL_EXPORT",
-    "EXPORT_PROGRESS",
-    "ASSET_START",
-    "ASSET_CHUNK",
-    "ASSET_DONE",
-]
-RPC_ACTION_EXTRA = "EXPORT_FINISHED"
+# Doc 02 round 4 (§8): the expected action set is DERIVED from ws_rpc_schema.json
+# itself — envelope.action.enum must exactly equal the union of the type_actions
+# groups (disjoint, unique, non-empty). No hardcoded action names or counts here;
+# corrupted/renamed/dropped actions are caught by the cross-check below.
+
+
+def _derive_action_set(spec: dict) -> tuple[set[str] | None, list[str]]:
+    """Cross-check envelope.action.enum against type_actions; None = derivation failed.
+
+    Returns (expected_set, errors): the expected set is the union of the
+    type_actions groups, or None when type_actions is unusable.
+    """
+    errors: list[str] = []
+    groups = spec.get("type_actions", _MISSING)
+    if groups is _MISSING:
+        errors.append("type_actions: expected object got <missing>")
+        return None, errors
+    if not isinstance(groups, dict):
+        errors.append(f"type_actions: expected object got {groups!r}")
+        return None, errors
+    expected: set[str] = set()
+    for group, actions in groups.items():
+        if group not in RPC_TYPES:
+            errors.append(f"type_actions: unexpected group {group!r} (type enum {RPC_TYPES})")
+        if not isinstance(actions, list) or not actions:
+            errors.append(f"type_actions.{group}: expected non-empty list got {actions!r}")
+            continue
+        for action in actions:
+            if not isinstance(action, str) or not action:
+                errors.append(f"type_actions.{group}: invalid action entry {action!r}")
+                continue
+            if action in expected:
+                errors.append(f"type_actions: action {action!r} listed in more than one group")
+            expected.add(action)
+    return expected, errors
 
 CANVAS_KEYS = (
     "$schema",
@@ -230,26 +246,55 @@ def validate_ws_rpc(spec: dict) -> list[str]:
 
     _enum(errors, "envelope.type.enum", RPC_TYPES, spec, "envelope", "type", "enum")
 
+    # Action set: envelope.action.enum ⇄ type_actions union (Doc 02 §8 — the
+    # expected set is derived from the schema itself, never hardcoded here).
     actions = _dig(spec, "envelope", "action", "enum")
-    core = set(RPC_ACTIONS_13)
-    allowed = core | {RPC_ACTION_EXTRA}
+    derived, derive_errors = _derive_action_set(spec)
+    errors.extend(derive_errors)
     if actions is _MISSING:
-        errors.append(f"envelope.action.enum: expected {RPC_ACTIONS_13} got <missing>")
+        errors.append("envelope.action.enum: expected list of actions got <missing>")
     elif not isinstance(actions, list):
         errors.append(f"envelope.action.enum: expected list of actions got {actions!r}")
-    elif not set(actions) == core and not set(actions) == allowed:
-        missing = sorted(core - set(actions))
-        unexpected = sorted(set(actions) - allowed)
-        detail = []
-        if missing:
-            detail.append(f"missing {missing}")
-        if unexpected:
-            detail.append(f"unexpected {unexpected}")
-        errors.append(
-            "envelope.action.enum: expected the 13 locked actions "
-            f"(or 14 with {RPC_ACTION_EXTRA}), got {actions!r}"
-            + (f" ({', '.join(detail)})" if detail else " (duplicate entries)")
-        )
+    else:
+        problems: list[str] = []
+        enum_set: set[str] = set()
+        duplicates: set[str] = set()
+        invalid: list[object] = []
+        for action in actions:
+            if not isinstance(action, str) or not action:
+                invalid.append(action)
+                continue
+            if action in enum_set:
+                duplicates.add(action)
+            enum_set.add(action)
+        if invalid:
+            problems.append(f"invalid entries {invalid!r}")
+        if duplicates:
+            problems.append(f"duplicate entries {sorted(duplicates)!r}")
+        if derived is not None:
+            missing = sorted(derived - enum_set)
+            unexpected = sorted(enum_set - derived)
+            if missing:
+                problems.append(f"missing {missing}")
+            if unexpected:
+                problems.append(f"unexpected {unexpected}")
+        if problems:
+            errors.append(
+                "envelope.action.enum does not match the type_actions union: "
+                + "; ".join(problems)
+            )
+
+    # Payload schemas (Doc 02 §8): when present, every keyed action must exist.
+    schemas = spec.get("payload_schemas", _MISSING)
+    if schemas is not _MISSING:
+        if not isinstance(schemas, dict):
+            errors.append(f"payload_schemas: expected object got {schemas!r}")
+        elif derived is not None:
+            for action in schemas:
+                if action not in derived:
+                    errors.append(
+                        f"payload_schemas: action {action!r} not present in type_actions"
+                    )
 
     _eq(
         errors,

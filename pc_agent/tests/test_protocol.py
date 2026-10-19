@@ -88,9 +88,12 @@ def test_rpc_actions_mirror_doc02_exactly() -> None:
         "ASSET_START",
         "ASSET_CHUNK",
         "ASSET_DONE",
+        "CANVAS_LIST_REQUEST",
+        "CANVAS_LIST",
+        "CANVAS_OPEN_REQUEST",
     }
     assert RPC_ACTIONS == frozenset(expected)
-    assert len(RPC_ACTIONS) == 14
+    assert len(RPC_ACTIONS) == 17
 
 
 def test_rpc_types_mirror_doc02_exactly() -> None:

@@ -11,6 +11,7 @@ FALLBACK FBO ROI cap, and "every GL entry point runs on the Tk main thread".
 
 from __future__ import annotations
 
+import gc
 import threading
 import time
 import tkinter as tk
@@ -18,7 +19,7 @@ import tkinter as tk
 import pytest
 
 from pc_agent.core.config_manager import AppConfig
-from pc_agent.core.events import EventBus
+from pc_agent.core.events import DOCUMENT_LOADED, EventBus
 from pc_agent.core.protocol import (
     FRAME_CAMERA,
     FRAME_LASER,
@@ -618,3 +619,179 @@ def test_gl_entry_points_stay_on_the_main_thread_with_worker_submits() -> None:
         except Exception:
             pass
         root.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Issue 03 — page boundary pixels through the real DOCUMENT_LOADED path
+# ---------------------------------------------------------------------------
+
+
+def _boundary_doc(preset: str):
+    from pc_agent.engine.document_store import Artboard, CanvasDocument
+
+    if preset == "A4":
+        width, height, style = 2480.0, 3508.0, "RULED"
+    else:
+        width, height, style = None, None, "DOT_GRID"
+    return CanvasDocument(
+        canvas_id=f"doc-{preset.lower()}",
+        title="Boundary probe",
+        created_at=0,
+        updated_at=0,
+        artboard=Artboard(
+            preset=preset,
+            width=width,
+            height=height,
+            is_infinite=(preset == "INFINITE"),
+            background_style=style,
+            background_color="#FFFFFF",
+        ),
+        content_bounds={"min_x": 0.0, "min_y": 0.0, "max_x": 0.0, "max_y": 0.0},
+        elements=[],
+    )
+
+
+def _pump_until_clean(root: tk.Tk, host: GLCanvasHost, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        root.update()
+        if not host._dirty:
+            time.sleep(0.02)
+            root.update()
+            if not host._dirty:
+                return
+        time.sleep(0.02)
+    pytest.fail("viewport never finished rendering (dirty flag stayed set)")
+
+
+def _is_border_pixel(rgb: tuple[int, int, int]) -> bool:
+    """_PAGE_BORDER_COLOR family: neutral-ish gray distinctly bluer than red."""
+    r, g, b = rgb
+    return 120 <= r <= 235 and abs(r - g) <= 8 and 4 <= (b - r) <= 30
+
+
+def _is_pattern_ink(rgb: tuple[int, int, int]) -> bool:
+    """RULED/DOT ink: bg × 0.55 → neutral gray, not the bluish border."""
+    r, g, b = rgb
+    return 130 <= r <= 240 and r == g == b
+
+
+def _is_shadow(rgb: tuple[int, int, int]) -> bool:
+    """Feathered shadow ring: neutral gray darker than the white scaffold."""
+    r, g, b = rgb
+    return 150 <= r <= 252 and abs(r - g) <= 2 and abs(g - b) <= 2
+
+
+@requires_gl
+def test_a4_doc_renders_paper_pattern_boundary_and_shadow_pixels() -> None:
+    """Issue 03: an A4 doc through set_document paints page chrome offscreen."""
+    root = _make_root()
+    bus = EventBus()
+    host = GLCanvasHost(root, AppConfig(), bus)
+    try:
+        parent = tk.Frame(root, width=360, height=280)
+        parent.pack(fill="both", expand=True)
+        host.mount(parent)
+        assert host._mode == "fallback", "pixel test needs the offscreen FBO path"
+        _pump_until_clean(root, host)
+
+        doc = _boundary_doc("A4")
+        bus.emit(DOCUMENT_LOADED, doc=doc)
+        assert host._artboard is doc.artboard, "set_document must feed the Artboard"
+        # tx=0, scale=1 → the page's left edge (world x=0) sits at column vp_w/2.
+        host.set_camera(1.0, 0.0, 1754.0)
+        host.request_redraw()
+        _pump_until_clean(root, host)
+        assert host._ctx.error == "GL_NO_ERROR"
+
+        fbo = host._fbo
+        assert fbo is not None
+        width, height = fbo.size
+        data = fbo.read(components=3, alignment=1)
+
+        def pixel(x: int, y: int) -> tuple[int, int, int]:
+            start = (y * width + x) * 3
+            return tuple(data[start : start + 3])
+
+        edge = width // 2
+        mid = height // 2
+
+        # White paper inside the page.
+        assert pixel(edge + 40, mid) == (255, 255, 255), "page must render white paper"
+        # RULED pattern ink inside the page (line at world y ≡ 0 mod 32).
+        pattern_rows = range(max(0, mid - 40), min(height, mid + 5))
+        has_pattern = any(
+            _is_pattern_ink(pixel(x, y))
+            for y in pattern_rows
+            for x in range(edge + 2, width)
+        )
+        assert has_pattern, "RULED background must paint light-gray pattern ink"
+        # 1 px bluish page boundary hugging the edge, on every page row.
+        has_border = any(
+            _is_border_pixel(pixel(x, y))
+            for y in range(height)
+            for x in range(max(0, edge - 4), min(width, edge + 4))
+        )
+        assert has_border, "bounded preset must paint the Doc 08 page boundary"
+        # Feathered shadow on the scaffold left of the page edge.
+        has_shadow = any(
+            _is_shadow(pixel(x, y))
+            for y in range(height)
+            for x in range(max(0, edge - 90), max(0, edge - 4))
+        )
+        assert has_shadow, "bounded preset must paint the feathered drop shadow"
+    finally:
+        try:
+            host.shutdown()
+        except Exception:
+            pass
+        root.destroy()
+        # Collect this test's Tk/GL/PIL garbage HERE: deferred collections were
+        # landing inside later FFI tests (rtree) and crashing the native heap.
+        gc.collect()
+
+
+@requires_gl
+def test_infinite_doc_renders_no_boundary_pixels() -> None:
+    """Issue 03: INFINITE docs paint pattern only — no boundary, no shadow."""
+    root = _make_root()
+    bus = EventBus()
+    host = GLCanvasHost(root, AppConfig(), bus)
+    try:
+        parent = tk.Frame(root, width=360, height=280)
+        parent.pack(fill="both", expand=True)
+        host.mount(parent)
+        assert host._mode == "fallback"
+        _pump_until_clean(root, host)
+
+        doc = _boundary_doc("INFINITE")
+        bus.emit(DOCUMENT_LOADED, doc=doc)
+        host.set_camera(1.0, 0.0, 0.0)
+        host.request_redraw()
+        _pump_until_clean(root, host)
+        assert host._ctx.error == "GL_NO_ERROR"
+
+        fbo = host._fbo
+        assert fbo is not None
+        width, height = fbo.size
+        data = fbo.read(components=3, alignment=1)
+
+        def pixel(x: int, y: int) -> tuple[int, int, int]:
+            start = (y * width + x) * 3
+            return tuple(data[start : start + 3])
+
+        samples = [pixel(x, y) for y in range(0, height, 2) for x in range(0, width, 2)]
+        assert any(_is_pattern_ink(rgb) for rgb in samples), (
+            "INFINITE doc must still render its DOT_GRID pattern (render ran)"
+        )
+        border = [rgb for rgb in samples if _is_border_pixel(rgb)]
+        assert border == [], f"INFINITE must paint no page boundary, got {border[:5]}"
+    finally:
+        try:
+            host.shutdown()
+        except Exception:
+            pass
+        root.destroy()
+        # Collect this test's Tk/GL/PIL garbage HERE: deferred collections were
+        # landing inside later FFI tests (rtree) and crashing the native heap.
+        gc.collect()

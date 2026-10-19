@@ -1,4 +1,4 @@
-"""Synchronous caller-thread ``EventBus`` + the 11 event-name constants (Doc 04 §4)."""
+"""Synchronous caller-thread ``EventBus`` + the 12 event-name constants (Doc 04 §4)."""
 
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ EXPORT_STARTED = "EXPORT_STARTED"
 EXPORT_PROGRESS = "EXPORT_PROGRESS"
 EXPORT_FINISHED = "EXPORT_FINISHED"
 PAIRING_INFO = "PAIRING_INFO"
+#: Round 4 (Doc 02 §8.1) — CanvasSyncManager cached the tablet's CANVAS_LIST.
+CANVAS_LIST_UPDATED = "CANVAS_LIST_UPDATED"
 
 
 class EventBus:

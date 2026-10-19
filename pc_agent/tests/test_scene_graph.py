@@ -7,6 +7,7 @@ the full §4.4 upgrade matrix, the frozen event contract, undo/redo (incl. the
 
 from __future__ import annotations
 
+import gc
 import logging
 import random
 import threading
@@ -459,6 +460,10 @@ def test_nodes_sorted_by_layer_then_id_and_get(graph: SceneGraph) -> None:
 
 
 def test_concurrent_mutations_and_queries_share_the_rlock(graph: SceneGraph) -> None:
+    # Collect pending garbage BEFORE the FFI window: a full generation-2
+    # collection landing inside this test's rtree/ctypes calls crashes the
+    # native heap on this stack (observed under full-suite load, round 4).
+    gc.collect()
     errors: list[BaseException] = []
 
     def worker() -> None:

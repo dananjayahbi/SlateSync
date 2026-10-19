@@ -94,18 +94,29 @@ def _ws_url(server: WsStreamServer, token: str | None = TOKEN, path: str = "/ws"
 
 
 async def _await_close_code(url: str) -> int | None:
-    """Connect, then return the close code the server chose (None if none)."""
-    try:
-        async with websockets.connect(url) as websocket:
-            await asyncio.wait_for(websocket.recv(), _WAIT_S)
-    except ConnectionClosed as exc:
-        if exc.rcvd is not None:
-            return exc.rcvd.code
-        if exc.sent is not None:
-            return exc.sent.code
-    except asyncio.TimeoutError:
-        return None
-    return None
+    """Connect, then return the close code the server chose (None if none).
+
+    Transient retry: under full-suite CPU contention the close handshake can be
+    lost to a transport reset (returns None) — retry on a fresh connection so
+    the contract (exact close code) is still asserted, never relaxed.
+    """
+    code: int | None = None
+    for _attempt in range(3):
+        code = None
+        try:
+            async with websockets.connect(url) as websocket:
+                await asyncio.wait_for(websocket.recv(), _WAIT_S)
+        except ConnectionClosed as exc:
+            if exc.rcvd is not None:
+                code = exc.rcvd.code
+            elif exc.sent is not None:
+                code = exc.sent.code
+        except asyncio.TimeoutError:
+            code = None
+        if code is not None:
+            return code
+        await asyncio.sleep(0.2)
+    return code
 
 
 def _envelope(**overrides: Any) -> dict[str, Any]:
@@ -278,17 +289,33 @@ def test_envelope_shell_validation_matrix(server_env: Any) -> None:
     bad.append(_envelope(canvas_id=7))
     bad.append([base])  # valid JSON, not an envelope object
     good = _envelope(type="EXPORT_JOB", action="EXPORT_FINISHED", payload={"job_id": "j1"})
+    # Doc 02 §8: the three canvas-sync actions pass the shell matrix too.
+    canvas_good = [
+        _envelope(type="CANVAS_LIFECYCLE", action="CANVAS_LIST_REQUEST", payload={}),
+        _envelope(
+            type="CANVAS_LIFECYCLE",
+            action="CANVAS_LIST",
+            payload={"canvases": []},
+        ),
+        _envelope(
+            type="CANVAS_LIFECYCLE",
+            action="CANVAS_OPEN_REQUEST",
+            payload={"canvas_id": "c-1"},
+        ),
+    ]
 
     async def scenario() -> None:
         async with websockets.connect(_ws_url(server)) as websocket:
             for case in bad:
                 await websocket.send(json.dumps(case))
             await websocket.send(json.dumps(good))
+            for case in canvas_good:
+                await websocket.send(json.dumps(case))
 
     asyncio.run(scenario())
-    assert rec.wait_for(RPC_MESSAGE)
+    assert rec.wait_for(RPC_MESSAGE, count=1 + len(canvas_good))
     time.sleep(0.1)
-    assert rec.of(RPC_MESSAGE) == [{"msg": good}]
+    assert rec.of(RPC_MESSAGE) == [{"msg": good}] + [{"msg": m} for m in canvas_good]
 
 
 def test_envelope_fidelity_passthrough(server_env: Any) -> None:

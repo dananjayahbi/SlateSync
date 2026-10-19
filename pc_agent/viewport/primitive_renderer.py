@@ -734,6 +734,11 @@ class PrimitiveRenderer:
         graphs = [node for node in ordered if getattr(node, "kind", "") == "GRAPH_AXES"]
         # Frozen phase order (Doc 08 §4): background → shadow → images → shapes → graphs.
         self._draw_background(artboard, cam, view_w, view_h)
+        # Background clipping stays a phase-1 concern (the grid shader keeps its
+        # own world-rect discard): the page shadow/boundary live OUTSIDE the
+        # artboard rect, so the GL scissor must be off before phase 2.
+        if self.scissor_enabled:
+            self._ctx.disable_direct(_GL_SCISSOR_TEST)
         self._draw_shadow_boundary(artboard, cam, view_w, view_h, world_rect)
         self._draw_images(images, cam, view_w, view_h)
         self._draw_shapes(shapes, cam, view_w, view_h)
@@ -837,7 +842,9 @@ class PrimitiveRenderer:
         )
         # 1 px screen-scaled page outline (kind 1).
         half = 0.5 / max(scale, 1e-9)
-        stream.extend(outline_quads(0.0, 0.0, width, height, half))
+        outline: list[float] = []
+        _push_line_tris(outline, outline_quads(0.0, 0.0, width, height, half), _PAGE_BORDER_COLOR)
+        stream.extend(outline)
         self._emit_primitive(
             stream, blend=0, uniforms={"u_kind": 1}, camera=camera,
             viewport=(view_w, view_h),
