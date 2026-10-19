@@ -32,6 +32,12 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
   /// the export sheet shares the same connection + event stream.
   final VectorSyncClient _client = VectorSyncClient();
 
+  /// Route pushes go through the `MaterialApp` navigator directly: this
+  /// State's `context` sits ABOVE `MaterialApp`, so `Navigator.of(context)`
+  /// would find no Navigator ancestor (release builds: null-check crash on
+  /// `navigator!` — Issue 02 "Can't open a canvas").
+  final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
+
   @override
   void dispose() {
     unawaited(_client.dispose());
@@ -39,7 +45,12 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
   }
 
   void _openCanvas(CanvasDocumentModel doc) {
-    Navigator.of(context).push(
+    final NavigatorState? navigator = _navigatorKey.currentState;
+    assert(
+      navigator != null,
+      'SlateSyncApp navigator must be mounted before opening a canvas',
+    );
+    navigator?.push(
       MaterialPageRoute<void>(
         builder: (BuildContext context) =>
             CanvasStudioPage(document: doc, client: _client),
@@ -51,6 +62,7 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'SlateSync Studio',
+      navigatorKey: _navigatorKey,
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
@@ -63,7 +75,10 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
           onSurface: StudioTheme.text,
         ),
       ),
-      home: HomeCanvasDashboard(onOpenDocument: _openCanvas),
+      home: HomeCanvasDashboard(
+        onOpenDocument: _openCanvas,
+        client: _client,
+      ),
     );
   }
 }

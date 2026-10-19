@@ -19,7 +19,9 @@ import 'package:mobile_app/canvas_engine/artboard_manager.dart'; // Doc 23
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 import 'package:mobile_app/core/storage/local_db.dart';
 import 'package:mobile_app/core/theme/studio_theme.dart'; // Doc 05
-import 'package:mobile_app/network/vector_sync_client.dart' show uuidV4; // Doc 25
+import 'package:mobile_app/features/pairing/pairing_screen.dart'; // Issue 03
+import 'package:mobile_app/network/vector_sync_client.dart'
+    show VectorSyncClient, uuidV4; // Doc 25
 
 // ---------------------------------------------------------------------------
 // Pure helpers (Doc 26 §5.8 — unit-testable)
@@ -209,6 +211,7 @@ class HomeCanvasDashboard extends StatefulWidget {
     required this.onOpenDocument,
     this.db,
     this.baseDir,
+    this.client,
   });
 
   /// Canvas route hand-off (Doc 26 §4, wired in Wave 3.A).
@@ -221,6 +224,10 @@ class HomeCanvasDashboard extends StatefulWidget {
   /// Optional `.slatesync` cache directory (tests). `null` ⇒ path_provider
   /// app-documents/SlateSync (Doc 26 §5.3).
   final String? baseDir;
+
+  /// App-lifetime Doc 25 client; when provided, the app bar shows the
+  /// "Connect" entry point to [PairingScreen] (Issue 03).
+  final VectorSyncClient? client;
 
   @override
   State<HomeCanvasDashboard> createState() => _HomeCanvasDashboardState();
@@ -298,6 +305,22 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
       context: context,
       builder: (BuildContext context) =>
           NewCanvasModal(onCreate: _createDocument),
+    );
+  }
+
+  // ----- Pairing (Issue 03) ------------------------------------------------
+
+  void _openPairing() {
+    final VectorSyncClient? client = widget.client;
+    if (client == null) {
+      return;
+    }
+    // This context sits inside the `MaterialApp` home route, below its
+    // Navigator, so `Navigator.of(context)` is valid here.
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (BuildContext context) => PairingScreen(client: client),
+      ),
     );
   }
 
@@ -493,6 +516,15 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
       appBar: AppBar(
         backgroundColor: StudioTheme.surface,
         title: const Text('SlateSync', key: Key('dashboard_title')),
+        actions: <Widget>[
+          if (widget.client != null)
+            IconButton(
+              key: const Key('home-connect'),
+              tooltip: 'Connect to SlateSync PC',
+              onPressed: _openPairing,
+              icon: const Icon(Icons.link),
+            ),
+        ],
       ),
       body: Column(
         children: <Widget>[

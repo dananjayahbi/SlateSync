@@ -854,10 +854,23 @@ class VectorSyncClient {
 
 /// QR scanner: pairs on the first valid `slatesync://connect?…` payload
 /// (debounced to a single [onPair] call); unparseable codes are skipped.
+///
+/// Camera startup failures (permission denied, no camera) are reported
+/// through [onCameraError] one frame after they occur so host screens can
+/// swap in a manual-entry fallback (Issue 03).
 class PairingScanner extends StatefulWidget {
-  const PairingScanner({super.key, required this.onPair});
+  const PairingScanner({
+    super.key,
+    required this.onPair,
+    this.onCameraError,
+  });
 
   final void Function(PairingInfo info) onPair;
+
+  /// Optional camera-failure hook (Doc 25 §5 step 2 fallback): receives the
+  /// [MobileScannerErrorCode] from `MobileScanner.errorBuilder`. Invoked
+  /// post-frame, so listeners may call `setState` safely.
+  final void Function(MobileScannerErrorCode code)? onCameraError;
 
   @override
   State<PairingScanner> createState() => _PairingScannerState();
@@ -888,7 +901,23 @@ class _PairingScannerState extends State<PairingScanner> {
   }
 
   @override
-  Widget build(BuildContext context) => MobileScanner(onDetect: _onDetect);
+  Widget build(BuildContext context) {
+    final void Function(MobileScannerErrorCode)? onError = widget.onCameraError;
+    return MobileScanner(
+      onDetect: _onDetect,
+      errorBuilder: onError == null
+          ? null
+          : (BuildContext context, MobileScannerException error) {
+              // Defer past the current build so the host may setState.
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (mounted) {
+                  onError(error.errorCode);
+                }
+              });
+              return const SizedBox.shrink();
+            },
+    );
+  }
 }
 
 /// Manual IPv4/port/token entry fallback shown when `discover()` times out,

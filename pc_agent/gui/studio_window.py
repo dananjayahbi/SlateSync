@@ -51,6 +51,45 @@ _ERROR_BG = "#E74C3C"
 
 _ZOOM_MIN, _ZOOM_MAX = 0.05, 20.0  # template §3 zoom range
 _POLL_MS = 10  # Tk-thread poller cadence for off-thread after() requests
+_DRAG_CLEAR_MS = 300  # Issue 04: silence window this long after the last move
+
+
+def _move_loop_active() -> bool:
+    """Issue 04: ``True`` while Win32's modal move/size loop runs on this thread.
+
+    The 10 ms poller, the GL pump and queued ``show`` callbacks all execute
+    *inside* the native drag (Tk enables ``Tcl_SetServiceMode(TCL_SERVICE_ALL)``
+    on ``WM_ENTERSIZEMOVE``), so ``deiconify``+``lift`` (a ``SetWindowPos``)
+    landing mid-loop cancels the move and Windows rolls the window back to its
+    original position. ``GetGUIThreadInfo`` exposes the loop directly via
+    ``hwndMoveSize`` — including the press-and-hold phase before any
+    ``<Configure>`` position change fires.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes as _wt
+
+        class _GTI(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_uint),
+                ("flags", ctypes.c_uint),
+                ("hwndActive", _wt.HWND),
+                ("hwndFocus", _wt.HWND),
+                ("hwndCapture", _wt.HWND),
+                ("hwndMenuOwner", _wt.HWND),
+                ("hwndMoveSize", _wt.HWND),
+                ("hwndCaret", _wt.HWND),
+                ("rcCaret", _wt.RECT),
+            ]
+
+        g = _GTI()
+        g.cbSize = ctypes.sizeof(_GTI)
+        tid = ctypes.windll.kernel32.GetCurrentThreadId()
+        if not ctypes.windll.user32.GetGUIThreadInfo(tid, ctypes.byref(g)):
+            return False
+        return bool(g.hwndMoveSize)
+    except Exception:  # pragma: no cover - non-Windows / ctypes failure
+        return False
 
 
 class StudioWindow:
@@ -105,6 +144,14 @@ class StudioWindow:
         self._last_raise = 0.0
         self._job_id: str | None = None
         self._last_path: str | None = None
+
+        # Issue 04 drag guard: while the user is moving the window, the tray/
+        # stylus auto-raise (deiconify+lift) must not fire — a SetWindowPos
+        # mid-WM_ENTERSIZEMOVE aborts the native move loop and the window
+        # snaps back to its original position.
+        self._dragging = False
+        self._drag_pos: tuple[int, int] | None = None
+        self._drag_clear_id: str | None = None
 
         # Injected menu actions — unbound no-ops until main.py wires them.
         self._rpc: Callable[[dict], None] | None = None
@@ -184,6 +231,14 @@ class StudioWindow:
         self._root = parent.winfo_toplevel()
         self._tk_ident = threading.get_ident()
         self._root.title("SlateSync Studio")
+
+        # Issue 04: track toplevel position changes → drag flag (child
+        # <Configure> events share the toplevel's bindtag — filter them out).
+        self._root.bind("<Configure>", self._on_position_configure, add="+")
+        try:
+            self._drag_pos = (self._root.winfo_x(), self._root.winfo_y())
+        except Exception:  # pragma: no cover - root gone mid-build
+            self._drag_pos = None
 
         parent.grid_columnconfigure(0, weight=1)
         parent.grid_rowconfigure(1, weight=1)
@@ -553,18 +608,57 @@ class StudioWindow:
             self.after(0, func)
 
     def _show_impl(self) -> None:
-        if self._root is not None:
+        if self._root is not None and not (self._dragging or _move_loop_active()):
             self._root.deiconify()
             self._root.lift()
 
     def _hide_impl(self) -> None:
+        self._dragging = False  # hidden window cannot be mid-drag (stale flag)
         if self._root is not None:
             self._root.withdraw()
 
     def _raise_window(self) -> None:
+        if self._dragging or _move_loop_active():
+            return  # Issue 04: never SetWindowPos during an active native move
         if self._root is not None:
             self._root.deiconify()
             self._root.lift()
+
+    # ------------------------------------------------------------------
+    # Issue 04: native-drag detection (position-change Configure tracking)
+    # ------------------------------------------------------------------
+    def _on_position_configure(self, event: tk.Event) -> None:
+        """Mark an active drag when the toplevel's position changes."""
+        root = self._root
+        if root is None or event.widget is not root:
+            return  # child <Configure>s share the toplevel's bindtag
+        try:
+            pos = (root.winfo_x(), root.winfo_y())
+        except Exception:  # pragma: no cover - root destroyed mid-event
+            return
+        if self._drag_pos is not None and pos != self._drag_pos:
+            self._dragging = True
+            self._arm_drag_clear()
+        self._drag_pos = pos
+
+    def _arm_drag_clear(self) -> None:
+        """(Re)arm the timer that clears the drag flag after motion stops."""
+        root = self._root
+        if root is None:
+            return
+        if self._drag_clear_id is not None:
+            try:
+                root.after_cancel(self._drag_clear_id)
+            except Exception:  # pragma: no cover - root gone
+                pass
+        try:
+            self._drag_clear_id = root.after(_DRAG_CLEAR_MS, self._end_drag)
+        except Exception:  # pragma: no cover - root gone
+            self._drag_clear_id = None
+
+    def _end_drag(self) -> None:
+        self._dragging = False
+        self._drag_clear_id = None
 
     @staticmethod
     def _rpc_envelope(

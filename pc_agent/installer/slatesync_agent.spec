@@ -32,6 +32,10 @@ if exists(str(icon_path)):
     datas.append((str(icon_path), "pc_agent/assets"))
 icon = str(icon_path) if exists(str(icon_path)) else None  # EXE icon= guard
 
+# Issue 05: version resource (FileDescription/ProductName "SlateSync").
+version_file = ROOT / "pc_agent" / "installer" / "slatesync_version.txt"
+version = str(version_file) if exists(str(version_file)) else None
+
 # --- hiddenimports (Doc 18 §5.5, grouped by consuming doc) ------------------
 hiddenimports = [
     "zeroconf",  # Doc 12 — mDNS discovery
@@ -86,7 +90,8 @@ exe = EXE(
     exclude_binaries=True,
     name="SlateSyncAgent",
     console=False,  # windowless: no console flash (Doc 18 §5.9)
-    icon=icon,
+    icon=icon,  # Issue 05: pc_agent/assets/slatesync.ico (guarded above)
+    version=version,  # Issue 05: SlateSync FileDescription/ProductName resource
 )
 coll = COLLECT(
     exe,

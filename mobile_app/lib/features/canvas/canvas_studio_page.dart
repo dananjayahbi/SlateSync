@@ -31,6 +31,7 @@ import 'package:mobile_app/core/storage/local_db.dart'; // Doc 26
 import 'package:mobile_app/core/theme/studio_theme.dart'; // Doc 05
 import 'package:mobile_app/features/export/export_modal_sheet.dart'; // Doc 27
 import 'package:mobile_app/features/home/home_canvas_dashboard.dart'; // Doc 26
+import 'package:mobile_app/features/pairing/pairing_screen.dart'; // Issue 03
 import 'package:mobile_app/features/tools/tool_palette_dock.dart'; // Doc 24
 import 'package:mobile_app/network/vector_sync_client.dart'; // Doc 25
 
@@ -878,77 +879,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
   }
 
   void _openPairing() {
-    unawaited(
-      showModalBottomSheet<void>(
-        context: context,
-        backgroundColor: StudioTheme.surface,
-        shape: const RoundedRectangleBorder(
-          borderRadius: BorderRadius.vertical(
-            top: Radius.circular(StudioTheme.radiusLarge),
-          ),
-        ),
-        builder: (BuildContext sheetContext) => SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: <Widget>[
-              ListTile(
-                key: const ValueKey<String>('pair-qr'),
-                leading: const Icon(Icons.qr_code_scanner),
-                title: const Text('Scan QR code'),
-                subtitle: const Text('Pair with the SlateSync PC tray QR'),
-                onTap: () {
-                  Navigator.of(sheetContext).pop();
-                  _pushScanner();
-                },
-              ),
-              ListTile(
-                key: const ValueKey<String>('pair-manual'),
-                leading: const Icon(Icons.lan),
-                title: const Text('Enter IP manually'),
-                subtitle: const Text('IPv4, port 50606 and session token'),
-                onTap: () {
-                  Navigator.of(sheetContext).pop();
-                  _pushManualPairing();
-                },
-              ),
-              const SizedBox(height: 8),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  void _pushScanner() {
-    if (!mounted) {
-      return;
-    }
+    // Top bar connection button → three-mode Pairing screen (Issue 03);
+    // banner/status updates flow from `client.events` StateChanged.
     Navigator.of(context).push(
       MaterialPageRoute<void>(
-        builder: (BuildContext ctx) => PairingScanner(
-          onPair: (PairingInfo info) {
-            if (ctx.mounted) {
-              Navigator.of(ctx).pop();
-            }
-            unawaited(widget.client.connect(info));
-          },
-        ),
-      ),
-    );
-  }
-
-  void _pushManualPairing() {
-    if (!mounted) {
-      return;
-    }
-    Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (BuildContext ctx) => ManualPairingScreen(
-          onConnect: (PairingInfo info) {
-            Navigator.of(ctx).pop();
-            unawaited(widget.client.connect(info));
-          },
-        ),
+        builder: (BuildContext context) => PairingScreen(client: widget.client),
       ),
     );
   }
