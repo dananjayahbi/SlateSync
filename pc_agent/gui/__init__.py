@@ -4,6 +4,7 @@
 explicitly by its consumers; this package init only re-exports Doc 16.
 """
 
+from .canvas_gallery_panel import CanvasGalleryPanel
 from .studio_window import StudioWindow
 
-__all__ = ["StudioWindow"]
+__all__ = ["CanvasGalleryPanel", "StudioWindow"]

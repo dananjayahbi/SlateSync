@@ -12,10 +12,12 @@
 [Setup]
 ; Fixed AppId GUID - upgrades replace in place; never change across releases (Doc 19 Section 4).
 AppId={{8F3C2A1B-5D4E-4B9C-A7F6-1E2D3C4B5A69}
-; Issue 05 UPGRADE/REPAIR: running this setup over an old install updates IN
-; PLACE - Inno's default behavior with an unchanged AppId (the previous
+; Issue 05/07 UPGRADE/REPAIR: running this setup over an old install updates
+; IN PLACE - Inno's default behavior with an unchanged AppId (the previous
 ; version is NOT uninstalled first; files are replaced, settings kept).
-; UsePrevious* reuses the prior install's directory/group choices.
+; Issue 07 adds a selectable mode page in [Code] shown only when a previous
+; install exists: Upgrade (default) / Repair / Fresh (Fresh runs the old
+; uninstaller first). UsePrevious* reuses the prior install's dir/group/tasks.
 UsePreviousAppDir=yes
 UsePreviousGroup=yes
 UsePreviousTasks=yes
@@ -67,13 +69,19 @@ Type: filesandordirs; Name: "{app}\logs"
 Type: files; Name: "{app}\*.log"
 
 [Code]
-{ Issue 05: Fresh / UPGRADE / REPAIR detection for the welcome-page banner.
-  Prior state is read from the Inno uninstall entry of the fixed AppId
-  (DisplayVersion = previous release).  Same version => REPAIR mode,
-  different version => UPGRADE mode, no entry => Fresh install. }
+{ Issue 05 welcome banner + Issue 07 selectable UPGRADE / REPAIR / FRESH mode.
+  Prior state is read from the Inno uninstall entry of the fixed AppId:
+  DisplayVersion = previous release, UninstallString = previous unins000.exe.
+  No uninstall entry => no mode page is created and the original fresh
+  install path runs unchanged. }
 var
   HasPriorInstall: Boolean;
   PriorVersion: String;
+  PriorUninstallString: String;
+  InstallMode: String;        { 'upgrade' | 'repair' | 'fresh' (Issue 07) }
+  ModePage: TWizardPage;      { nil when no previous install was detected }
+  OptUpgrade, OptRepair, OptFresh: TRadioButton;
+  FreshUninstallDone: Boolean;
 
 function InitializeSetup(): Boolean;
 var
@@ -82,17 +90,85 @@ begin
   UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{8F3C2A1B-5D4E-4B9C-A7F6-1E2D3C4B5A69}_is1';
   HasPriorInstall := RegKeyExists(HKLM, UninstallKey);
   PriorVersion := '';
-  if HasPriorInstall then
+  PriorUninstallString := '';
+  if HasPriorInstall then begin
     RegQueryStringValue(HKLM, UninstallKey, 'DisplayVersion', PriorVersion);
-  if HasPriorInstall and (PriorVersion = '') then
-    PriorVersion := 'unknown';
-  Result := True;  // never block the wizard; the banner only reports state
+    RegQueryStringValue(HKLM, UninstallKey, 'UninstallString', PriorUninstallString);
+    if PriorVersion = '' then
+      PriorVersion := 'unknown';
+  end;
+  Result := True;  // never block the wizard; banner/page only report state
+end;
+
+{ Issue 07: indented word-wrapped description line under a mode radio. }
+function AddModeDescription(ALeft, ATop, AWidth: Integer;
+  const ACaption: String): TNewStaticText;
+begin
+  Result := TNewStaticText.Create(ModePage);
+  Result.Parent := ModePage.Surface;
+  Result.AutoSize := False;
+  Result.WordWrap := True;
+  Result.ShowAccelChar := False;  // render any '&' literally in the caption
+  Result.Left := ALeft;
+  Result.Top := ATop;
+  Result.Width := AWidth;
+  Result.Caption := ACaption;
+  Result.AdjustHeight;
+end;
+
+{ Issue 07: silently run the PREVIOUS version's uninstaller (Fresh mode),
+  before any file copy. Returns True only when it launched and exited 0;
+  every failure branch shows a suppressible message box so silent installs
+  never hang on UI. }
+function RunPreviousUninstaller(): Boolean;
+var
+  CmdLine, UninstallExe, UninstallParams: String;
+  QuotePos: Integer;
+  ResultCode: Integer;
+begin
+  Result := False;
+  CmdLine := Trim(PriorUninstallString);
+  if CmdLine = '' then begin
+    SuppressibleMsgBox('Fresh install was selected, but no uninstaller for the previous version was found in the registry. Please choose Upgrade or Repair instead.', mbError, MB_OK, IDOK);
+    exit;
+  end;
+  if Copy(CmdLine, 1, 1) = '"' then begin
+    Delete(CmdLine, 1, 1);
+    QuotePos := Pos('"', CmdLine);
+    if QuotePos = 0 then begin
+      SuppressibleMsgBox('The uninstall command of the previous version is malformed. Please choose Upgrade or Repair instead.', mbError, MB_OK, IDOK);
+      exit;
+    end;
+    UninstallExe := Copy(CmdLine, 1, QuotePos - 1);
+    UninstallParams := Trim(Copy(CmdLine, QuotePos + 1, MaxInt));
+  end else begin
+    UninstallExe := CmdLine;
+    UninstallParams := '';
+  end;
+  if not FileExists(UninstallExe) then begin
+    SuppressibleMsgBox('The previous uninstaller no longer exists: ' + UninstallExe + '. Please choose Upgrade or Repair instead.', mbError, MB_OK, IDOK);
+    exit;
+  end;
+  if UninstallParams <> '' then
+    UninstallParams := UninstallParams + ' ';
+  UninstallParams := UninstallParams + '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART';
+  if not Exec(UninstallExe, UninstallParams, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then begin
+    SuppressibleMsgBox('Setup could not start the previous uninstaller. Please choose Upgrade or Repair instead.', mbError, MB_OK, IDOK);
+    exit;
+  end;
+  if ResultCode <> 0 then begin
+    SuppressibleMsgBox('The previous uninstaller exited with code ' + IntToStr(ResultCode) + '. The old version may still be present; Setup will not continue with a fresh install.', mbError, MB_OK, IDOK);
+    exit;
+  end;
+  Result := True;
 end;
 
 procedure InitializeWizard();
 var
   Banner: TNewStaticText;
   AnchorBottom: Integer;
+  DescUpgrade, DescRepair, DescFresh: TNewStaticText;
+  DescLeft, DescWidth, CursorTop: Integer;
 begin
   { Prepend the install-mode status banner to the welcome page (right column,
     below the standard welcome paragraph - clear of the image and buttons). }
@@ -114,4 +190,83 @@ begin
     AnchorBottom := WizardForm.ClientHeight;
   Banner.Top := AnchorBottom - ScaleY(78);
   Banner.AdjustHeight;
+
+  { Issue 07: the selectable mode page exists ONLY when a previous install
+    was detected; otherwise ModePage stays nil and NextButtonClick ignores
+    it (fresh path unchanged). Page header carries the detected version. }
+  ModePage := nil;
+  InstallMode := '';
+  FreshUninstallDone := False;
+  if HasPriorInstall then begin
+    InstallMode := 'upgrade';  // matches the preselected radio below
+    ModePage := CreateCustomPage(wpWelcome, 'Upgrade or Repair',
+      'Previous version: v' + PriorVersion + ' detected - choose how Setup should proceed.');
+    DescLeft := ScaleX(19);
+    DescWidth := ModePage.SurfaceWidth - DescLeft;
+    CursorTop := 0;
+
+    OptUpgrade := TRadioButton.Create(ModePage);
+    OptUpgrade.Parent := ModePage.Surface;
+    OptUpgrade.Left := 0;
+    OptUpgrade.Top := CursorTop;
+    OptUpgrade.Width := ModePage.SurfaceWidth;
+    OptUpgrade.Anchors := [akLeft, akTop, akRight];
+    OptUpgrade.Caption := 'Upgrade (recommended) - install v{#MyAppVersion} over v' + PriorVersion;
+    OptUpgrade.Checked := True;
+    CursorTop := OptUpgrade.Top + OptUpgrade.Height;
+    DescUpgrade := AddModeDescription(DescLeft, CursorTop + ScaleY(2), DescWidth,
+      'Program files are replaced with v{#MyAppVersion} in place; all your data and settings are preserved.');
+    CursorTop := DescUpgrade.Top + DescUpgrade.Height + ScaleY(12);
+
+    OptRepair := TRadioButton.Create(ModePage);
+    OptRepair.Parent := ModePage.Surface;
+    OptRepair.Left := 0;
+    OptRepair.Top := CursorTop;
+    OptRepair.Width := ModePage.SurfaceWidth;
+    OptRepair.Anchors := [akLeft, akTop, akRight];
+    OptRepair.Caption := 'Repair - refresh the existing v' + PriorVersion + ' install';
+    CursorTop := OptRepair.Top + OptRepair.Height;
+    DescRepair := AddModeDescription(DescLeft, CursorTop + ScaleY(2), DescWidth,
+      'Re-writes the program files and re-registers icons, firewall rule and .slatesync association of the current install. Data and settings are preserved - validates or refreshes an existing install.');
+    CursorTop := DescRepair.Top + DescRepair.Height + ScaleY(12);
+
+    OptFresh := TRadioButton.Create(ModePage);
+    OptFresh.Parent := ModePage.Surface;
+    OptFresh.Left := 0;
+    OptFresh.Top := CursorTop;
+    OptFresh.Width := ModePage.SurfaceWidth;
+    OptFresh.Anchors := [akLeft, akTop, akRight];
+    OptFresh.Caption := 'Fresh install - uninstall the old version first';
+    CursorTop := OptFresh.Top + OptFresh.Height;
+    DescFresh := AddModeDescription(DescLeft, CursorTop + ScaleY(2), DescWidth,
+      'Runs the previous uninstaller first, then installs clean. Only app files are removed: documents in %APPDATA%\SlateSync on this PC are NOT deleted, and synced PC storage is untouched.');
+  end;
+end;
+
+{ Issue 07: validate the mode selection on the mode page and, for Fresh,
+  remove the previous install BEFORE any file copy. A failure leaves the
+  wizard on this page (abort-on-fail) so a half-removed install is never
+  overwritten by a "clean" run. }
+function NextButtonClick(CurPageID: Integer): Boolean;
+begin
+  Result := True;
+  if (ModePage <> nil) and (CurPageID = ModePage.ID) then begin
+    if OptUpgrade.Checked then
+      InstallMode := 'upgrade'
+    else if OptRepair.Checked then
+      InstallMode := 'repair'
+    else if OptFresh.Checked then
+      InstallMode := 'fresh'
+    else begin
+      SuppressibleMsgBox('Please choose Upgrade, Repair or Fresh install before continuing.', mbError, MB_OK, IDOK);
+      Result := False;
+      exit;
+    end;
+    if (InstallMode = 'fresh') and not FreshUninstallDone then begin
+      if RunPreviousUninstaller() then
+        FreshUninstallDone := True
+      else
+        Result := False;  // error already reported; stay on the mode page
+    end;
+  end;
 end;

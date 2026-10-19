@@ -55,8 +55,15 @@ def run_full() -> int:
     import tkinter as tk
 
     from pc_agent.core.config_manager import ConfigManager
-    from pc_agent.core.events import DOCUMENT_LOADED, PAIRING_INFO, RPC_MESSAGE, EventBus
+    from pc_agent.core.events import (
+        CANVAS_LIST_UPDATED,
+        DOCUMENT_LOADED,
+        PAIRING_INFO,
+        RPC_MESSAGE,
+        EventBus,
+    )
     from pc_agent.engine.document_store import CanvasDocument, DocumentStore
+    from pc_agent.engine.local_canvas_index import LocalCanvasIndex
     from pc_agent.engine.scene_graph import SceneGraph
     from pc_agent.export.export_coordinator import ExportCoordinator
     from pc_agent.export.tiled_raster_exporter import TiledRasterExporter
@@ -96,13 +103,21 @@ def run_full() -> int:
     scene_graph = SceneGraph(bus)
     document_store = DocumentStore(bus, config, scene_graph)
 
-    # --- 3b. canvas sync (Doc 02 §8): list cache + OPEN_CANVAS canvas dialect;
-    # pushes go through the same broadcast_json fan-out as the exporters. -----
+    # --- 3a. local canvas index (Doc 02 §9.3): %APPDATA%/SlateSync/canvases
+    # (<id>.slatesync + index.json). The index takes the store for ZIP I/O and
+    # is attached back so open_payload persist-on-open + autosave row refreshes
+    # work. Browsing is local/read-only with 0 devices; sync actions no-op. ----
+    local_index = LocalCanvasIndex(document_store, config.appdata_dir / "canvases")
+    document_store.attach_index(local_index)
+
+    # --- 3b. canvas sync v2 (Doc 02 §9): per-device state, LWW merge, pull/put,
+    # hub list broadcast; pushes go through the exporters' broadcast_json. -----
     canvas_sync = CanvasSyncManager(
         bus=bus,
         config=config,
         push=server.broadcast_json,
         store=document_store,
+        index=local_index,
     )
 
     # --- 4. exports (Doc 15); output files land in config.export_dir --------
@@ -141,6 +156,13 @@ def run_full() -> int:
     window.build(root)  # gridded layout; build() mounts the GL host (Doc 16 §5.4)
     if pairing_info:  # replay the pre-GUI PAIRING_INFO for the window
         bus.emit(PAIRING_INFO, **pairing_info)
+    # Round 5: seed the gallery/HUD with the persisted hub store (§9.2) — the
+    # manager was built before the GUI, so replay its current merged state.
+    bus.emit(
+        CANVAS_LIST_UPDATED,
+        canvases=canvas_sync.canvases,
+        devices=canvas_sync.devices,
+    )
 
     def menu_rpc(envelope: dict) -> None:
         """File→New/Open envelopes (Doc 16 §5.12), routed by payload shape."""
@@ -155,6 +177,15 @@ def run_full() -> int:
             doc = document_store.new(
                 str(payload["preset"]), str(payload.get("title", "Untitled"))
             )
+            # Doc 02 §9.4 flow 4 (PC New): persist to hub storage, broadcast the
+            # silent CANVAS_PUT + hub list — devices persist WITHOUT switching,
+            # only this PC shows the new canvas immediately. Local-file "Open
+            # local file…" above stays index-free.
+            try:
+                local_index.save_document(doc, source="hub")
+            except Exception:
+                logger.exception("persisting the new canvas to the hub index failed")
+            canvas_sync.put_canvas(doc)
             bus.emit(DOCUMENT_LOADED, doc=doc)
         else:
             logger.warning("menu RPC ignored: %r", envelope)
@@ -224,7 +255,10 @@ def run_full() -> int:
         if state["torn_down"]:
             return
         try:
-            document_store.autosave_tick()
+            if document_store.autosave_tick():
+                # The hub store changed (§9.2): advertise the new updated_at so
+                # devices can PULL the fresh copy (§9.4 flow 2).
+                canvas_sync.broadcast_hub_list()
         except Exception:
             logger.exception("autosave failed")
         root.after(autosave_ms, autosave_tick)

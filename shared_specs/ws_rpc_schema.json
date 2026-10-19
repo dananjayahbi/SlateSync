@@ -13,10 +13,12 @@
     "action": {"enum": ["OPEN_CANVAS", "ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE",
       "DELETE_NODE", "UPGRADE_SIZE", "START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS",
       "EXPORT_FINISHED", "ASSET_START", "ASSET_CHUNK", "ASSET_DONE",
-      "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST"]}
+      "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
+      "CANVAS_PUT", "CANVAS_PULL"]}
   },
   "type_actions": {
-    "CANVAS_LIFECYCLE": ["OPEN_CANVAS", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST"],
+    "CANVAS_LIFECYCLE": ["OPEN_CANVAS", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
+      "CANVAS_PUT", "CANVAS_PULL"],
     "ELEMENT_COMMIT": ["ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE", "DELETE_NODE"],
     "ARTBOARD_RESIZE": ["UPGRADE_SIZE"],
     "ASSET_UPLOAD": ["ASSET_START", "ASSET_CHUNK", "ASSET_DONE"],
@@ -81,6 +83,29 @@
         "canvas_id": {"type": "string"}
       },
       "description": "asks the tablet to load that document, switch its own UI to it, and broadcast OPEN_CANVAS {canvas: <full doc>}"
+    },
+    "CANVAS_PUT": {
+      "direction": "any_to_any",
+      "type": "object",
+      "required": ["canvas", "source"],
+      "properties": {
+        "canvas": {
+          "type": "object",
+          "description": "complete Doc 03 CanvasDocumentModel document.json body (snake_case wire keys)"
+        },
+        "source": {"type": "string", "enum": ["device", "hub"]}
+      },
+      "description": "persist silently, NO UI switch: receiver stores locally first, then refreshes its list. LWW: apply only if canvas.updated_at >= local.updated_at (equal => keep local, no churn)"
+    },
+    "CANVAS_PULL": {
+      "direction": "any_to_any",
+      "type": "object",
+      "required": ["canvas_id", "have_updated_at"],
+      "properties": {
+        "canvas_id": {"type": "string"},
+        "have_updated_at": {"type": "integer", "unit": "unix_seconds"}
+      },
+      "description": "receiver replies CANVAS_PUT only if its stored copy has updated_at > have_updated_at"
     }
   },
   "asset_upload": {

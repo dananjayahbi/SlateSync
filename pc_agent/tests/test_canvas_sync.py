@@ -1,15 +1,19 @@
-"""Round 4 (Doc 02 §8) — CanvasSyncManager PC-side flows.
+"""Round 4/5 (Doc 02 §8/§9) — CanvasSyncManager PC-side flows.
 
-Covers: CONNECTION_STATE(connected) → CANVAS_LIST_REQUEST push, CANVAS_LIST →
-cache + CANVAS_LIST_UPDATED bus event, OPEN_CANVAS canvas dialect →
-``store.open_payload`` (path dialect ignored per §8.2), ``request_open`` →
-CANVAS_OPEN_REQUEST envelope, the ``canvases`` property, and shutdown symmetry.
+Covers: CONNECTION_STATE(connected) → hub CANVAS_LIST broadcast +
+CANVAS_LIST_REQUEST push, CANVAS_LIST → merge + ``CANVAS_LIST_UPDATED`` bus
+event with the frozen ``{canvases, devices}`` payload, OPEN_CANVAS canvas
+dialect → ``store.open_payload`` (path dialect ignored per §8.2),
+``request_open`` → CANVAS_OPEN_REQUEST envelope, the ``canvases`` property,
+and shutdown symmetry. Round-5 hub flows (merge/LWW, pull/put, index
+persistence, New-flow) live in ``test_canvas_sync_hub.py``.
 """
 
 from __future__ import annotations
 
 import logging
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -71,11 +75,17 @@ def _envelope(envelope_type: str, action: str, payload: dict) -> dict:
     }
 
 
-def _manager(push=None, store=None) -> tuple[EventBus, CanvasSyncManager, _PushSpy, _StoreSpy]:
+def _manager(
+    tmp_path: Path, push=None, store=None
+) -> tuple[EventBus, CanvasSyncManager, _PushSpy, _StoreSpy]:
     bus = EventBus()
     push_spy = push if push is not None else _PushSpy()
     store_spy = store if store is not None else _StoreSpy()
-    manager = CanvasSyncManager(bus, AppConfig(), push_spy, store_spy)
+    # tmp appdata: the hub device id is persisted under <appdata>/device_id.
+    config = AppConfig(appdata_dir=tmp_path / "appdata")
+    manager = CanvasSyncManager(
+        bus, config, push_spy, store_spy, pull_interval_s=0.0  # synchronous drain
+    )
     return bus, manager, push_spy, store_spy
 
 
@@ -89,27 +99,39 @@ def _assert_shell(msg: dict, action: str) -> None:
     assert isinstance(msg["timestamp"], int)
 
 
-def test_connected_pushes_canvas_list_request_and_disconnect_does_not() -> None:
-    _bus, manager, push, _store = _manager()
+def test_connected_pushes_canvas_list_request_and_disconnect_does_not(
+    tmp_path: Path,
+) -> None:
+    _bus, manager, push, _store = _manager(tmp_path)
     manager._on_connection_state(connected=False, peer=None)
     assert push.messages == []
 
     manager._on_connection_state(connected=True, peer="10.0.0.5:40000")
-    assert len(push.messages) == 1
-    _assert_shell(push.messages[0], "CANVAS_LIST_REQUEST")
-    assert push.messages[0]["payload"] == {}
+    # §9.2: hub list on each new connection, then §8.3 flow 2 requests the
+    # device's own list.
+    assert [m["action"] for m in push.messages] == ["CANVAS_LIST", "CANVAS_LIST_REQUEST"]
+    hub_list = push.messages[0]
+    _assert_shell(hub_list, "CANVAS_LIST")
+    assert hub_list["payload"]["origin"] == "hub"
+    assert hub_list["payload"]["canvases"] == []
+    assert isinstance(hub_list["payload"]["device_id"], str)
+    _assert_shell(push.messages[1], "CANVAS_LIST_REQUEST")
+    assert push.messages[1]["payload"] == {}
+
+    manager._on_connection_state(connected=False, peer=None)  # no new pushes
+    assert [m["action"] for m in push.messages] == ["CANVAS_LIST", "CANVAS_LIST_REQUEST"]
 
 
-def test_connection_state_via_bus_reaches_the_manager() -> None:
-    bus, _manager_obj, push, _store = _manager()
+def test_connection_state_via_bus_reaches_the_manager(tmp_path: Path) -> None:
+    bus, _manager_obj, push, _store = _manager(tmp_path)
     bus.emit(CONNECTION_STATE, connected=True, peer=None)
-    assert [m["action"] for m in push.messages] == ["CANVAS_LIST_REQUEST"]
+    assert [m["action"] for m in push.messages] == ["CANVAS_LIST", "CANVAS_LIST_REQUEST"]
 
 
-def test_canvas_list_caches_rows_and_emits_canvas_list_updated() -> None:
-    bus, manager, _push, _store = _manager()
-    seen: list[list[dict]] = []
-    bus.on(CANVAS_LIST_UPDATED, lambda canvases: seen.append(canvases))
+def test_canvas_list_caches_rows_and_emits_canvas_list_updated(tmp_path: Path) -> None:
+    bus, manager, _push, _store = _manager(tmp_path)
+    seen: list[dict] = []
+    bus.on(CANVAS_LIST_UPDATED, lambda **payload: seen.append(payload))
 
     bus.emit(
         RPC_MESSAGE,
@@ -117,14 +139,16 @@ def test_canvas_list_caches_rows_and_emits_canvas_list_updated() -> None:
     )
     assert manager.canvases == _ROWS
     assert len(seen) == 1
-    assert seen[0] == _ROWS
+    # Round-5 frozen payload: {canvases, devices} (core/events.py).
+    assert seen[0]["canvases"] == _ROWS
+    assert seen[0]["devices"] == 0
     # The event carries a copy — later cache swaps don't mutate delivered rows.
-    seen[0].append({"id": "ghost"})
+    seen[0]["canvases"].append({"id": "ghost"})
     assert len(manager.canvases) == 2
 
 
-def test_canvas_list_may_be_empty_and_still_emits() -> None:
-    bus, manager, _push, _store = _manager()
+def test_canvas_list_may_be_empty_and_still_emits(tmp_path: Path) -> None:
+    bus, manager, _push, _store = _manager(tmp_path)
     bus.emit(RPC_MESSAGE, msg=_envelope("CANVAS_LIFECYCLE", "CANVAS_LIST", {}))
     assert manager.canvases == []
 
@@ -132,8 +156,8 @@ def test_canvas_list_may_be_empty_and_still_emits() -> None:
     assert manager.canvases == []
 
 
-def test_open_canvas_canvas_dialect_routes_to_store_open_payload() -> None:
-    bus, _manager_obj, _push, store = _manager()
+def test_open_canvas_canvas_dialect_routes_to_store_open_payload(tmp_path: Path) -> None:
+    bus, _manager_obj, _push, store = _manager(tmp_path)
     body = {"canvas_id": "c-1", "title": "T", "elements": []}
     bus.emit(
         RPC_MESSAGE,
@@ -143,9 +167,9 @@ def test_open_canvas_canvas_dialect_routes_to_store_open_payload() -> None:
 
 
 def test_open_canvas_path_dialect_is_ignored_per_8_2(
-    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    bus, _manager_obj, _push, store = _manager()
+    bus, _manager_obj, _push, store = _manager(tmp_path)
     with caplog.at_level(logging.DEBUG):
         bus.emit(
             RPC_MESSAGE,
@@ -161,16 +185,16 @@ def test_open_canvas_path_dialect_is_ignored_per_8_2(
     assert any("canvas dialect" in r.getMessage() for r in caplog.records)
 
 
-def test_foreign_types_and_actions_never_touch_the_store() -> None:
-    bus, _manager_obj, _push, store = _manager()
+def test_foreign_types_and_actions_never_touch_the_store(tmp_path: Path) -> None:
+    bus, _manager_obj, _push, store = _manager(tmp_path)
     bus.emit(RPC_MESSAGE, msg=_envelope("ELEMENT_COMMIT", "OPEN_CANVAS", {"canvas": {}}))
     bus.emit(RPC_MESSAGE, msg=_envelope("CANVAS_LIFECYCLE", "ADD_STROKE", {"canvas": {}}))
     bus.emit(RPC_MESSAGE, msg={"not": "an envelope"})
     assert store.opened == []
 
 
-def test_request_open_pushes_canvas_open_request_shell() -> None:
-    _bus, manager, push, _store = _manager()
+def test_request_open_pushes_canvas_open_request_shell(tmp_path: Path) -> None:
+    _bus, manager, push, _store = _manager(tmp_path)
     manager.request_open("c-1")
     assert len(push.messages) == 1
     _assert_shell(push.messages[0], "CANVAS_OPEN_REQUEST")
@@ -178,16 +202,16 @@ def test_request_open_pushes_canvas_open_request_shell() -> None:
 
 
 def test_push_and_store_failures_are_logged_never_raised(
-    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    bus, _manager_obj, _push_bomb, _store = _manager(push=_PushBomb())
+    bus, _manager_obj, _push_bomb, _store = _manager(tmp_path, push=_PushBomb())
     with caplog.at_level(logging.ERROR):
         bus.emit(CONNECTION_STATE, connected=True, peer=None)  # raised → swallowed
     assert any("CANVAS_LIST_REQUEST push failed" in r.getMessage()
                for r in caplog.records)
 
     caplog.clear()
-    bus2, _m2, _p2, _s2 = _manager(store=_StoreBomb())
+    bus2, _m2, _p2, _s2 = _manager(tmp_path, store=_StoreBomb())
     with caplog.at_level(logging.ERROR):
         bus2.emit(
             RPC_MESSAGE,
@@ -197,8 +221,8 @@ def test_push_and_store_failures_are_logged_never_raised(
                for r in caplog.records)
 
 
-def test_shutdown_unsubscribes_symmetrically() -> None:
-    bus, manager, push, _store = _manager()
+def test_shutdown_unsubscribes_symmetrically(tmp_path: Path) -> None:
+    bus, manager, push, _store = _manager(tmp_path)
     manager.shutdown()
     manager.shutdown()  # idempotent
     bus.emit(CONNECTION_STATE, connected=True, peer=None)

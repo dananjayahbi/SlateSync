@@ -148,10 +148,12 @@ Doc-specific frozen contract (top-level keys of the two files this doc creates):
     "action": {"enum": ["OPEN_CANVAS", "ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE",
       "DELETE_NODE", "UPGRADE_SIZE", "START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS",
       "EXPORT_FINISHED", "ASSET_START", "ASSET_CHUNK", "ASSET_DONE",
-      "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST"]}
+      "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
+      "CANVAS_PUT", "CANVAS_PULL"]}
   },
   "type_actions": {
-    "CANVAS_LIFECYCLE": ["OPEN_CANVAS", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST"],
+    "CANVAS_LIFECYCLE": ["OPEN_CANVAS", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
+      "CANVAS_PUT", "CANVAS_PULL"],
     "ELEMENT_COMMIT": ["ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE", "DELETE_NODE"],
     "ARTBOARD_RESIZE": ["UPGRADE_SIZE"],
     "ASSET_UPLOAD": ["ASSET_START", "ASSET_CHUNK", "ASSET_DONE"],
@@ -216,6 +218,29 @@ Doc-specific frozen contract (top-level keys of the two files this doc creates):
         "canvas_id": {"type": "string"}
       },
       "description": "asks the tablet to load that document, switch its own UI to it, and broadcast OPEN_CANVAS {canvas: <full doc>}"
+    },
+    "CANVAS_PUT": {
+      "direction": "any_to_any",
+      "type": "object",
+      "required": ["canvas", "source"],
+      "properties": {
+        "canvas": {
+          "type": "object",
+          "description": "complete Doc 03 CanvasDocumentModel document.json body (snake_case wire keys)"
+        },
+        "source": {"type": "string", "enum": ["device", "hub"]}
+      },
+      "description": "persist silently, NO UI switch: receiver stores locally first, then refreshes its list. LWW: apply only if canvas.updated_at >= local.updated_at (equal => keep local, no churn)"
+    },
+    "CANVAS_PULL": {
+      "direction": "any_to_any",
+      "type": "object",
+      "required": ["canvas_id", "have_updated_at"],
+      "properties": {
+        "canvas_id": {"type": "string"},
+        "have_updated_at": {"type": "integer", "unit": "unix_seconds"}
+      },
+      "description": "receiver replies CANVAS_PUT only if its stored copy has updated_at > have_updated_at"
     }
   },
   "asset_upload": {
@@ -354,3 +379,48 @@ Full action list after this extension (17): `OPEN_CANVAS, ADD_STROKE, ADD_GRAPH,
 * **PC sync agent:** `shared_specs/ws_rpc_schema.json` (apply §8.1–8.2), the embedded JSON body inside THIS file's §5, `shared_specs/validate_specs.py` (make it derive the expected action set from `ws_rpc_schema.json` itself instead of any hardcoded count), `pc_agent/core/protocol.py` (`RPC_ACTIONS` = 17), plus its pc_agent modules/tests.
 * **Mobile sync agent:** Dart send-side action validation (in `lib/network/`), receive tolerance for unknown incoming actions (never reject the three new ones), plus its mobile files.
 * **Neither** may change envelope top-level keys, the 16-byte frame, `type` enum (still 5), or §4.2's existing payload shapes other than the `OPEN_CANVAS` dialect rule above.
+
+---
+
+## 9. Hub Sync & Multi-Device Extension (Round 5 — NORMATIVE, amends §8)
+
+Round 5 turns the PC agent into a **sync hub** serving **any number of devices** with **PC-local storage** (user issues 03/04). All Round-5 agents implement exactly this section.
+
+### 9.1 Action-set extension (17 → 19)
+
+Add to `envelope.action.enum` + `type_actions.CANVAS_LIFECYCLE` (and Doc 02 §5 embedded body, PC mirrors):
+
+| Action | Direction | Payload schema |
+|---|---|---|
+| `CANVAS_PUT` | any → any | `{canvas: <full Doc03 document>, source: "device"\|"hub"}` — **persist silently, NO UI switch**. Receiver stores locally first, then refreshes its list. **LWW rule: apply only if `canvas.updated_at >= local.updated_at`** (equal ⇒ keep local, no churn). |
+| `CANVAS_PULL` | any → any | `{canvas_id, have_updated_at: int}` — receiver replies `CANVAS_PUT` only if its stored copy has `updated_at > have_updated_at`. |
+
+### 9.2 `CANVAS_LIST` v2 payload (backward compatible)
+
+`{device_id: str, device_name?: str, origin: "hub"|"device", canvases: [...]}` — `device_id` is a stable uuid generated once per app install (persisted); missing `device_id` ⇒ treat as `legacy-<conn>`.
+
+* **Device → hub** (`origin:"device"`) on (re)connect and after create/rename/delete.
+* **Hub → all devices** (`origin:"hub"`, merged store) whenever the hub store changes and on each new connection (broadcast acceptable).
+* Hub keys its per-device caches by `device_id`; HUD/gallery may show `device_name` and connected-device count.
+
+### 9.3 Persistence targets (every endpoint stores)
+
+* **PC hub:** `%APPDATA%/SlateSync/canvases/<canvas_id>.slatesync` + `index.json` (`id,title,preset,background,updated_at,source_devices[]`) — DocumentStore save/open reused. PC browsing works **offline/read-only until a device pairs**; sync actions no-op without connections.
+* **Device:** existing `LocalDb` + `.slatesync` archive (Doc 26 path).
+* **Persist-on-open rule (amends §8.3):** a peer receiving `OPEN_CANVAS {canvas}` MUST persist it to its local store (LWW per 9.1) **before** switching UI. `CANVAS_PUT` persists without switching.
+
+### 9.4 Canonical hub flows
+
+1. **Fresh device joins:** device publishes `CANVAS_LIST (origin:device)` → hub merges (union by id, LWW on `updated_at`) → hub broadcasts `CANVAS_LIST (origin:hub)` → device diffs ids it lacks → sends `CANVAS_PULL` for each → hub replies `CANVAS_PUT` per doc → device stores silently (no navigation). Device then shows the shared canvases in its normal gallery (they are local rows now).
+2. **Hub missing/older docs:** on a device list, hub PULLs ids it lacks or has older `updated_at` (device replies PUT). Sequential per id is fine (v1).
+3. **Open/switch** remains §8.3 (OPEN_CANVAS switches everyone; CANVAS_OPEN_REQUEST fetches).
+4. **New canvas anywhere:** device ⇒ save + `OPEN_CANVAS` broadcast + `CANVAS_LIST(device)` publish; PC (File→New) ⇒ persist to hub storage + broadcast `CANVAS_PUT` + `CANVAS_LIST(hub)`. Every endpoint ends with the same content.
+5. **Mutations** (ELEMENT_COMMIT/…) unchanged; PC mirrors against the currently-open doc; multi-device writes are serialized by the hub's single WS thread; conflicts beyond LWW (concurrent same-canvas edits) ⇒ newer `updated_at` wins at receipt (v1 rule, documented limitation).
+
+### 9.5 Round-5 ownership (write-conflict guard)
+
+* **Protocol/hub agent (PC):** `ws_rpc_schema.json`, Doc 02 §5 embedded body, `validate_specs.py`, `core/protocol.py` (19), `core/events.py`, `network/canvas_sync.py` (v2: per-device state, merge, pull/put, hub list), `engine/document_store.py` (+ local index), NEW `engine/local_canvas_index.py`, `main.py`.
+* **Studio UI agent (PC):** `gui/studio_window.py`, NEW `gui/canvas_gallery_panel.py`, `installer/slatesync_agent.spec` (bundle ico), runtime `iconbitmap`.
+* **Mobile bridge agent:** `lib/features/sync/canvas_sync_bridge.dart` (+ pre-seeded `hubChanged` notifier contract) and sync tests only.
+* **Mobile shell agent:** `lib/main.dart`, `lib/features/home/**` and their tests.
+* Envelope top-level keys, frame layout, `type` enum and §4.2 payloads (other than 9.1/9.2 additions) remain unchanged.

@@ -26,6 +26,7 @@ from pc_agent.core.events import (
     EventBus,
 )
 from pc_agent.engine.document_store import Artboard, CanvasDocument, DocumentStore
+from pc_agent.engine.local_canvas_index import LocalCanvasIndex
 from pc_agent.engine.scene_graph import CanvasNode, NodeGeometry, NodeStyle, SceneGraph
 
 _ZERO = {"min_x": 0.0, "min_y": 0.0, "max_x": 0.0, "max_y": 0.0}
@@ -629,3 +630,125 @@ def test_autosave_racing_asset_done_never_interleaves_zip_writes(env: _Env) -> N
     with zipfile.ZipFile(path, "r") as archive:
         assert archive.testzip() is None  # archive fully consistent
     assert len(list((config.assets_dir / "other-cv").glob("race*.bin"))) == 40
+
+
+# ---------------------------------------------------------------------------
+# Round 5 (Doc 02 §9.3): local index binding, persist-on-open, silent saves
+# ---------------------------------------------------------------------------
+
+
+def _index_for(env: _Env) -> LocalCanvasIndex:
+    index = LocalCanvasIndex(env.store, env.config.appdata_dir / "canvases")
+    env.store.attach_index(index)
+    return index
+
+
+def test_persist_on_open_stores_before_the_switch_event(env: _Env) -> None:
+    index = _index_for(env)
+    wire_doc = env.store.new("A4", "From device")
+    body = env.store.document_to_json(wire_doc)
+
+    existed_at_emit: list[bool] = []
+    env.bus.on(
+        DOCUMENT_LOADED,
+        lambda **_: existed_at_emit.append(
+            index.archive_path(wire_doc.canvas_id).is_file()
+        ),
+    )
+    loaded = env.store.open_payload(body)
+
+    # §9.3: the archive already exists when DOCUMENT_LOADED fires (persist
+    # happens BEFORE the UI switch), and the row carries the wire timestamp.
+    assert existed_at_emit == [True]
+    assert index.get(wire_doc.canvas_id)["updated_at"] == loaded.updated_at
+    # A wire document is never the autosave target.
+    assert env.store.current_path is None
+    assert env.store.is_dirty is False
+
+
+def test_persist_on_open_lww_never_downgrades_the_local_copy(env: _Env) -> None:
+    index = _index_for(env)
+    seed = env.store.new("A4", "Local copy")
+    seed.updated_at = 1000
+    index.save_document(seed, source="hub")
+    original_zip = index.archive_path(seed.canvas_id).read_bytes()
+
+    stale = env.store.document_to_json(seed)
+    stale["updated_at"] = 500
+    stale["title"] = "Stale copy"
+    env.store.open_payload(stale)
+
+    assert index.archive_path(seed.canvas_id).read_bytes() == original_zip
+    row = index.get(seed.canvas_id)
+    assert row["updated_at"] == 1000 and row["title"] == "Local copy"
+
+
+def test_open_payload_without_index_never_touches_disk(env: _Env) -> None:
+    body = env.store.document_to_json(env.store.new("A4", "No index"))
+    env.store.open_payload(body)
+    target = env.config.appdata_dir / "canvases" / f"{body['canvas_id']}.slatesync"
+    assert not target.exists()
+
+
+def test_read_archive_has_no_side_effects(env: _Env) -> None:
+    doc = env.store.new("A4", "Read me")
+    path = env.store.save(doc)
+    loaded_events: list[object] = []
+    env.bus.on(DOCUMENT_LOADED, lambda **payload: loaded_events.append(payload))
+    focus_before = env.store.current_path
+
+    parsed = env.store.read_archive(path)
+
+    assert parsed.canvas_id == doc.canvas_id
+    assert parsed.updated_at == doc.updated_at
+    assert loaded_events == []  # serving a pull never switches the document
+    assert env.store.current_path == focus_before
+    assert env.store.is_dirty is False
+
+
+def test_write_archive_silent_flags_preserve_the_received_document(env: _Env) -> None:
+    doc = env.store.new("A4", "Silent")
+    doc.updated_at = 1234567
+    doc.elements = [_element("n-wire", (0.0, 0.0, 10.0, 10.0))]
+    env.graph.replace_all([])  # the OPEN scene must not be spliced in
+    focus_before = env.store.current_path
+    dirty_before = env.store.is_dirty
+    path = env.config.appdata_dir / "canvases" / "silent.slatesync"
+
+    env.store.write_archive(
+        doc, path, stamp_updated=False, sync_scene=False, focus=False
+    )
+
+    assert path.is_file()
+    assert doc.updated_at == 1234567  # LWW timestamp stays authoritative
+    assert [node.node_id for node in doc.elements] == ["n-wire"]  # scene untouched
+    assert env.store.current_path == focus_before  # focus untouched
+    assert env.store.is_dirty is dirty_before
+    assert list(path.parent.glob("*.tmp")) == []
+
+
+def test_autosave_tick_returns_bool_and_refreshes_the_index_row(env: _Env) -> None:
+    index = _index_for(env)
+    doc = env.store.new("A4", "Auto")
+    index.save_document(doc, source="hub")
+    assert env.store.is_dirty is True  # the index save (focus=False) keeps dirty
+
+    assert env.store.autosave_tick() is True  # dirty doc is saved + row refreshed
+    row = index.get(doc.canvas_id)
+    assert row["updated_at"] == doc.updated_at  # row followed the save stamp
+    assert row["source_devices"] == ["hub"]  # and kept its provenance
+    assert env.store.is_dirty is False
+    assert env.store.autosave_tick() is False  # clean → untouched (Doc 10)
+
+
+def test_local_file_outside_the_index_never_creates_a_row(env: _Env) -> None:
+    index = _index_for(env)
+    doc = env.store.new("A4", "Elsewhere")
+    path = env.config.export_dir / "elsewhere.slatesync"
+    env.store.save(doc, path)
+    assert index.get(doc.canvas_id) is None  # File → "Open local file…" stays index-free
+
+    # ...but an archive living INSIDE the index dir gets its row on save.
+    hub_doc = env.store.new("A4", "Hub owned")
+    assert env.store.autosave_tick() is True
+    assert index.get(hub_doc.canvas_id) is not None

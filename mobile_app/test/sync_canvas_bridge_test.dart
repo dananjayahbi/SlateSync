@@ -1,12 +1,14 @@
-/// Doc 02 §8 unit suite for [CanvasSyncBridge] (Issue 04, round 4):
+/// Doc 02 §8 + §9 unit suite for [CanvasSyncBridge] (Issue 04, rounds 4+5):
 ///  * `CANVAS_LIST` push on [SyncState.online], on direct [publishList]
 ///    calls and in reply to `CANVAS_LIST_REQUEST` — rows sorted
-///    `updated_at DESC` with the exact §8.1 key set (may be EMPTY)
+///    `updated_at DESC` inside the **§9.2 v2 payload**
+///    `{device_id, device_name, origin, canvases}` (may be EMPTY)
 ///  * `CANVAS_OPEN_REQUEST` → load local doc → broadcast full-doc
 ///    `OPEN_CANVAS` → fire `remoteOpen` (send-before-fire order), with a
 ///    full save→load→toJson roundtrip equality check
-///  * remote `OPEN_CANVAS {payload.canvas}` parses and fires `remoteOpen`
-///    WITHOUT echoing back (no feedback loop)
+///  * remote `OPEN_CANVAS {payload.canvas}` persists the document first
+///    (§9.3 persist-on-open) and then fires `remoteOpen` WITHOUT echoing
+///    back (no feedback loop)
 ///  * `payload.path` dialect (§8.2, PC-internal) is IGNORED; unknown
 ///    incoming actions are tolerated, never rejected (§8.5)
 ///  * [CanvasSyncBridge.announceOpen] envelope/payload exact keys (§8.3.1)
@@ -166,6 +168,9 @@ void main() {
     LocalDb? db,
     String? baseDir,
     void Function(CanvasDocumentModel doc)? onRemoteOpen,
+    String? deviceFilePath,
+    Future<String> Function(CanvasDocumentModel doc, {String? baseDir})?
+        saver,
   }) {
     final _FakeClient client = _FakeClient();
     clients.add(client);
@@ -174,6 +179,10 @@ void main() {
       db: db,
       baseDir: baseDir,
       onRemoteOpen: onRemoteOpen,
+      // §9.2 identity file lives under this test's scratch dir — no
+      // path_provider in unit tests, deterministic per-test device_id.
+      deviceFilePath: deviceFilePath ?? '${tmp.path}/slatesync_device.json',
+      saver: saver,
     );
     bridges.add(bridge);
     return (client, bridge);
@@ -273,7 +282,27 @@ void main() {
 
       final Map<String, dynamic> payload =
           Map<String, dynamic>.from(env['payload'] as Map);
-      expect(payload.keys, <String>['canvases']);
+      // §9.2 v2 payload: exact key set, stable uuid, device origin.
+      expect(
+        payload.keys,
+        unorderedEquals(<String>[
+          'device_id',
+          'device_name',
+          'origin',
+          'canvases',
+        ]),
+      );
+      expect(payload['origin'], 'device');
+      expect(payload['device_name'], isNull);
+      expect(
+        payload['device_id'],
+        matches(
+          RegExp(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-'
+            r'[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+          ),
+        ),
+      );
       final List<dynamic> canvases = payload['canvases'] as List<dynamic>;
       expect(
         canvases.map((dynamic c) => (c as Map)['id']),
@@ -437,14 +466,19 @@ void main() {
   // -------------------------------------------------------------------------
 
   group('OPEN_CANVAS dialects', () {
-    test('payload.canvas parses the document and fires remoteOpen',
+    test('payload.canvas persists first (§9.3), fires remoteOpen, no echo',
         () async {
+      final LocalDb db = await openDb('remote_open');
+      final String cacheDir = '${tmp.path}/SlateSync';
       final CanvasDocumentModel doc = buildDoc(
         id: 'pc-open',
         title: 'From PC',
       );
-      final (_FakeClient client, CanvasSyncBridge bridge) =
-          makeBridge(onRemoteOpen: (_) {});
+      final (_FakeClient client, CanvasSyncBridge bridge) = makeBridge(
+        db: db,
+        baseDir: cacheDir,
+        onRemoteOpen: (_) {},
+      );
 
       client.emitRpc(
         <String, dynamic>{
@@ -454,14 +488,33 @@ void main() {
           'payload': <String, dynamic>{'canvas': doc.toJson()},
         },
       );
-      await settle();
+      await waitFor(
+        () => bridge.remoteOpen.value != null,
+        description: 'remoteOpen after persist-on-open',
+      );
 
-      expect(bridge.remoteOpen.value, isNotNull);
       expect(bridge.remoteOpen.value!.canvasId, 'pc-open');
       expect(bridge.remoteOpen.value!.title, 'From PC');
       expect(bridge.remoteOpen.value!.toJson(), equals(doc.toJson()));
       // PC-initiated opens are NEVER echoed back (no loop).
       expect(client.sent, isEmpty);
+
+      // §9.3: the document hit the local store before the switch — zip and
+      // gallery row both exist for the newly received canvas (row upsert +
+      // hubChanged trail the switch by a beat).
+      await waitFor(
+        () => bridge.hubChanged.value > 0,
+        description: 'row upsert after persist-on-open',
+      );
+      final CanvasDocumentModel stored = await loadDocument(
+        'pc-open',
+        baseDir: cacheDir,
+      );
+      expect(stored.toJson(), equals(doc.toJson()));
+      final CanvasRecord? row = await db.get('pc-open');
+      expect(row, isNotNull);
+      expect(row!.updatedAt, doc.updatedAt);
+      expect(row.title, doc.title);
     });
 
     test('payload.path dialect (PC-internal) is IGNORED', () async {

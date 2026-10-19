@@ -130,6 +130,59 @@ def sample_path(
     return samples
 
 
+def is_cubic_chain(points: Sequence[Sequence[float]]) -> bool:
+    """True for Doc 21 Bézier chains ``[P0, c1, c2, P1, c3, c4, P2, …]``.
+
+    Doc 21 emits ``n = 3k − 2`` points for ``k`` anchors, i.e. ``n ≡ 1 (mod 3)``
+    ⇒ ``(n − 1) % 3 == 0``; the frozen cross-doc contract additionally accepts
+    ``(n − 2) % 3 == 0`` (one trailing point). Anything else (``n ≤ 3`` or
+    ``n ≡ 0 (mod 3)``) is a plain anchor polyline for the Catmull-Rom fit.
+    Mirrors ``pc_agent/export``'s ``_is_cubic_chain`` so every consumer of a
+    document renders the same geometry from the same ``geometry.pts``.
+    """
+    n = len(points)
+    return n >= 4 and ((n - 1) % 3 == 0 or (n - 2) % 3 == 0)
+
+
+def sample_cubic_chain(
+    points: Sequence[Sequence[float]], step_px: float = STEP_PX, scale: float = 1.0
+) -> list[_Point]:
+    """Exact cubic samples of a Doc 21 chain (joint-deduplicated).
+
+    Walks ``move_to P0`` + ``curve_to (c1, c2, P1)`` triples like the exporters;
+    a trailing point (frozen ``n ≡ 2`` layout) is appended as a final anchor.
+    Raises nothing — callers must gate on :func:`is_cubic_chain`.
+    """
+    pts = [(float(p[0]), float(p[1])) for p in points]
+    n = len(pts)
+    samples: list[_Point] = [pts[0]]
+    i = 1
+    while i + 2 < n:
+        chunk = sample_segment(samples[-1], pts[i], pts[i + 1], pts[i + 2],
+                               step_px=step_px, scale=scale)
+        samples.extend(chunk[1:])
+        i += 3
+    if i < n:
+        samples.append(pts[i])
+    return samples
+
+
+def flatten_stroke_path(
+    points: Sequence[Sequence[float]], step_px: float = STEP_PX, scale: float = 1.0
+) -> list[_Point]:
+    """Committed-path layout normaliser: chains → dense exact-cubic samples.
+
+    Document nodes carry Doc 21 Bézier chains; re-fitting those control points
+    as Catmull-Rom anchors wanders tens of world units off the true path (issue
+    05 round 5 — smeared bands / stroke tangle). Non-chain input (LIVE wire
+    anchors, the laser crosshair, legacy anchor nodes) is returned unchanged,
+    so this is safe to call on any point list without layout guessing.
+    """
+    if is_cubic_chain(points):
+        return sample_cubic_chain(points, step_px=step_px, scale=scale)
+    return [(float(p[0]), float(p[1])) for p in points]
+
+
 def compute_half_widths(
     pressure: Sequence[float], width: float, width_pressure_factor: float
 ) -> np.ndarray:

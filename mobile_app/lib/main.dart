@@ -48,6 +48,13 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
   /// `navigator!` — Issue 02 "Can't open a canvas").
   final GlobalKey<NavigatorState> _navigatorKey = GlobalKey<NavigatorState>();
 
+  /// Issue 03 round 5: bumped whenever a studio route completes (popped
+  /// back to home, or superseded by a later switch) so the home gallery
+  /// deterministically re-reads its rows on return (wired through
+  /// [HomeCanvasDashboard.refreshListenable] together with the bridge's
+  /// Doc 02 §9 `hubChanged`).
+  final ValueNotifier<int> _returnRefresh = ValueNotifier<int>(0);
+
   @override
   void initState() {
     super.initState();
@@ -76,11 +83,38 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
       navigator != null,
       'SlateSyncApp navigator must be mounted before opening a canvas',
     );
-    navigator?.push(
+    if (navigator == null) {
+      return;
+    }
+    _pushStudio(navigator, doc);
+  }
+
+  /// Issue 03 round 5 — single-studio navigation invariant: EVERY studio
+  /// entry (local gallery open, create-new flow, remote/bridge open, hub
+  /// driven switch) leaves EXACTLY ONE [CanvasStudioPage] in the stack,
+  /// with the home gallery as the root route.
+  ///
+  /// `pushAndRemoveUntil(... (r) => r.isFirst)` removes whatever else is
+  /// stacked above home — a stale studio buried under a dialog, a second
+  /// studio from a rapid double-open race — so studio routes can never
+  /// nest ("overlapping canvases") and Back always lands on home. From a
+  /// bare `[home]` stack it degenerates to a plain push, preserving the
+  /// original behavior.
+  ///
+  /// Completing the pushed route (Back, or a later switch superseding it)
+  /// bumps [_returnRefresh] to refresh the gallery beneath.
+  void _pushStudio(NavigatorState navigator, CanvasDocumentModel doc) {
+    final pushed = navigator.pushAndRemoveUntil<void>(
       MaterialPageRoute<void>(
         builder: (BuildContext context) =>
             CanvasStudioPage(document: doc, client: _client),
       ),
+      (Route<dynamic> route) => route.isFirst,
+    );
+    unawaited(
+      pushed.then((_) {
+        _returnRefresh.value += 1;
+      }),
     );
   }
 
@@ -89,10 +123,12 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
   ///
   /// Navigation uses the `navigatorKey`'s Navigator (never
   /// `Navigator.of(this.context)` — that context sits above `MaterialApp`,
-  /// Issue 02). If something is already pushed (studio, pairing, dialog) it
-  /// is REPLACED so repeated PC-initiated switches never stack stale
-  /// routes — back always lands on the home gallery; from the home gallery
-  /// itself the studio is pushed on top, preserving the existing stack.
+  /// Issue 02) through [_pushStudio]: whatever is on top — studio, pairing,
+  /// an export sheet, a dialog — the remote switch REPLACES the whole
+  /// stack above home, so repeated PC-initiated switches never stack stale
+  /// routes (round 4's top-only `pushReplacement` left a buried old studio
+  /// alive when a dialog covered it) and Back always lands on the home
+  /// gallery.
   void _onRemoteOpen() {
     final CanvasDocumentModel? doc = _bridge.remoteOpen.value;
     if (doc == null) {
@@ -103,15 +139,7 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
       return; // not mounted yet — value stays set for a later consume
     }
     _bridge.remoteOpen.value = null; // clear after consume (single-shot)
-    final MaterialPageRoute<void> route = MaterialPageRoute<void>(
-      builder: (BuildContext context) =>
-          CanvasStudioPage(document: doc, client: _client),
-    );
-    if (navigator.canPop()) {
-      navigator.pushReplacement(route);
-    } else {
-      navigator.push(route);
-    }
+    _pushStudio(navigator, doc);
   }
 
   @override
@@ -138,6 +166,13 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
         client: _client,
         // Doc 02 §8.1 — create/rename/delete pushes a fresh CANVAS_LIST.
         onListChanged: _bridge.publishList,
+        // Doc 02 §9 (round 5): hub store mutations (bridge.hubChanged) plus
+        // returns to this route (studio popped/superseded ⇒ _returnRefresh)
+        // re-read the gallery rows — debounced inside the dashboard.
+        refreshListenable: Listenable.merge(<Listenable>[
+          _bridge.hubChanged,
+          _returnRefresh,
+        ]),
       ),
     );
   }

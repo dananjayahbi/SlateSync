@@ -18,7 +18,11 @@ EXPORT_STARTED = "EXPORT_STARTED"
 EXPORT_PROGRESS = "EXPORT_PROGRESS"
 EXPORT_FINISHED = "EXPORT_FINISHED"
 PAIRING_INFO = "PAIRING_INFO"
-#: Round 4 (Doc 02 §8.1) — CanvasSyncManager cached the tablet's CANVAS_LIST.
+#: Round 4/5 (Doc 02 §8.1/§9) — merged canvas cache + live device count.
+#: Frozen payload shape (round 5): ``{canvases: [{id, title, preset,
+#: background, updated_at}, ...], devices: int}`` where ``canvases`` is the
+#: hub-merged store (updated_at DESC) and ``devices`` is the live connection
+#: count. Handlers must tolerate unknown keys (``**extra``).
 CANVAS_LIST_UPDATED = "CANVAS_LIST_UPDATED"
 
 

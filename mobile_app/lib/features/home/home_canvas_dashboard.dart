@@ -213,6 +213,7 @@ class HomeCanvasDashboard extends StatefulWidget {
     this.baseDir,
     this.client,
     this.onListChanged,
+    this.refreshListenable,
   });
 
   /// Canvas route hand-off (Doc 26 §4, wired in Wave 3.A).
@@ -235,6 +236,14 @@ class HomeCanvasDashboard extends StatefulWidget {
   /// push a fresh `CANVAS_LIST`. `null` ⇒ no-op (existing callers/tests).
   final VoidCallback? onListChanged;
 
+  /// Doc 02 §9 round-5 hook: notified when an OUT-of-band store mutation
+  /// may have changed the rows (bridge `hubChanged`: CANVAS_PUT applied,
+  /// hub list merged, pulls done) or when the shell returns to this route.
+  /// Each notification debounces into a single `_refresh()` after 100 ms so
+  /// bursts coalesce. `null` ⇒ no-op (existing callers/tests compile
+  /// untouched).
+  final Listenable? refreshListenable;
+
   @override
   State<HomeCanvasDashboard> createState() => _HomeCanvasDashboardState();
 }
@@ -245,11 +254,44 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
   List<CanvasRecord> _records = const <CanvasRecord>[];
   String _query = '';
   Timer? _debounce;
+  Timer? _refreshDebounce;
+  Listenable? _attachedRefresh;
 
   @override
   void initState() {
     super.initState();
+    _attachRefreshListenable();
     _init();
+  }
+
+  @override
+  void didUpdateWidget(covariant HomeCanvasDashboard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!identical(oldWidget.refreshListenable, widget.refreshListenable)) {
+      _detachRefreshListenable();
+      _attachRefreshListenable();
+    }
+  }
+
+  void _attachRefreshListenable() {
+    _attachedRefresh = widget.refreshListenable;
+    _attachedRefresh?.addListener(_onRefreshRequested);
+  }
+
+  void _detachRefreshListenable() {
+    _attachedRefresh?.removeListener(_onRefreshRequested);
+    _attachedRefresh = null;
+  }
+
+  /// Doc 02 §9: coalesce bursty hub notifications into ONE re-read.
+  void _onRefreshRequested() {
+    _refreshDebounce?.cancel();
+    _refreshDebounce = Timer(const Duration(milliseconds: 100), () {
+      if (!mounted) {
+        return;
+      }
+      unawaited(_refresh());
+    });
   }
 
   Future<void> _init() async {
@@ -266,6 +308,8 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
   @override
   void dispose() {
     _debounce?.cancel();
+    _refreshDebounce?.cancel();
+    _detachRefreshListenable();
     if (_ownsDb) {
       unawaited(_db?.close());
     }

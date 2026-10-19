@@ -5,6 +5,13 @@ Freeze source: ``docs/micro/10_pc_canvas_persistence_store.md`` §4 and
 ``document.json`` (Doc 03 schema, ``ensure_ascii=False``) plus ``assets/*``.
 Saves go through ``<path>.tmp`` → ``os.replace`` so a failure leaves the
 previous archive untouched and no ``.tmp`` residue.
+
+Round 5 (Doc 02 §9.3) extensions: :meth:`attach_index` binds the
+``LocalCanvasIndex`` (the index is constructed with this store for ZIP I/O,
+then attached — no import cycle), ``open_payload`` persists wire documents
+into that index BEFORE switching the UI (persist-on-open, LWW per §9.1), and
+focused saves refresh the matching ``index.json`` row so the hub store never
+drifts from its archives.
 """
 
 from __future__ import annotations
@@ -203,6 +210,7 @@ class DocumentStore:
         self._current_path: Path | None = None
         self._dirty = False
         self._transfers: dict[str, _Transfer] = {}
+        self._index: object | None = None  # LocalCanvasIndex (late attach, §9.3)
         bus.on(RPC_MESSAGE, self._on_rpc)
         bus.on(COMMITTED_NODE, self._mark_dirty)
         bus.on(ARTBOARD_CHANGED, self._mark_dirty)
@@ -241,20 +249,7 @@ class DocumentStore:
         """Unzip ``.slatesync`` → ``CanvasDocument``; rebuild the scene graph and
         emit ``DOCUMENT_LOADED`` exactly once with clean state already set."""
         path = Path(path)
-        with zipfile.ZipFile(path, "r") as archive:
-            try:
-                raw = archive.read("document.json")
-            except KeyError as exc:
-                raise ValueError(f"{path}: archive missing document.json") from exc
-            doc = _doc_from_json(json.loads(raw.decode("utf-8")))
-            asset_entries = [
-                (info, archive.read(info))
-                for info in archive.infolist()
-                if not info.is_dir()
-                and info.filename not in ("", ".")
-                and Path(info.filename).name not in ("", ".", "..")
-                and info.filename.replace("\\", "/").startswith("assets/")
-            ]
+        doc, asset_entries = self._read_archive(path)
         if asset_entries:
             dest_dir = self.assets_dir(doc.canvas_id)
             for info, blob in asset_entries:
@@ -269,6 +264,63 @@ class DocumentStore:
         self._bus.emit(DOCUMENT_LOADED, doc=doc)  # state set BEFORE emit (Doc 10 §4)
         return doc
 
+    # ------------------------------------------------------------------
+    # Round 5 (Doc 02 §9.3) — side-effect-free I/O + local index binding
+    # ------------------------------------------------------------------
+    def _read_archive(
+        self, path: Path
+    ) -> tuple[CanvasDocument, list[tuple[zipfile.ZipInfo, bytes]]]:
+        """Shared ZIP parse for :meth:`open`/:meth:`read_archive` (no side effects)."""
+        with zipfile.ZipFile(path, "r") as archive:
+            try:
+                raw = archive.read("document.json")
+            except KeyError as exc:
+                raise ValueError(f"{path}: archive missing document.json") from exc
+            doc = _doc_from_json(json.loads(raw.decode("utf-8")))
+            asset_entries = [
+                (info, archive.read(info))
+                for info in archive.infolist()
+                if not info.is_dir()
+                and info.filename not in ("", ".")
+                and Path(info.filename).name not in ("", ".", "..")
+                and info.filename.replace("\\", "/").startswith("assets/")
+            ]
+        return doc, asset_entries
+
+    def read_archive(self, path: Path) -> CanvasDocument:
+        """Parse a ``.slatesync`` archive with NO state changes: no scene
+        rebuild, no current-path switch, no ``DOCUMENT_LOADED`` emit and no
+        asset extraction (round 5: ``LocalCanvasIndex.load`` serves
+        ``CANVAS_PULL`` replies without ever touching the open document)."""
+        doc, _asset_entries = self._read_archive(Path(path))
+        return doc
+
+    @staticmethod
+    def parse_document(data: dict) -> CanvasDocument:
+        """Validate + parse a wire/JSON document body without loading it
+        (round 5: ``CANVAS_PUT`` persists through this before any switch)."""
+        if not isinstance(data, dict):
+            raise ValueError("parse_document() needs a document object")
+        return _doc_from_json(data)
+
+    @staticmethod
+    def document_to_json(doc: CanvasDocument) -> dict:
+        """Frozen ``document.json`` body for a document (round 5: ``CANVAS_PUT``
+        replies carry this; key order matches :meth:`save`)."""
+        return _doc_to_json(doc)
+
+    def attach_index(self, index) -> None:
+        """Bind the ``LocalCanvasIndex`` after construction (the index takes
+        this store for ZIP I/O, so the reference is attached late). Enables
+        persist-on-open in :meth:`open_payload` and the ``index.json`` row
+        refresh after focused saves."""
+        self._index = index
+
+    @property
+    def index(self):
+        """The attached ``LocalCanvasIndex``, or None (persistence disabled)."""
+        return self._index
+
     def open_payload(self, data: dict) -> CanvasDocument:
         """Load a full Doc 03 document from a wire dict (Doc 02 §8.2 dialect).
 
@@ -277,10 +329,24 @@ class DocumentStore:
         ``DOCUMENT_LOADED`` exactly once (state set before the emit). The
         document came off the wire, so ``current_path`` becomes ``None`` — a
         tablet canvas is never autosaved into a PC-local archive.
+
+        Persist-on-open (round 5, Doc 02 §9.3): when an index is attached,
+        the document is stored into the hub index FIRST — LWW per §9.1 via
+        ``save_document_if_newer`` (equal keeps local, older never overwrites)
+        — and only then does the scene switch below. A persistence failure is
+        logged and the switch still proceeds (ordering rule, not atomicity);
+        without an attached index this is a no-op.
         """
         if not isinstance(data, dict):
             raise ValueError("open_payload() needs a document object")
         doc = _doc_from_json(data)
+        if self._index is not None:
+            try:
+                self._index.save_document_if_newer(doc, source="device")
+            except Exception:
+                logger.exception(
+                    "persist-on-open failed for %s; document still opened", doc.canvas_id
+                )
         self._scene.replace_all(doc.elements)
         self._scene.set_artboard(doc.artboard)
         with self._lock:
@@ -304,13 +370,16 @@ class DocumentStore:
         dest.mkdir(parents=True, exist_ok=True)
         return dest
 
-    def autosave_tick(self) -> None:
+    def autosave_tick(self) -> bool:
         """Called every ``config.autosave_interval_s`` by main.py's single timer:
-        save only when dirty AND a current doc AND a destination exist."""
+        save only when dirty AND a current doc AND a destination exist.
+        Round 5: returns True when a save happened so main.py can rebroadcast
+        the hub ``CANVAS_LIST`` (§9.2 — the hub store changed)."""
         with self._lock:
             if not self._dirty or self._current is None or self._current_path is None:
-                return
+                return False
             self._save(self._current, self._current_path)
+            return True
 
     # ------------------------------------------------------------------
     # Doc-specific API & contracts (frozen)
@@ -480,27 +549,76 @@ class DocumentStore:
     # Atomic archive I/O
     # ------------------------------------------------------------------
     def _save(self, doc: CanvasDocument, path: Path) -> Path:
-        """Serialize + atomic replace. Caller must hold ``self._lock`` (single writer)."""
-        doc.updated_at = int(time.time())
-        doc.elements = self._scene.nodes()
-        doc.content_bounds = self._scene.content_bounds()
-        text = json.dumps(_doc_to_json(doc), ensure_ascii=False)
-        tmp = Path(str(path) + ".tmp")
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-                archive.writestr("document.json", text)
-                assets_root = self.assets_dir(doc.canvas_id)
-                for file in sorted(assets_root.rglob("*")):
-                    if file.is_file():
-                        arcname = "assets/" + file.relative_to(assets_root).as_posix()
-                        archive.write(file, arcname=arcname)
-            os.replace(tmp, path)
-        except Exception:
-            tmp.unlink(missing_ok=True)
-            logger.exception("save to %s failed; original untouched", path)
-            raise
-        self._current = doc
-        self._current_path = path
-        self._dirty = False
+        """Doc 10 frozen save semantics — stamp + sync scene + focus (see
+        :meth:`write_archive` for the round-5 knobs)."""
+        return self.write_archive(doc, path)
+
+    def write_archive(
+        self,
+        doc: CanvasDocument,
+        path: Path,
+        *,
+        stamp_updated: bool = True,
+        sync_scene: bool = True,
+        focus: bool = True,
+    ) -> Path:
+        """Serialize + atomic replace (``<path>.tmp`` → ``os.replace``); failure
+        logs, unlinks the tmp file and re-raises — the original stays untouched.
+
+        Defaults reproduce the Doc 10 contract (single-writer under
+        ``self._lock``): stamp ``updated_at``, pull elements/bounds from the
+        injected SceneGraph, and focus the currently-open document as clean.
+        ``LocalCanvasIndex.save_document`` persists received wire documents
+        with ``stamp_updated=False, sync_scene=False, focus=False`` so the LWW
+        timestamp stays authoritative, the open scene never leaks into a silent
+        save, and current-document/autosave state is untouched. After a
+        focused save the matching ``index.json`` row (when one exists, or when
+        the archive lives inside the index directory) is refreshed.
+        """
+        with self._lock:
+            if stamp_updated:
+                doc.updated_at = int(time.time())
+            if sync_scene:
+                doc.elements = self._scene.nodes()
+                doc.content_bounds = self._scene.content_bounds()
+            text = json.dumps(_doc_to_json(doc), ensure_ascii=False)
+            tmp = Path(str(path) + ".tmp")
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                    archive.writestr("document.json", text)
+                    assets_root = self.assets_dir(doc.canvas_id)
+                    for file in sorted(assets_root.rglob("*")):
+                        if file.is_file():
+                            arcname = "assets/" + file.relative_to(assets_root).as_posix()
+                            archive.write(file, arcname=arcname)
+                os.replace(tmp, path)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                logger.exception("save to %s failed; original untouched", path)
+                raise
+            if focus:
+                self._current = doc
+                self._current_path = path
+                self._dirty = False
+                self._refresh_index_row(doc, path)
         return path
+
+    def _refresh_index_row(self, doc: CanvasDocument, path: Path) -> None:
+        """Keep ``index.json`` in step with a hub-store archive (§9.3).
+
+        Runs only when the index has a row for this canvas OR the archive
+        lives inside the index directory — opening/autosaving a PC-local file
+        elsewhere never creates index rows (File → "Open local file…" stays
+        index-free). Always called with ``self._lock`` held (lock order:
+        store → index).
+        """
+        if self._index is None:
+            return
+        try:
+            in_index_dir = Path(path).parent.resolve() == Path(self._index.directory).resolve()
+            if not in_index_dir and self._index.get(doc.canvas_id) is None:
+                return
+            self._index.refresh_row(doc)
+        except Exception:
+            logger.exception("index row refresh failed for %s", doc.canvas_id)

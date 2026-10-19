@@ -1,11 +1,11 @@
 """Round-4 contract tests (Doc 02 §8) — schema ⇄ validator ⇄ protocol ⇄ doc.
 
 * ``validate_specs.py`` derives the expected action set from
-  ``ws_rpc_schema.json`` itself (no hardcoded 13/14/17) — proven both ways:
+  ``ws_rpc_schema.json`` itself (no hardcoded count) — proven both ways:
   corrupted action sets are rejected, consistently-removed ones still pass.
 * The embedded JSON body in Doc 02 §5 (Step 8) stays byte-identical with the
   schema file (mechanical sync required by §8.5).
-* ``pc_agent.core.protocol.RPC_ACTIONS`` mirrors the schema's 17 actions.
+* ``pc_agent.core.protocol.RPC_ACTIONS`` mirrors the schema's 19 actions.
 """
 
 from __future__ import annotations
@@ -55,9 +55,9 @@ def test_real_schema_validates_clean() -> None:
     assert _VALIDATOR.main([str(_SCHEMA_PATH.parent)]) == 0
 
 
-def test_seventeen_actions_in_enum_and_canvas_lifecycle_group(schema: dict) -> None:
+def test_nineteen_actions_in_enum_and_canvas_lifecycle_group(schema: dict) -> None:
     actions = schema["envelope"]["action"]["enum"]
-    assert len(actions) == 17
+    assert len(actions) == 19
     assert set(actions) == set(RPC_ACTIONS)
     canvas_actions = set(schema["type_actions"]["CANVAS_LIFECYCLE"])
     assert canvas_actions == {
@@ -65,8 +65,11 @@ def test_seventeen_actions_in_enum_and_canvas_lifecycle_group(schema: dict) -> N
         "CANVAS_LIST_REQUEST",
         "CANVAS_LIST",
         "CANVAS_OPEN_REQUEST",
+        # Doc 02 §9.1 — round 5 hub sync.
+        "CANVAS_PUT",
+        "CANVAS_PULL",
     }
-    # §8.1: the union of the groups IS the enum (validator self-derivation).
+    # §8.1/§9.1: the union of the groups IS the enum (validator self-derivation).
     union = {a for group in schema["type_actions"].values() for a in group}
     assert union == set(actions)
 
@@ -78,6 +81,8 @@ def test_payload_schemas_cover_the_canvas_sync_actions(schema: dict) -> None:
         "CANVAS_LIST_REQUEST",
         "CANVAS_LIST",
         "CANVAS_OPEN_REQUEST",
+        "CANVAS_PUT",
+        "CANVAS_PULL",
     }
     open_canvas = schemas["OPEN_CANVAS"]
     assert open_canvas["discriminator"] == "canvas"
@@ -85,6 +90,13 @@ def test_payload_schemas_cover_the_canvas_sync_actions(schema: dict) -> None:
     assert open_canvas["dialects"]["path"]["direction"] == "pc_internal_only"
     for action in ("CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST"):
         assert schemas[action]["direction"] in ("pc_to_tablet", "tablet_to_pc")
+    # §9.1 payload schemas: CANVAS_PUT {canvas, source} / CANVAS_PULL {id, have}.
+    assert schemas["CANVAS_PUT"]["direction"] == "any_to_any"
+    assert schemas["CANVAS_PUT"]["required"] == ["canvas", "source"]
+    assert schemas["CANVAS_PUT"]["properties"]["source"]["enum"] == ["device", "hub"]
+    assert schemas["CANVAS_PULL"]["direction"] == "any_to_any"
+    assert schemas["CANVAS_PULL"]["required"] == ["canvas_id", "have_updated_at"]
+    assert schemas["CANVAS_PULL"]["properties"]["have_updated_at"]["unit"] == "unix_seconds"
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +154,24 @@ def test_group_missing_from_enum_is_rejected() -> None:
     assert any("missing ['EXPORT_SUMMARY']" in e for e in errors)
 
 
+def test_round5_action_dropped_from_group_is_rejected() -> None:
+    """§9.1: losing CANVAS_PUT from the group ⇔ enum has an unexpected action."""
+
+    def mutate(spec: dict) -> None:
+        spec["type_actions"]["CANVAS_LIFECYCLE"].remove("CANVAS_PUT")
+
+    errors = _validate(mutate)
+    assert any("unexpected ['CANVAS_PUT']" in e for e in errors)
+
+
+def test_round5_action_missing_from_enum_is_rejected() -> None:
+    def mutate(spec: dict) -> None:
+        spec["envelope"]["action"]["enum"].remove("CANVAS_PULL")
+
+    errors = _validate(mutate)
+    assert any("missing ['CANVAS_PULL']" in e for e in errors)
+
+
 def test_payload_schema_for_unknown_action_is_rejected() -> None:
     def mutate(spec: dict) -> None:
         spec["payload_schemas"]["CANVAS_LIST_X"] = {"type": "object"}
@@ -183,7 +213,11 @@ def test_doc02_step5_body_is_byte_identical_to_schema_file() -> None:
     )
 
 
-def test_doc02_embedded_body_parses_and_carries_the_17_actions() -> None:
+def test_doc02_embedded_body_parses_and_carries_the_19_actions() -> None:
     embedded = json.loads(_embedded_body())
     assert embedded == json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
-    assert len(embedded["envelope"]["action"]["enum"]) == 17
+    assert len(embedded["envelope"]["action"]["enum"]) == 19
+    assert set(embedded["type_actions"]["CANVAS_LIFECYCLE"]) >= {
+        "CANVAS_PUT",
+        "CANVAS_PULL",
+    }

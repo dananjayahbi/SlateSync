@@ -27,9 +27,13 @@ datas = [
 
 # --- datas: CustomTkinter themes/assets + runtime icon (only if present) -----
 datas += collect_data_files("customtkinter")
+# Issue 06: brand assets — .ico for iconbitmap (EXE icon too) and the 64 px
+# PNG fallback StudioWindow._apply_window_icon uses via wm iconphoto.
+for brand_asset in ("slatesync.ico", "slatesync_64.png"):
+    brand_path = ROOT / "pc_agent" / "assets" / brand_asset
+    if exists(str(brand_path)):
+        datas.append((str(brand_path), "pc_agent/assets"))
 icon_path = ROOT / "pc_agent" / "assets" / "slatesync.ico"
-if exists(str(icon_path)):
-    datas.append((str(icon_path), "pc_agent/assets"))
 icon = str(icon_path) if exists(str(icon_path)) else None  # EXE icon= guard
 
 # Issue 05: version resource (FileDescription/ProductName "SlateSync").

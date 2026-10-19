@@ -23,6 +23,9 @@ from pc_agent.viewport.stroke_tessellator import (
     build_strip,
     catmull_rom_to_bezier,
     compute_half_widths,
+    flatten_stroke_path,
+    is_cubic_chain,
+    sample_cubic_chain,
     sample_path,
     sample_segment,
     spline_control_points,
@@ -134,6 +137,104 @@ def test_sample_path_dedups_shared_segment_joints() -> None:
     assert len(path) == sum(raw_counts) - (len(segments) - 1)
     assert path[0] == pytest.approx((0.0, 0.0))
     assert path[-1] == pytest.approx((80.0, 0.0))
+
+
+# ---------------------------------------------------------------------------
+# Always-run: Doc 21 chain layout detection + exact-chain flattening
+# (issue 05 round 5 — committed nodes must never re-fit chains as anchors)
+# ---------------------------------------------------------------------------
+
+
+def _chain_of(anchors: list[tuple[float, float]]) -> list[list[float]]:
+    """Doc 21 §4 chain from anchors: ``[P0, c1, c2, P1, …]`` (τ = 0.5)."""
+    out = [[float(anchors[0][0]), float(anchors[0][1])]]
+    n = len(anchors)
+    for i in range(n - 1):
+        p1, p2 = anchors[i], anchors[i + 1]
+        p0 = anchors[i - 1] if i > 0 else p1
+        p3 = anchors[i + 2] if i + 2 < n else p2
+        c1 = (p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0)
+        c2 = (p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0)
+        out.extend(([c1[0], c1[1]], [c2[0], c2[1]], [float(p2[0]), float(p2[1])]))
+    return out
+
+
+@pytest.mark.parametrize(
+    ("point_count", "expect_chain"),
+    [(2, False), (3, False), (4, True), (5, True), (6, False),
+     (7, True), (8, True), (9, False), (10, True)],
+)
+def test_is_cubic_chain_matches_frozen_doc21_contract(
+    point_count: int, expect_chain: bool
+) -> None:
+    pts = [(float(i), 0.0) for i in range(point_count)]
+    assert is_cubic_chain(pts) is expect_chain
+
+
+def test_sample_cubic_chain_walks_exact_cubics_and_dedups_joints() -> None:
+    # Straight chain: control points sit ON the chord ⇒ every sample collinear.
+    chain = _chain_of([(0.0, 0.0), (90.0, 0.0), (180.0, 0.0)])
+    assert is_cubic_chain(chain) and len(chain) == 7  # 3k − 2
+    samples = sample_cubic_chain(chain, step_px=4.0, scale=1.0)
+    assert samples[0] == pytest.approx((0.0, 0.0))
+    assert samples[-1] == pytest.approx((180.0, 0.0))
+    for x, y in samples:
+        assert y == pytest.approx(0.0, abs=1e-6)
+        assert -1e-6 <= x <= 180.0 + 1e-6
+    # joint-dedup: strictly increasing x on the straight line (no repeats)
+    xs = [p[0] for p in samples]
+    assert all(b > a for a, b in zip(xs, xs[1:]))
+    # the anchor vertices themselves must be interpolated exactly
+    for anchor in ((0.0, 0.0), (90.0, 0.0), (180.0, 0.0)):
+        assert any(
+            p[0] == pytest.approx(anchor[0]) and p[1] == pytest.approx(anchor[1])
+            for p in samples
+        ), f"anchor {anchor} missing from chain samples"
+
+
+def test_flatten_stroke_path_identity_for_non_chain_layouts() -> None:
+    # n ≤ 3 and n ≡ 0 (mod 3) polylines are anchors — returned unchanged.
+    for pts in ([(0.0, 0.0), (40.0, 0.0)],
+                [(0.0, 0.0), (40.0, 0.0), (80.0, 0.0)],
+                [(0.0, 0.0), (10.0, 0.0), (20.0, 0.0), (30.0, 0.0),
+                 (40.0, 0.0), (50.0, 0.0)]):
+        flat = flatten_stroke_path(pts, step_px=4.0, scale=1.0)
+        assert flat == [(float(x), float(y)) for x, y in pts]
+
+
+def test_flatten_stroke_path_chain_stays_inside_control_hull() -> None:
+    anchors = [(0.0, 0.0), (160.0, 60.0), (320.0, -40.0), (480.0, 80.0)]
+    chain = _chain_of(anchors)
+    flat = flatten_stroke_path(chain, step_px=4.0, scale=1.0)
+    # densified, endpoints preserved, anchors interpolated
+    assert len(flat) > len(chain)
+    assert flat[0] == pytest.approx(anchors[0])
+    assert flat[-1] == pytest.approx(anchors[-1])
+    for ax, ay in anchors:
+        assert any(
+            abs(x - ax) < 1e-6 and abs(y - ay) < 1e-6 for x, y in flat
+        ), f"anchor {(ax, ay)} not interpolated"
+    # exact cubic sampling NEVER leaves the control hull (the whole point —
+    # re-fitting controls as Catmull-Rom anchors overshoots by tens of units)
+    xs = [p[0] for p in chain]
+    ys = [p[1] for p in chain]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    for x, y in flat:
+        assert x0 - 1e-6 <= x <= x1 + 1e-6
+        assert y0 - 1e-6 <= y <= y1 + 1e-6
+    # control-hull bbox is strictly larger than the anchor bbox here ⇒ the
+    # chain-vs-anchor ambiguity is real, and sampling stays on the true path
+    ax0 = min(a[0] for a in anchors)
+    assert x0 <= ax0
+
+
+def test_flatten_stroke_path_appends_trailing_point_layout() -> None:
+    # Frozen n ≡ 2 (mod 3) contract: chain + one trailing anchor point.
+    chain = _chain_of([(0.0, 0.0), (90.0, 0.0)]) + [[200.0, 5.0]]
+    assert len(chain) == 5 and is_cubic_chain(chain)
+    flat = flatten_stroke_path(chain, step_px=4.0, scale=1.0)
+    assert flat[0] == pytest.approx((0.0, 0.0))
+    assert flat[-1] == pytest.approx((200.0, 5.0))
 
 
 # ---------------------------------------------------------------------------

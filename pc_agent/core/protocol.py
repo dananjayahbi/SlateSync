@@ -46,6 +46,9 @@ RPC_ACTIONS: Final = frozenset(
         "CANVAS_LIST_REQUEST",
         "CANVAS_LIST",
         "CANVAS_OPEN_REQUEST",
+        # Doc 02 §9.1 — Hub Sync & Multi-Device Extension (19 actions).
+        "CANVAS_PUT",
+        "CANVAS_PULL",
     }
 )
 

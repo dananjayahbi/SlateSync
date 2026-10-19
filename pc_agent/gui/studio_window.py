@@ -1,6 +1,7 @@
 """Dark-mode CustomTkinter desktop shell of the PC agent (Doc 16 §4 freeze).
 
 Layout: TOP HUD (connection badge / zoom / artboard preset / QR button),
+LEFT gallery strip (Issue 03-PC, docked col 0, hidden until paired),
 CENTER OpenGL viewport via Doc 06 ``GLCanvasHost.mount``, BOTTOM export bar
 (format/DPI/target combos, Start, progress, Open-in-Explorer) plus the
 File/View/Help menu. Export execution reaches Doc 15 **only** through the
@@ -16,11 +17,13 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import time
 import tkinter as tk
 import uuid
 from collections import deque
+from pathlib import Path
 from tkinter import filedialog, messagebox
 from typing import TYPE_CHECKING, Callable
 
@@ -39,6 +42,7 @@ from pc_agent.core.events import (
     PAIRING_INFO,
     EventBus,
 )
+from pc_agent.gui.canvas_gallery_panel import CanvasGalleryPanel
 
 if TYPE_CHECKING:  # Doc 06 GLCanvasHost — consumed, never redefined
     from pc_agent.viewport.gl_canvas_host import GLCanvasHost
@@ -62,6 +66,35 @@ _DRAG_CLEAR_MS = 300  # Issue 04: silence window this long after the last move
 # share the same guarantee); size-only geometry preserves a caller-set +x+y.
 _DEFAULT_GEOMETRY = "1280x800"
 _DEFAULT_MINSIZE = (800, 560)
+
+_ASSET_NAMES = ("slatesync.ico", "slatesync_64.png")  # Issue 06 branding
+
+
+def _branding_asset(name: str) -> Path | None:
+    """Resolve ``pc_agent/assets/<name>`` for source and frozen (onedir) runs.
+
+    Source: repo-relative next to this package. Frozen (PyInstaller): datas are
+    collected under ``pc_agent/assets`` inside ``_internal/`` (next to the
+    exe) or inside ``sys._MEIPASS`` (onefile / `_internal` prefix), so both
+    layouts are probed in order. ``None`` when the asset is absent — callers
+    fall back instead of raising.
+    """
+    if getattr(sys, "frozen", False):  # pragma: no cover - exercised in bundles
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates = [
+            Path(getattr(sys, "_MEIPASS", exe_dir)) / "pc_agent" / "assets" / name,
+            exe_dir / "_internal" / "pc_agent" / "assets" / name,
+            exe_dir / "pc_agent" / "assets" / name,
+        ]
+    else:
+        candidates = [Path(__file__).resolve().parent.parent / "assets" / name]
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:  # pragma: no cover - unreadable mount
+            continue
+    return None
 
 
 def _move_loop_active() -> bool:
@@ -145,6 +178,20 @@ class StudioWindow:
         self._open_btn: ctk.CTkButton | None = None
         self._progress: ctk.CTkProgressBar | None = None
         self._menubar: tk.Menu | None = None
+
+        # Issue 03-PC: left gallery strip (None until build(); hidden until
+        # a device pairs AND the hub list is non-empty — Issue 02/03 spirit).
+        self._gallery: CanvasGalleryPanel | None = None
+
+        # Issue 02: pairing state driving the Pair / QR button visibility
+        # (devices comes from CANVAS_LIST_UPDATED, connected from the badge
+        # path — either signal alone hides the button).
+        self._devices = 0
+        self._connected = False
+
+        # Issue 06: applied branding icon (for tests/diagnostics).
+        self._icon_applied: str | None = None
+        self._icon_photos: list[tk.PhotoImage] = []  # keep refs (Tk GC rule)
 
         # QR dialog state
         self._qr_dialog: ctk.CTkToplevel | None = None
@@ -246,7 +293,13 @@ class StudioWindow:
     # Frozen public API (template §4)
     # ------------------------------------------------------------------
     def build(self, parent: tk.Misc) -> None:
-        """Grid the HUD / viewport / export bar + menu on ``parent`` (§5.2)."""
+        """Grid the HUD / gallery / viewport / export bar + menu on ``parent``.
+
+        Issue 03-PC: the gallery strip takes grid col 0 (fixed width, hidden
+        until paired) and the Doc 06 viewport moves to col 1 — the center row
+        keeps ``weight=1`` so the viewport still fills the window; HUD and
+        export bar span both columns. Default geometry is unchanged.
+        """
         if self._root is not None:
             return
         self._parent = parent
@@ -267,12 +320,27 @@ class StudioWindow:
         except Exception:  # pragma: no cover - root gone mid-build
             self._drag_pos = None
 
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1)
-        self._build_hud().grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        self._build_center().grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
-        self._build_export_bar().grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 8))
+        # Issue 06: brand the window before it maps (see helper).
+        self._apply_window_icon(self._root)
+
+        parent.grid_columnconfigure(0, weight=0)  # gallery strip (fixed)
+        parent.grid_columnconfigure(1, weight=1)  # viewport fills
+        parent.grid_rowconfigure(1, weight=1)  # center row keeps the weight
+        self._build_hud().grid(
+            row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=(8, 4)
+        )
+        self._gallery = CanvasGalleryPanel(
+            parent, open_request=self._open_request
+        )
+        self._gallery.mount(row=1, column=0, sticky="nsw", padx=(8, 0), pady=4)
+        self._build_center().grid(
+            row=1, column=1, sticky="nsew", padx=8, pady=4
+        )
+        self._build_export_bar().grid(
+            row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8)
+        )
         self._build_menu()
+        self._refresh_pairing_affordance()
         self._start_poller()
 
     def show(self) -> None:
@@ -283,16 +351,67 @@ class StudioWindow:
         """Withdraw; self-marshalled when called from the tray thread."""
         self._marshal(self._hide_impl)
 
+    # ------------------------------------------------------------------
+    # Issue 06: real window logo (root + QR dialog)
+    # ------------------------------------------------------------------
+    def _apply_window_icon(self, window: tk.Misc) -> str | None:
+        """Brand ``window`` with the SlateSync icon; returns "ico"/"png"/None.
+
+        ``slatesync.ico`` is resolved repo-relative from source and from the
+        PyInstaller bundle (``sys._MEIPASS`` / ``_internal/``) when frozen —
+        see ``_branding_asset``. Falls back to ``wm iconphoto`` from the
+        ``slatesync_64.png`` kept alongside the .ico when iconbitmap fails
+        (e.g. non-Windows or a missing .ico). Any Tk error is swallowed: a
+        missing brand asset must never break window construction.
+        """
+        # Hold the PhotoImage alive for the window's lifetime (Tk GC rule).
+        def _photo(path: Path) -> tk.PhotoImage | None:
+            try:
+                image = tk.PhotoImage(file=str(path))
+            except tk.TclError:
+                logger.debug("iconphoto load failed for %s", path)
+                return None
+            self._icon_photos.append(image)
+            return image
+
+        ico = _branding_asset(_ASSET_NAMES[0])
+        if ico is not None:
+            try:
+                window.iconbitmap(str(ico))  # CTk override sets its own flag too
+                self._icon_applied = "ico"
+                return "ico"
+            except tk.TclError:
+                logger.debug("iconbitmap failed for %s", ico)
+        png = _branding_asset(_ASSET_NAMES[1])
+        if png is not None:
+            image = _photo(png)
+            if image is not None:
+                try:
+                    window.tk.call("wm", "iconphoto", window, "-default", image)
+                    self._icon_applied = "png"
+                    return "png"
+                except tk.TclError:
+                    logger.debug("iconphoto failed for %s", png)
+        self._icon_applied = None
+        return None
+
     def set_connection_state(self, connected: bool, peer: str | None) -> None:
-        """Badge flip: CONNECTED / WAITING / ERROR (colours per §4)."""
+        """Badge flip: CONNECTED / WAITING / ERROR (colours per §4).
+
+        Issue 02: also re-evaluates Pair / QR button visibility — the button is
+        hidden while a connection is up (or the hub reports ``devices >= 1``)
+        and shown again once nothing is paired.
+        """
         if connected:
             text, colour = "CONNECTED", _CONNECTED_BG
         elif peer:
             text, colour = "ERROR", _ERROR_BG
         else:
             text, colour = "WAITING", _WAITING_BG
+        self._connected = bool(connected)
         if self._badge is not None:
             self._badge.configure(text=text, fg_color=colour)
+        self._refresh_pairing_affordance()
 
     def open_qr_dialog(self) -> None:
         """Raise the pairing dialog rendering PAIRING_INFO (§5.7)."""
@@ -306,6 +425,9 @@ class StudioWindow:
             dialog.geometry("260x340")
             dialog.resizable(False, False)
             dialog.protocol("WM_DELETE_WINDOW", self._close_qr_dialog)
+            # Issue 06: brand the Toplevel (Tk usually inherits the owner's
+            # icon, but apply explicitly so it is verifiable either way).
+            self._apply_window_icon(dialog)
             self._qr_dialog = dialog
             self._qr_image_label = ctk.CTkLabel(dialog, text="")
             self._qr_image_label.pack(padx=20, pady=(20, 8))
@@ -448,8 +570,10 @@ class StudioWindow:
     ) -> None:
         self.after(0, self._apply_pairing_info, ipv4, port, token, qr_png_path)
 
-    def _on_canvas_list_updated(self, canvases=None, **_extra) -> None:
-        self.after(0, self._apply_canvas_list, canvases)
+    def _on_canvas_list_updated(self, canvases=None, devices=None, **_extra) -> None:
+        # Frozen v2 payload (Doc 02 §9): {canvases, devices}. ``devices`` is
+        # optional so older/no-device emits still land (Issue 02 default: none).
+        self.after(0, self._apply_canvas_list, canvases, devices)
 
     # ------------------------------------------------------------------
     # Tk-thread appliers
@@ -461,11 +585,17 @@ class StudioWindow:
         self.update_hud(1.0, preset)
         if self._start_btn is not None:
             self._start_btn.configure(state="normal")
+        # Issue 03-PC: highlight the row for the canvas now open in the viewport.
+        if self._gallery is not None:
+            self._gallery.set_current(self._canvas_id)
 
     def _apply_artboard_changed(self, artboard) -> None:
         preset = self._preset_of(artboard)
         if preset:
             self.update_hud(self._last_scale, preset)
+        # Artboard switches may follow a canvas swap — re-assert the highlight.
+        if self._gallery is not None:
+            self._gallery.set_current(self._canvas_id)
 
     def _apply_export_started(self) -> None:
         if self._progress is not None:
@@ -501,9 +631,46 @@ class StudioWindow:
         if dialog is not None and dialog.winfo_exists():
             self._render_qr()  # re-render while open (§5.7)
 
-    def _apply_canvas_list(self, canvases) -> None:
-        """Tk-thread cache of the tablet's CANVAS_LIST rows (Doc 02 §8.1)."""
+    def _apply_canvas_list(self, canvases, devices=None) -> None:
+        """Tk-thread cache of the hub's CANVAS_LIST rows (Doc 02 §8.1/§9).
+
+        Issue 02/03-PC: store the frozen ``devices`` count (kept when absent)
+        and refresh the Pair / QR visibility + gallery strip.
+        """
         self._canvases = [dict(row) for row in canvases] if isinstance(canvases, list) else []
+        if devices is not None:
+            try:
+                self._devices = int(devices)
+            except (TypeError, ValueError):
+                logger.warning("bad CANVAS_LIST_UPDATED devices=%r", devices)
+        if self._gallery is not None:
+            self._gallery.set_rows(self._canvases)
+            self._gallery.set_current(self._canvas_id)
+        self._refresh_pairing_affordance()
+
+    # ------------------------------------------------------------------
+    # Issue 02/03-PC pairing affordances
+    # ------------------------------------------------------------------
+    def _refresh_pairing_affordance(self) -> None:
+        """Hide Pair / QR while paired; show/hide the gallery strip.
+
+        Paired = ``devices >= 1`` (frozen CANVAS_LIST_UPDATED count) OR the
+        connection badge says CONNECTED. The gallery needs paired AND a
+        non-empty canvas list (unpaired/empty → hidden entirely).
+        """
+        paired = self._devices >= 1 or self._connected
+        btn = self._qr_btn
+        if btn is not None:
+            try:
+                managed = bool(btn.winfo_manager())
+                if paired and managed:
+                    btn.pack_forget()  # hidden while a device is paired
+                elif not paired and not managed:
+                    btn.pack(side="right", padx=8, pady=6)
+            except tk.TclError:  # widget gone mid-teardown
+                logger.debug("QR affordance refresh skipped", exc_info=True)
+        if self._gallery is not None:
+            self._gallery.set_visible(bool(paired and self._canvases))
 
     # ------------------------------------------------------------------
     # Export bar actions (§5.5–5.6, §5.11)

@@ -60,6 +60,7 @@ from pc_agent.viewport.stroke_tessellator import (
     DEFAULT_STROKE_WIDTH,
     StrokeTessellator,
     TessellatedMesh,
+    flatten_stroke_path,
 )
 
 if TYPE_CHECKING:
@@ -1029,7 +1030,11 @@ class GLCanvasHost:
         )
         tess = self._tessellator
         tess.width_pressure_factor = 0.0  # committed payloads keep style.stroke_width base
-        mesh = tess.build_stroke(points, [1.0] * len(points), width)
+        # Doc 21 chain layout (issue 05 round 5): committed nodes carry Bézier
+        # control chains — tessellate the EXACT cubics, never re-fit controls
+        # as Catmull-Rom anchors (that wanders tens of world units off-path).
+        flat = flatten_stroke_path(points, scale=tess.scale)
+        mesh = tess.build_stroke(flat, [1.0] * len(flat), width)
         node_id = str(getattr(node, "node_id", "") or f"__node_{id(node)}")
         self._committed[node_id] = (mesh, color, blend_mode)
 

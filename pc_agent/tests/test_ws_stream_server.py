@@ -289,7 +289,7 @@ def test_envelope_shell_validation_matrix(server_env: Any) -> None:
     bad.append(_envelope(canvas_id=7))
     bad.append([base])  # valid JSON, not an envelope object
     good = _envelope(type="EXPORT_JOB", action="EXPORT_FINISHED", payload={"job_id": "j1"})
-    # Doc 02 §8: the three canvas-sync actions pass the shell matrix too.
+    # Doc 02 §8/§9: the canvas-sync actions pass the shell matrix too (19 total).
     canvas_good = [
         _envelope(type="CANVAS_LIFECYCLE", action="CANVAS_LIST_REQUEST", payload={}),
         _envelope(
@@ -301,6 +301,16 @@ def test_envelope_shell_validation_matrix(server_env: Any) -> None:
             type="CANVAS_LIFECYCLE",
             action="CANVAS_OPEN_REQUEST",
             payload={"canvas_id": "c-1"},
+        ),
+        _envelope(
+            type="CANVAS_LIFECYCLE",
+            action="CANVAS_PUT",
+            payload={"canvas": {}, "source": "hub"},
+        ),
+        _envelope(
+            type="CANVAS_LIFECYCLE",
+            action="CANVAS_PULL",
+            payload={"canvas_id": "c-1", "have_updated_at": 0},
         ),
     ]
 

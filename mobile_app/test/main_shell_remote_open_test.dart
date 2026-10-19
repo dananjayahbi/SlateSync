@@ -130,6 +130,24 @@ void main() {
     }
   }
 
+  /// Pumps real-event-loop windows until [condition] holds (or a safety
+  /// cap — the assertion afterwards then fails). Needed because Doc 02
+  /// §9.3's persist-before-switch chain (db probe + archive save + row
+  /// upsert) completes in real time of unknown depth under load.
+  Future<void> waitUntil(
+    WidgetTester tester,
+    bool Function() condition, {
+    int maxRounds = 50,
+  }) async {
+    for (int i = 0; i < maxRounds && !condition(); i++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 20)),
+      );
+      await tester.pump(const Duration(milliseconds: 60));
+    }
+    await tester.pumpAndSettle();
+  }
+
   testWidgets(
     'remote OPEN_CANVAS {canvas} navigates the real shell to the studio',
     (WidgetTester tester) async {
@@ -157,6 +175,14 @@ void main() {
       await flushReal(tester);
       await tester.pumpAndSettle();
 
+      // §9.3 (round 5): the bridge persists the incoming document (db
+      // probe + archive save + row upsert — real IO) BEFORE firing
+      // remoteOpen, so wait for the driven navigation instead of a fixed
+      // window count.
+      await waitUntil(
+        tester,
+        () => find.byType(CanvasStudioPage).evaluate().isNotEmpty,
+      );
       expect(find.byType(CanvasStudioPage), findsOneWidget);
       final CanvasStudioPage studio =
           tester.widget<CanvasStudioPage>(find.byType(CanvasStudioPage));
@@ -168,12 +194,14 @@ void main() {
       expect(fake.sent, isEmpty);
 
       // Back from the studio returns to the home gallery (the remote
-      // open pushed onto the home stack instead of stacking stale routes).
-      // `_onBack` awaits a full `_save()` (file + sqflite real IO) before
-      // popping — give the chain generous real-event-loop windows.
+      // open pushed onto the home stack instead of stacking stale
+      // routes). `_onBack` awaits a full `_save()` (file + sqflite real
+      // IO) before popping — wait for the studio to leave the tree.
       await tester.tap(find.byKey(const Key('studio-back')));
-      await flushReal(tester, rounds: 12);
-      await tester.pumpAndSettle();
+      await waitUntil(
+        tester,
+        () => find.byType(CanvasStudioPage).evaluate().isEmpty,
+      );
       expect(find.byType(CanvasStudioPage), findsNothing);
       expect(find.byType(HomeCanvasDashboard), findsOneWidget);
 

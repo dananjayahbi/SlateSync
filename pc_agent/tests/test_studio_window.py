@@ -35,7 +35,7 @@ from pc_agent.core.events import (
     PAIRING_INFO,
     EventBus,
 )
-from pc_agent.gui.studio_window import StudioWindow
+from pc_agent.gui.studio_window import StudioWindow, _branding_asset
 
 _MATRIX_EVENTS = [
     CONNECTION_STATE,
@@ -558,3 +558,114 @@ def test_open_request_unbound_is_logged_not_crashing(
             win._menu_open_synced()  # no open_request wired → warn, no dialog
         assert win._sync_dialog is None
         assert any("open_request" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 11. Issue 02 — Pair / QR visible only while unpaired
+# ---------------------------------------------------------------------------
+
+
+def test_pair_qr_button_visible_until_paired_then_hidden() -> None:
+    with _studio() as (root, win, bus, _gl, _submit):
+        # Unpaired at build: the button is packed in the HUD.
+        assert win._qr_btn is not None
+        assert win._qr_btn.winfo_manager() == "pack"
+
+        rows = [{"id": "c-1", "title": "T", "preset": "A4", "updated_at": 1760763600}]
+        # Frozen CANVAS_LIST_UPDATED devices >= 1 → hidden.
+        bus.emit(CANVAS_LIST_UPDATED, canvases=rows, devices=1)
+        assert _pump_until(root, lambda: win._qr_btn.winfo_manager() == "")
+        assert win._devices == 1
+
+        # Device leaves → visible again.
+        bus.emit(CANVAS_LIST_UPDATED, canvases=rows, devices=0)
+        assert _pump_until(root, lambda: win._qr_btn.winfo_manager() == "pack")
+
+        # The CONNECTION_STATE badge path alone also hides it…
+        bus.emit(CONNECTION_STATE, connected=True, peer=None)
+        assert _pump_until(root, lambda: win._qr_btn.winfo_manager() == "")
+
+        # …and disconnecting with no devices restores it.
+        bus.emit(CONNECTION_STATE, connected=False, peer=None)
+        assert _pump_until(root, lambda: win._qr_btn.winfo_manager() == "pack")
+
+        # open_qr_dialog keeps working while the button is shown.
+        win.open_qr_dialog()
+        assert win._qr_dialog is not None and win._qr_dialog.winfo_exists()
+        win._close_qr_dialog()
+        assert win._qr_dialog is None
+
+
+# ---------------------------------------------------------------------------
+# 12. Issue 06 — real window logo (root + QR dialog + bundle datas)
+# ---------------------------------------------------------------------------
+
+
+def test_build_applies_window_icon_from_branding_asset() -> None:
+    root = _make_root()
+    calls: list[Any] = []
+    original = root.iconbitmap
+
+    def spy(bitmap=None, default=None):  # wrap: iconstates() is not a Tk call
+        calls.append(bitmap)
+        return original(bitmap, default)
+
+    root.iconbitmap = spy  # type: ignore[method-assign]
+    win = StudioWindow(AppConfig(), _RecordingBus(), _FakeGLHost(), _SubmitSpy())
+    try:
+        win.build(root)
+        assert calls, "iconbitmap must be attempted during build"
+        assert any(str(path).endswith("slatesync.ico") for path in calls)
+        assert win._icon_applied == "ico"
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
+def test_qr_dialog_applies_window_icon(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[Any] = []
+    original = ctk.CTkToplevel.iconbitmap
+
+    def spy(self, bitmap=None, default=None):
+        calls.append(bitmap)
+        return original(self, bitmap, default)
+
+    monkeypatch.setattr(ctk.CTkToplevel, "iconbitmap", spy)
+    with _studio() as (root, win, _bus, _gl, _submit):
+        win.open_qr_dialog()
+        assert win._qr_dialog is not None
+        assert calls, "iconbitmap must be attempted on the QR dialog"
+        assert any(str(path).endswith("slatesync.ico") for path in calls)
+
+
+def test_window_icon_falls_back_to_png_iconphoto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    png = _branding_asset("slatesync_64.png")
+    assert png is not None and png.is_file()
+
+    def fake(name: str) -> Path | None:
+        return None if name.endswith(".ico") else png  # .ico unavailable → PNG
+
+    monkeypatch.setattr("pc_agent.gui.studio_window._branding_asset", fake)
+    with _studio() as (root, win, _bus, _gl, _submit):
+        assert win._icon_applied == "png"
+        assert win._icon_photos  # PhotoImage kept alive (Tk GC rule)
+        assert win._icon_photos[0].width() == 64
+
+
+def test_branding_assets_resolve_from_source_tree() -> None:
+    ico = _branding_asset("slatesync.ico")
+    png = _branding_asset("slatesync_64.png")
+    assert ico is not None and ico.is_file()
+    assert png is not None and png.is_file()
+    assert ico.parent == png.parent == ico.parents[1] / "assets"
+
+
+def test_spec_datas_include_both_branding_assets() -> None:
+    spec = Path(__file__).resolve().parents[1] / "installer" / "slatesync_agent.spec"
+    text = spec.read_text(encoding="utf-8")
+    assert '"slatesync.ico", "slatesync_64.png"' in text
+    assert "pc_agent/assets" in text

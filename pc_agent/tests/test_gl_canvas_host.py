@@ -622,6 +622,85 @@ def test_gl_entry_points_stay_on_the_main_thread_with_worker_submits() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Issue 05 round 5 — committed Doc 21 chains are flattened before tessellation
+# ---------------------------------------------------------------------------
+
+
+def _doc_chain(anchors: list[tuple[float, float]]) -> list[list[float]]:
+    """Doc 21 §4 chain ``[P0, c1, c2, P1, …]`` (τ = 0.5)."""
+    out = [[float(anchors[0][0]), float(anchors[0][1])]]
+    n = len(anchors)
+    for i in range(n - 1):
+        p1, p2 = anchors[i], anchors[i + 1]
+        p0 = anchors[i - 1] if i > 0 else p1
+        p3 = anchors[i + 2] if i + 2 < n else p2
+        c1 = (p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0)
+        c2 = (p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0)
+        out.extend(([c1[0], c1[1]], [c2[0], c2[1]], [float(p2[0]), float(p2[1])]))
+    return out
+
+
+def test_committed_chain_node_is_flattened_before_build_stroke() -> None:
+    """Issue 05: COMMITTED_NODE chains reach the tessellator as exact-cubic
+    samples — never as Catmull-Rom anchors (that is the stroke-tangle bug)."""
+    from pc_agent.engine.scene_graph import CanvasNode, NodeGeometry, NodeStyle
+    from pc_agent.viewport.stroke_tessellator import is_cubic_chain
+
+    _, _, host = _make_host()
+
+    class _RecordingTess:
+        width_pressure_factor = -1.0  # sentinel: _commit_node must zero it
+        scale = 1.0
+
+        def __init__(self) -> None:
+            self.calls: list[tuple[list, list, float, float]] = []
+
+        def build_stroke(self, points, pressure, width):
+            self.calls.append(
+                (list(points), list(pressure), float(width), self.width_pressure_factor)
+            )
+            return ("mesh", len(points))
+
+    tess = _RecordingTess()
+    host._tessellator = tess
+    host._stroke_program = object()  # non-None gate only — no GL on this path
+
+    anchors = [(0.0, 0.0), (160.0, 60.0), (320.0, -40.0), (480.0, 80.0)]
+    chain = _doc_chain(anchors)
+    assert is_cubic_chain(chain)
+    host._commit_node(
+        CanvasNode(
+            node_id="chain-1",
+            kind="STROKE",
+            bbox=(0.0, -40.0, 480.0, 80.0),
+            style=NodeStyle(color="#000000", stroke_width=7.0),
+            geometry=NodeGeometry(pts=chain),
+        )
+    )
+    points, pressure, width, wpf = tess.calls[-1]
+    assert len(points) > len(chain), "chain must be densified, not re-fitted"
+    assert points[0] == anchors[0] and points[-1] == anchors[-1]
+    assert width == 7.0, "committed strokes must use style.stroke_width"
+    assert wpf == 0.0, "committed strokes must keep constant (pressure-free) width"
+    assert pressure == [1.0] * len(points)
+
+    # Non-chain (anchor) nodes keep their exact point list through the path.
+    host._commit_node(
+        CanvasNode(
+            node_id="anchors-1",
+            kind="STROKE",
+            bbox=(0.0, 0.0, 80.0, 0.0),
+            style=NodeStyle(),
+            geometry=NodeGeometry(pts=[[0.0, 0.0], [40.0, 0.0], [80.0, 0.0]]),
+        )
+    )
+    pts2, pressure2, _, _ = tess.calls[-1]
+    assert pts2 == [(0.0, 0.0), (40.0, 0.0), (80.0, 0.0)]
+    assert pressure2 == [1.0, 1.0, 1.0]
+    assert "chain-1" in host._committed and "anchors-1" in host._committed
+
+
+# ---------------------------------------------------------------------------
 # Issue 03 — page boundary pixels through the real DOCUMENT_LOADED path
 # ---------------------------------------------------------------------------
 
