@@ -23,9 +23,12 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:mobile_app/canvas_engine/tiled_canvas_painter.dart';
 import 'package:mobile_app/core/models/canvas_models.dart';
 import 'package:mobile_app/core/storage/local_db.dart';
+import 'package:mobile_app/core/theme/studio_theme.dart';
 import 'package:mobile_app/features/canvas/canvas_studio_page.dart';
 import 'package:mobile_app/features/home/home_canvas_dashboard.dart';
 import 'package:mobile_app/network/vector_sync_client.dart';
+
+import 'support/recording_canvas.dart';
 
 // ---------------------------------------------------------------------------
 // Fake (Doc 25 surface — widget tests never touch the network)
@@ -307,6 +310,188 @@ void main() {
     await _disposeStudio(tester, client);
   });
 
+  testWidgets(
+      'one-finger drag paints a live stroke, commits it to the engine and '
+      'keeps it after zoom', (WidgetTester tester) async {
+    final _FakeSyncClient client = _FakeSyncClient();
+    await _pumpStudio(tester, client: client);
+
+    // Issue 02: the canvas viewport sits on white paper (`strokeCanvas`).
+    expect(
+      find.byWidgetPredicate(
+        (Widget w) => w is ColoredBox && w.color == StudioTheme.strokeCanvas,
+      ),
+      findsWidgets,
+    );
+
+    // Controlled one-finger drag: down → two decimation-safe moves.
+    final TestGesture drag = await tester.startGesture(const Offset(450, 350));
+    await tester.pump(const Duration(milliseconds: 16));
+    await drag.moveBy(const Offset(30, 10));
+    await tester.pump(const Duration(milliseconds: 16));
+    await drag.moveBy(const Offset(30, 20));
+    await tester.pump(const Duration(milliseconds: 16));
+
+    // (a) Live foreground stroke: above the static layer, default dark ink,
+    // non-null paints — and the painter really issues draw calls for the
+    // in-flight path.
+    final CustomPaint liveWidget = tester.widget<CustomPaint>(
+      find.byWidgetPredicate(
+        (Widget w) => w is CustomPaint && w.painter is ForegroundStrokePainter,
+      ),
+    );
+    final ForegroundStrokePainter live =
+        liveWidget.painter! as ForegroundStrokePainter;
+    expect(live.points, hasLength(greaterThan(1)));
+    expect(live.color, const Color(0xFF1E1E1E)); // Doc 24 default ink
+    expect(live.width, greaterThan(0));
+    expect(live.opacity, greaterThan(0));
+
+    final RecordingCanvas liveSpy = RecordingCanvas();
+    live.paint(liveSpy, const Size(800, 600));
+    expect(liveSpy.didCall('drawPath'), isTrue);
+    final Paint ink = liveSpy.paintsOf('drawPath').single;
+    // Dark ink on white paper — clearly visible (invisible on the old
+    // #0E0E0E / #121212 dark canvas: luminance ≈ 0.005 vs ≈ 0.005).
+    expect(ink.color.computeLuminance(), lessThan(0.05));
+
+    // The background layer renders the bounded A4 page on white paper with
+    // the documented soft drop shadow.
+    final CustomPaint bgWidget = tester.widget<CustomPaint>(
+      find.byWidgetPredicate(
+        (Widget w) => w is CustomPaint && w.painter is CanvasBackgroundPainter,
+      ),
+    );
+    final CanvasBackgroundPainter bg =
+        bgWidget.painter! as CanvasBackgroundPainter;
+    expect(bg.boundary, isNotNull); // bounded preset ⇒ frame + shadow
+    expect(bg.style, 'BLANK');
+    final RecordingCanvas bgSpy = RecordingCanvas();
+    bg.paint(bgSpy, const Size(800, 600));
+    expect(bgSpy.didCall('drawRect'), isTrue);
+    expect(
+      bgSpy.paintsOf('drawRect').map((Paint p) => p.color),
+      contains(StudioTheme.strokeCanvas), // white paper fill
+    );
+    expect(
+      bgSpy.paintsOf('drawRect').any((Paint p) => p.maskFilter != null),
+      isTrue, // feathered drop shadow (bounded presets only)
+    );
+
+    // (b) Finger up → StrokeProcessor.finish() → committed node in the
+    // engine (rebaked into its tile) + RPC fired.
+    await drag.up();
+    await tester.pump(const Duration(milliseconds: 16));
+
+    expect(_actions(client, 'ADD_STROKE'), hasLength(1));
+    const Rect allWorld = Rect.fromLTRB(-1e9, -1e9, 1e9, 1e9);
+    final TiledCanvasView view =
+        tester.widget<TiledCanvasView>(find.byType(TiledCanvasView));
+    final List<CanvasNodeModel> committed =
+        view.engine.queryVisible(allWorld);
+    expect(committed, hasLength(1));
+    expect(committed.single.kind, 'STROKE');
+
+    // Live layer cleared once the stroke committed.
+    final CustomPaint settledWidget = tester.widget<CustomPaint>(
+      find.byWidgetPredicate(
+        (Widget w) => w is CustomPaint && w.painter is ForegroundStrokePainter,
+      ),
+    );
+    expect(
+      (settledWidget.painter! as ForegroundStrokePainter).points,
+      isEmpty,
+    );
+
+    // (c) Camera zoom: the committed node persists in the engine index, its
+    // tile stays rebaked in the cache, and the static layer replays tile
+    // pictures at the new zoom bucket.
+    await tester.tap(find.byKey(const ValueKey<String>('studio-zoom-in')));
+    await tester.pump();
+    final List<CanvasNodeModel> afterZoom =
+        view.engine.queryVisible(allWorld);
+    expect(afterZoom, hasLength(1));
+    final CanvasNodeModel node = afterZoom.single;
+    final TileKey nodeTile = TileKey.forPoint(node.bbox[0], node.bbox[1]);
+    expect(view.engine.cache.contains(nodeTile), isTrue);
+    expect(view.engine.bakedBucketOf(nodeTile), isNotNull);
+    // The node's path made it into the baked picture: the stroke tile holds
+    // strictly more recorded bytes than a tile with no content.
+    final int strokeBytes =
+        view.engine.getTile(nodeTile).approximateBytesUsed;
+    final int emptyBytes =
+        view.engine.getTile(const TileKey(9, 9)).approximateBytesUsed;
+    expect(strokeBytes, greaterThan(emptyBytes));
+    final CustomPaint staticWidget = tester.widget<CustomPaint>(
+      find.byWidgetPredicate(
+        (Widget w) => w is CustomPaint && w.painter is StaticTilePainter,
+      ),
+    );
+    final RecordingCanvas staticSpy = RecordingCanvas();
+    (staticWidget.painter! as StaticTilePainter)
+        .paint(staticSpy, const Size(800, 600));
+    expect(staticSpy.didCall('drawPicture'), isTrue); // tiles replay
+
+    await _disposeStudio(tester, client);
+  });
+
+  testWidgets('two-finger pinch drives the camera only — no stray marks',
+      (WidgetTester tester) async {
+    final _FakeSyncClient client = _FakeSyncClient();
+    await _pumpStudio(tester, client: client);
+
+    final TiledCanvasView start =
+        tester.widget<TiledCanvasView>(find.byType(TiledCanvasView));
+    final List<double> matrix0 =
+        List<double>.from(start.viewMatrix.storage, growable: false);
+
+    // First finger would start a pen stroke; the second contact hands the
+    // gesture to the camera and discards the single-point stroke — a pinch
+    // must never leave a mark behind.
+    final TestGesture left = await tester.startGesture(const Offset(320, 340));
+    await tester.pump(const Duration(milliseconds: 16));
+    final TestGesture right =
+        await tester.startGesture(const Offset(520, 420));
+    await tester.pump(const Duration(milliseconds: 16));
+
+    final CustomPaint midWidget = tester.widget<CustomPaint>(
+      find.byWidgetPredicate(
+        (Widget w) => w is CustomPaint && w.painter is ForegroundStrokePainter,
+      ),
+    );
+    expect(
+      (midWidget.painter! as ForegroundStrokePainter).points,
+      isEmpty, // aborted single-point stroke left no live path
+    );
+
+    await left.moveBy(const Offset(-70, -50));
+    await right.moveBy(const Offset(70, 50));
+    await tester.pump(const Duration(milliseconds: 16));
+    await left.up();
+    await right.up();
+    await tester.pump(const Duration(milliseconds: 16));
+
+    expect(_actions(client, 'ADD_STROKE'), isEmpty); // camera only
+    expect(_actions(client, 'ADD_SHAPE'), isEmpty);
+    final TiledCanvasView end =
+        tester.widget<TiledCanvasView>(find.byType(TiledCanvasView));
+    expect(
+      List<double>.from(end.viewMatrix.storage, growable: false),
+      isNot(equals(matrix0)), // the pinch actually moved the camera
+    );
+    final CustomPaint liveWidget = tester.widget<CustomPaint>(
+      find.byWidgetPredicate(
+        (Widget w) => w is CustomPaint && w.painter is ForegroundStrokePainter,
+      ),
+    );
+    expect(
+      (liveWidget.painter! as ForegroundStrokePainter).points,
+      isEmpty, // no stray live mark after the gesture ends
+    );
+
+    await _disposeStudio(tester, client);
+  });
+
   testWidgets('highlighter commits HIGHLIGHT/MULTIPLY with toolId 0x02',
       (WidgetTester tester) async {
     final _FakeSyncClient client = _FakeSyncClient(connected: true);
@@ -349,6 +534,15 @@ void main() {
     expect(deletes, hasLength(1));
     expect(_payload(deletes.single)['node_id'], strokeId);
     expect(_actions(client, 'ADD_STROKE'), hasLength(1)); // no stray commit
+
+    // The node is gone from the engine index too (reindex rebaked its tiles).
+    final TiledCanvasView view =
+        tester.widget<TiledCanvasView>(find.byType(TiledCanvasView));
+    expect(
+      view.engine
+          .queryVisible(const Rect.fromLTRB(-1e9, -1e9, 1e9, 1e9)),
+      isEmpty,
+    );
 
     await _disposeStudio(tester, client);
   });

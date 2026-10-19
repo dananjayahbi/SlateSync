@@ -1154,6 +1154,173 @@ class ForegroundStrokePainter extends CustomPainter {
       !listEquals(oldDelegate.viewMatrix.storage, viewMatrix.storage);
 }
 
+/// Light-gray pattern ink for RULED / DOT_GRID / ISO_GRID on white paper
+/// (Issue 02 — light canvas, matches the Doc 26 preview proportions).
+const Color kPagePatternColor = Color(0xFFD9DEE7);
+
+/// Subtle light-gray artboard frame for bounded presets (Issue 02).
+const Color kPageBorderColor = Color(0xFFC6CDD8);
+
+/// Page/background layer beneath the static tiles (Issue 02 light canvas).
+///
+/// Doc 22's dual-layer view only ever replayed strokes — the canvas area had
+/// no page fill, no boundary and no pattern, so the app's dark scaffold
+/// showed through and the artboard was invisible. This painter renders, in
+/// world space under the camera transform:
+///
+/// * the white paper fill ([pageColor], `background_color` — #FFFFFF),
+/// * Doc 08 §4.2's feathered drop shadow + 1 px screen-scaled light-gray
+///   boundary for bounded presets only (INFINITE renders neither),
+/// * Doc 08 §4.1's `RULED` (32 u), `DOT_GRID` (24 u lattice) and `ISO_GRID`
+///   (24 u, ±30° + vertical families) in light gray, clipped to the page
+///   for bounded presets and to the visible world for INFINITE.
+class CanvasBackgroundPainter extends CustomPainter {
+  CanvasBackgroundPainter({
+    required this.viewMatrix,
+    required this.scale,
+    this.boundary,
+    this.style = 'BLANK',
+    this.pageColor = const Color(0xFFFFFFFF),
+    super.repaint,
+  });
+
+  final Matrix4 viewMatrix;
+  final double scale;
+
+  /// Bounded page rect in world units — `null` ⇒ INFINITE.
+  final Rect? boundary;
+
+  /// `BLANK | RULED | DOT_GRID | ISO_GRID` (template §3).
+  final String style;
+
+  /// Artboard `background_color` — the paper itself.
+  final Color pageColor;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.isEmpty) {
+      return;
+    }
+    final double safeScale = scale > 1e-6 ? scale : 1.0;
+    final Rect world = _worldRectOfViewport(viewMatrix, size);
+    if (!world.isFinite) {
+      return;
+    }
+    canvas.save();
+    canvas.transform(viewMatrix.storage);
+    final Rect? page = boundary;
+    if (page == null || !page.isFinite) {
+      canvas.drawRect(world, Paint()..color = pageColor);
+      _drawPattern(canvas, world, safeScale);
+    } else {
+      // Doc 08 §4.2: offset ≈ 0.02·min(w,h), feather ≈ 3× offset (≈ 3σ of
+      // the gaussian blur); bounded presets only, INFINITE draws none.
+      final double off = 0.02 * math.min(page.width, page.height);
+      if (off > 0) {
+        canvas.drawRect(
+          page.translate(0, off),
+          Paint()
+            ..color = const Color(0x38000000)
+            ..maskFilter = MaskFilter.blur(BlurStyle.normal, off),
+        );
+      }
+      canvas.drawRect(page, Paint()..color = pageColor);
+      _drawPattern(canvas, page, safeScale);
+      canvas.drawRect(
+        page,
+        Paint()
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.0 / safeScale
+          ..color = kPageBorderColor,
+      );
+    }
+    canvas.restore();
+  }
+
+  void _drawPattern(Canvas canvas, Rect area, double safeScale) {
+    if (style == 'BLANK' || area.isEmpty) {
+      return;
+    }
+    canvas.save();
+    canvas.clipRect(area);
+    final Paint line = Paint()
+      ..color = kPagePatternColor
+      ..strokeWidth = 1.0 / safeScale; // ≈1 screen px at any zoom (fwidth)
+    switch (style) {
+      case 'RULED':
+        {
+          const double step = 32;
+          final double y0 = (area.top / step).floorToDouble() * step;
+          for (double y = y0; y <= area.bottom; y += step) {
+            canvas.drawLine(Offset(area.left, y), Offset(area.right, y), line);
+          }
+        }
+      case 'DOT_GRID':
+        {
+          const double step = 24;
+          final double r = step * 0.125;
+          final Paint dot = Paint()..color = kPagePatternColor;
+          final double x0 = (area.left / step).floorToDouble() * step;
+          final double y0 = (area.top / step).floorToDouble() * step;
+          for (double x = x0; x <= area.right; x += step) {
+            for (double y = y0; y <= area.bottom; y += step) {
+              canvas.drawCircle(Offset(x, y), r, dot);
+            }
+          }
+        }
+      case 'ISO_GRID':
+        {
+          // Doc 26 §5.5 isometric families (-30°, +30°, vertical), anchored
+          // to the world lattice so the grid pans with the paper.
+          const double step = 24;
+          final double diag = area.width + area.height;
+          for (final double angle in const <double>[
+            -math.pi / 6,
+            math.pi / 6,
+            math.pi / 2,
+          ]) {
+            final double ux = math.cos(angle);
+            final double uy = math.sin(angle);
+            final double nx = -uy;
+            final double ny = ux;
+            double minD = double.infinity;
+            double maxD = -double.infinity;
+            for (final Offset c in <Offset>[
+              area.topLeft,
+              area.topRight,
+              area.bottomLeft,
+              area.bottomRight,
+            ]) {
+              final double d = c.dx * nx + c.dy * ny;
+              if (d < minD) minD = d;
+              if (d > maxD) maxD = d;
+            }
+            // 1e-9 slop absorbs float32 trig rounding (e.g. sin(π/6) being
+            // 0.49999999999999994 would otherwise ceil past a lattice point).
+            final double d0 = ((minD / step) - 1e-9).ceilToDouble() * step;
+            for (double d = d0; d <= maxD; d += step) {
+              final Offset base = Offset(nx * d, ny * d);
+              canvas.drawLine(
+                base - Offset(ux, uy) * diag,
+                base + Offset(ux, uy) * diag,
+                line,
+              );
+            }
+          }
+        }
+    }
+    canvas.restore();
+  }
+
+  @override
+  bool shouldRepaint(CanvasBackgroundPainter oldDelegate) =>
+      oldDelegate.style != style ||
+      oldDelegate.pageColor != pageColor ||
+      oldDelegate.boundary != boundary ||
+      oldDelegate.scale != scale ||
+      !listEquals(oldDelegate.viewMatrix.storage, viewMatrix.storage);
+}
+
 /// Dual-layer view (Doc 22 §4): static tiles and live strokes sit in
 /// separate [RepaintBoundary] layers so stroke ticks never repaint tiles and
 /// tile bakes never repaint strokes.

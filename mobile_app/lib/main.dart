@@ -65,9 +65,9 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
       navigatorKey: _navigatorKey,
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        brightness: Brightness.dark,
+        brightness: Brightness.light,
         scaffoldBackgroundColor: StudioTheme.bg,
-        colorScheme: const ColorScheme.dark(
+        colorScheme: const ColorScheme.light(
           surface: StudioTheme.surface,
           primary: StudioTheme.accent,
           error: StudioTheme.danger,
@@ -75,6 +75,8 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
           onSurface: StudioTheme.text,
         ),
       ),
+      // Issue 02: the app is light-only; no dark variant is wired.
+      themeMode: ThemeMode.light,
       home: HomeCanvasDashboard(
         onOpenDocument: _openCanvas,
         client: _client,

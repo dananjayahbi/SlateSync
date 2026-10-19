@@ -1,8 +1,23 @@
 """Embedded OpenGL viewport host + generic shader registry — Doc 06 (Wave 1.B).
 
-PRIMARY embedding: hidden pyglet window (GL 3.3 core, MSAA 4×) reparented into the
-Tk frame via ctypes ``user32.SetParent`` + ``WS_CHILD`` styles. FALLBACK: standalone
-``moderngl`` context + RGBA FBO (ROI ≤ 1280×720) blitted onto a Tk ``Label``.
+DEFAULT (issue 03/04 round 3): a PURE-Tk blit viewport — standalone ``moderngl``
+context + RGBA FBO rendered offscreen, blitted on every 16 ms tick into a Tk
+``Label`` via ``ImageTk.PhotoImage`` (raw RGB ``Image.frombytes``, no PNG
+encode). The Tk toplevel then contains ZERO foreign child windows, so native
+drag / resize / maximize / minsize work unconditionally on Win11 —
+``user32.SetParent`` is NEVER called on this path (windows reparented with
+``SetParent`` lose the parent's move/size semantics: microsoft-ui-xaml#8707 /
+#8779; a maximize is a state command, so it kept working while drag snapped
+back and borders could not resize). Doc 06 documents this as its FALLBACK
+escape hatch — this round promotes it to the default; docs are not edited.
+
+OPT-IN EXPERIMENTAL (default OFF): ``SLATESYNC_EMBED=setparent`` restores the
+legacy Doc 06 PRIMARY embedding — hidden pyglet window (GL 3.3 core, MSAA 4×)
+reparented into the Tk frame via ctypes ``user32.SetParent`` + ``WS_CHILD``
+styles. Known to corrupt Win11 drag/resize (the original issue 03/04
+symptoms); kept only as an escape hatch, guarded in both ``mount`` and
+``_embed_pyglet``.
+
 Threading (template §4): the WS thread may only call ``submit_live_frame`` /
 ``request_redraw`` — lock-free latest-frame slot + ``after(0, …)`` marshal, seq
 stale-drop inside ``_drain``, every GL call on the Tk main thread, and a
@@ -13,10 +28,11 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import time
 import tkinter as tk
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Mapping
 
 import moderngl
 from PIL import Image, ImageTk
@@ -62,10 +78,37 @@ LASER_TIMEOUT_S = 0.5  # LASER 0x04 crosshair cleared on LIVE_END or timeout
 LASER_ARM_PX = 12.0  # crosshair arm length in screen pixels
 LASER_THICK_PX = 2.0  # crosshair arm thickness in screen pixels
 LASER_COLOR = (1.0, 0.1, 0.1, 1.0)
-FALLBACK_MAX_W, FALLBACK_MAX_H = 1280, 720  # FALLBACK FBO ROI cap (Doc 06 §1)
+FALLBACK_MAX_W, FALLBACK_MAX_H = 1600, 900  # blit FBO ROI cap — Doc 06's FALLBACK
+# ROI, promoted to the DEFAULT pure-Tk path and raised from 1280×720 so the
+# mirror keeps filling a maximized window (issue 04 round 3).
 DEFAULT_COLOR = "#1E1E1E"  # NodeStyle.stroke default (template §4)
 DEFAULT_MOUNT_W, DEFAULT_MOUNT_H = 640, 480  # size used before <Configure> realizes
 _COMMIT_BUDGET = 64  # committed meshes tessellated per render (rest via redraw)
+
+# Embedding strategy (issue 03/04 round 3): DEFAULT "blit" = pure-Tk offscreen
+# FBO → ImageTk blit (no foreign child windows); "setparent" = the legacy Doc 06
+# pyglet/SetParent reparent, opt-in ONLY via SLATESYNC_EMBED=setparent (default
+# off — it breaks native window drag/resize on Win11, microsoft-ui-xaml#8707).
+EMBED_ENV_VAR = "SLATESYNC_EMBED"
+EMBED_BLIT = "blit"
+EMBED_SETPARENT = "setparent"
+
+
+def resolve_embed_strategy(env: Mapping[str, str] | None = None) -> str:
+    """``SLATESYNC_EMBED`` → strategy name; default ``"blit"`` (pure-Tk path).
+
+    Only the exact value ``setparent`` (case-insensitive) enables the legacy
+    reparent embedding; unknown values are ignored with a warning.
+    """
+    source = os.environ if env is None else env
+    raw = str(source.get(EMBED_ENV_VAR, "")).strip().lower()
+    if raw == EMBED_SETPARENT:
+        return EMBED_SETPARENT
+    if raw and raw != EMBED_BLIT:
+        logger.warning(
+            "ignoring unknown %s=%r — using the pure-Tk blit viewport", EMBED_ENV_VAR, raw
+        )
+    return EMBED_BLIT
 
 # Kinds whose geometry Doc 06 tessellates; SHAPE/GRAPH_AXES/IMAGE belong to Doc 08.
 _STROKE_KINDS = frozenset({"STROKE", "HIGHLIGHT", "LINE"})
@@ -90,6 +133,38 @@ _DECORATIONS = (
 
 _SRC_OVER_BLEND = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)  # u_blendMode 0
 _MULTIPLY_BLEND = (moderngl.DST_COLOR, moderngl.ZERO)  # u_blendMode 1 (§3)
+
+# Deliberate GL-context keep-alive (issue 03/04 round 3). moderngl does not
+# re-MakeCurrent per call, and releasing the thread-CURRENT context leaves the
+# thread with NO current GL context: every later context in the process then
+# fails ("cannot create program/buffer") and pyglet's WGL extension query
+# fails ("wglChoosePixelFormatARB is not exported"). The baseline masked this
+# by accident — its pyglet windows left a context current after close; the
+# pure-Tk default creates no pyglet windows, so shutdown keeps its context
+# alive and current on purpose (all GL *objects* are released above; only the
+# empty context shell survives, until process exit).
+_GL_KEEPALIVE: list[moderngl.Context] = []
+
+# One-triangle present flip (issue 04 round 3): samples the scene FBO with an
+# inverted V so readback rows arrive top-first — keeps the PIL/Tk row order
+# exact without a per-frame CPU transpose. Written inline (not a shader-dir
+# stem) because it is a GL plumbing detail of Doc 06's blit path only.
+_FLIP_VERT = """#version 330 core
+in vec2 in_pos;
+out vec2 v_uv;
+void main() {
+    v_uv = vec2(in_pos.x * 0.5 + 0.5, 0.5 - in_pos.y * 0.5);
+    gl_Position = vec4(in_pos, 0.0, 1.0);
+}
+"""
+_FLIP_FRAG = """#version 330 core
+uniform sampler2D u_tex;
+in vec2 v_uv;
+out vec4 fragColor;
+void main() {
+    fragColor = texture(u_tex, v_uv);
+}
+"""
 
 
 class MissingShaderPairError(FileNotFoundError, KeyError):
@@ -221,6 +296,20 @@ class GLCanvasHost:
         self._label: tk.Label | None = None
         self._frame: tk.Frame | None = None
         self._parent_widget: tk.Misc | None = None
+        # Blit-pipeline reuse state (DEFAULT pure-Tk path, issue 04 round 3):
+        # one cached read buffer, one zero-copy frombuffer view, two PhotoImage
+        # slots alternated so paste runs detached and configure stays a cheap swap.
+        self._blit_buf: bytearray | None = None
+        self._blit_view: Image.Image | None = None
+        self._blit_photo: ImageTk.PhotoImage | None = None
+        # GPU present-flip: the scene renders into the FBO in GL orientation
+        # (row 0 = visual bottom) but PIL/Tk want row 0 on top. A one-triangle
+        # pass samples the scene FBO with inverted V into ``_flip_fbo`` so the
+        # readback rows arrive top-first — no CPU transpose (~2.5 ms) per frame.
+        self._flip_texture: moderngl.Texture | None = None
+        self._flip_fbo: moderngl.Framebuffer | None = None
+        self._flip_program: moderngl.Program | None = None
+        self._flip_vao: moderngl.VertexArray | None = None
 
         # Lock-free latest-frame slot: GIL-atomic attribute replace (Doc 06 §4).
         self._slot: LiveFrame | None = None
@@ -233,10 +322,16 @@ class GLCanvasHost:
 
         self._camera: tuple[float, float, float] = (1.0, 0.0, 0.0)
         self._vp_w, self._vp_h = 0, 0
-        self._mode = "none"  # "primary" | "fallback" | "none"
+        # "primary" (opt-in setparent) | "fallback" (DEFAULT pure-Tk blit) | "none"
+        self._mode = "none"
         self._mounted = False
         self._shutdown = False
-        self._pyglet_available = self._probe_pyglet()
+        # Default: pure-Tk blit — pyglet is neither probed nor imported. The
+        # legacy SetParent path exists only behind SLATESYNC_EMBED=setparent.
+        self._embed_strategy = resolve_embed_strategy()
+        self._pyglet_available = (
+            self._probe_pyglet() if self._embed_strategy == EMBED_SETPARENT else False
+        )
 
         self._doc: CanvasDocument | None = None
         self._artboard = None
@@ -271,14 +366,20 @@ class GLCanvasHost:
             bus.on(event, handler)
 
     def _probe_pyglet(self) -> bool:
-        """Constructor-side availability probe (Doc 06 §1: degrade, don't explode)."""
+        """Constructor-side availability probe (Doc 06 §1: degrade, don't explode).
+
+        Only consulted for the opt-in ``SLATESYNC_EMBED=setparent`` strategy —
+        the default pure-Tk blit path never touches pyglet.
+        """
         try:
             import pyglet
 
             _ = pyglet.version  # import side-effect free: no display/GL touched yet
         except Exception as exc:
             logger.warning(
-                "pyglet unavailable (%s) — GLCanvasHost will use the FALLBACK viewport", exc
+                "pyglet unavailable (%s) — SLATESYNC_EMBED=setparent will degrade to "
+                "the pure-Tk blit viewport",
+                exc,
             )
             return False
         return True
@@ -303,21 +404,27 @@ class GLCanvasHost:
 
         mode = "none"
         try:
-            if self._pyglet_available and self._embed_pyglet():
+            if (
+                self._embed_strategy == EMBED_SETPARENT
+                and self._pyglet_available
+                and self._embed_pyglet()
+            ):
                 mode = "primary"
             else:
-                if self._pyglet_available:
+                # DEFAULT (pure-Tk): standalone context + FBO blit — reached
+                # without ever calling _embed_pyglet, i.e. without SetParent.
+                if self._embed_strategy == EMBED_SETPARENT:
                     logger.warning(
-                        "PRIMARY pyglet/SetParent embedding failed — degrading to FALLBACK "
-                        "(standalone moderngl FBO ≤%dx%d → ImageTk blit)",
+                        "SLATESYNC_EMBED=setparent embedding failed — degrading to the "
+                        "pure-Tk blit viewport (standalone moderngl FBO ≤%dx%d → ImageTk blit)",
                         FALLBACK_MAX_W,
                         FALLBACK_MAX_H,
                     )
-                if self._ctx is not None:  # half-attached primary context
+                if self._ctx is not None:  # half-attached setparent context
                     self._ctx.release()
                     self._ctx = None
                 self._ctx = moderngl.create_standalone_context()
-                mode = "fallback"
+                mode = "fallback"  # DEFAULT pure-Tk blit mode (legacy name kept)
             self._init_gl_surface()
             if mode == "fallback":
                 self._init_fallback_targets()
@@ -372,14 +479,19 @@ class GLCanvasHost:
         self._ensure_tick()
 
     def resize(self, w: int, h: int) -> None:
-        """Update the viewport, reparented window, or FALLBACK FBO target."""
+        """Update the viewport, reparented window, or DEFAULT blit FBO target."""
         width = max(int(w), 1)
         height = max(int(h), 1)
+        if self._mode == "fallback":
+            # Blit ROI: the camera math (u_viewport) must equal the FBO size,
+            # so the logical viewport is capped together with the FBO.
+            width = min(width, FALLBACK_MAX_W)
+            height = min(height, FALLBACK_MAX_H)
         if (width, height) == (self._vp_w, self._vp_h):
             return
         self._vp_w, self._vp_h = width, height
         if self._mode == "primary" and self._window is not None and self._user32 is not None:
-            try:  # keep the WS_CHILD surface glued to the Tk frame (Doc 06 §4)
+            try:  # legacy setparent path: glue the WS_CHILD surface to the Tk frame
                 self._user32.MoveWindow(int(self._window._hwnd), 0, 0, width, height, True)
             except Exception:
                 logger.debug("MoveWindow failed during resize", exc_info=True)
@@ -579,10 +691,19 @@ class GLCanvasHost:
             self.request_redraw()
 
     # ------------------------------------------------------------------
-    # PRIMARY embedding (Doc 06 §1/§4)
+    # LEGACY setparent embedding — opt-in ONLY via SLATESYNC_EMBED=setparent
+    # (issue 03/04 round 3: breaks native drag/resize on Win11; see header)
     # ------------------------------------------------------------------
     def _embed_pyglet(self) -> bool:
-        """Hidden pyglet window → ``SetParent`` into the Tk frame; ``False`` ⇒ FALLBACK."""
+        """Hidden pyglet window → ``SetParent`` into the Tk frame.
+
+        Guarded at entry: without an explicit ``SLATESYNC_EMBED=setparent``
+        opt-in this returns ``False`` immediately, so ``user32.SetParent`` is
+        unreachable on the default pure-Tk path (belt-and-suspenders on top
+        of the strategy check in :meth:`mount`).
+        """
+        if self._embed_strategy != EMBED_SETPARENT:
+            return False  # never reparent unless the user explicitly opted in
         import pyglet
 
         w, h = self._vp_w, self._vp_h
@@ -646,6 +767,29 @@ class GLCanvasHost:
         except ImportError:
             self._primitive = None
 
+    def _init_flip_pass(self) -> None:
+        """Compile the one-triangle present-flip pass (size-independent).
+
+        The sampler unit is bound once while the flip program is current —
+        setting a sampler uniform while ANOTHER program is current targets the
+        wrong uniform type and raises GL_INVALID_OPERATION.
+        """
+        if self._ctx is None or self._flip_program is not None:
+            return
+        import struct
+
+        self._flip_program = self._ctx.program(
+            vertex_shader=_FLIP_VERT,
+            fragment_shader=_FLIP_FRAG,
+        )
+        # Sampler unit bound once — moderngl uniform sets are DSA (no current-
+        # program dependency), and the program object retains the value.
+        self._flip_program["u_tex"].value = 0  # texture unit 0 (scene FBO texture)
+        vertices = struct.pack("6f", -1.0, -1.0, 3.0, -1.0, -1.0, 3.0)
+        self._flip_vao = self._ctx.vertex_array(
+            self._flip_program, [(self._ctx.buffer(vertices), "2f", "in_pos")]
+        )
+
     def _fallback_size(self) -> tuple[int, int]:
         return (
             min(max(self._vp_w, 1), FALLBACK_MAX_W),
@@ -655,36 +799,96 @@ class GLCanvasHost:
     def _init_fallback_targets(self) -> None:
         width, height = self._fallback_size()
         self._fbo_texture = self._ctx.texture((width, height), 4)
-        self._fbo_texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._fbo_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self._fbo = self._ctx.framebuffer(color_attachments=[self._fbo_texture])
+        # Benign driver flag: the FIRST framebuffer() after deleting targets
+        # that were cross-bound (draw = flip FBO, unit 0 = scene texture, the
+        # blit's steady state) reports GL_INVALID_OPERATION on this stack while
+        # the created FBO is fully functional (proven by the pixel/orientation
+        # and FBO-resize tests). Drain it right here so later ctx.error probes
+        # stay meaningful; on stacks without the quirk this is one clean read.
+        while self._ctx.error != "GL_NO_ERROR":
+            pass
+        self._init_flip_pass()
+        self._flip_texture = self._ctx.texture((width, height), 4)
+        self._flip_texture.filter = (moderngl.NEAREST, moderngl.NEAREST)
+        self._flip_fbo = self._ctx.framebuffer(color_attachments=[self._flip_texture])
 
     def _recreate_fbo(self) -> None:
         width, height = self._fallback_size()
         if self._fbo is not None and self._fbo.size == (width, height):
             return
-        if self._fbo is not None:
-            self._fbo.release()
-            self._fbo = None
-        if self._fbo_texture is not None:
-            self._fbo_texture.release()
-            self._fbo_texture = None
+        for target in (self._fbo, self._fbo_texture, self._flip_fbo, self._flip_texture):
+            if target is not None:
+                try:
+                    target.release()
+                except Exception:
+                    logger.debug("FBO release failed", exc_info=True)
+        self._fbo = None
+        self._fbo_texture = None
+        self._flip_fbo = None
+        self._flip_texture = None
         self._init_fallback_targets()
 
     def _build_fallback_label(self) -> None:
+        # DEFAULT pure-Tk surface: an ordinary tk.Label — zero foreign child
+        # windows, so the toplevel keeps native drag/resize/maximize (issue 03/04).
         self._label = tk.Label(self._frame, bg="#FFFFFF", bd=0)
         self._label.pack(fill="both", expand=True)
 
     def _blit_fallback(self) -> None:
-        """FBO → PIL → ``ImageTk.PhotoImage`` blit (FALLBACK path, Doc 06 §4)."""
-        if self._fbo is None or self._label is None:
+        """Present the scene FBO on the Tk label — DEFAULT pure-Tk pipeline.
+
+        Per frame (issue 04 round 3, budget < 8 ms mean at default size):
+
+        1. GPU present-flip: one triangle samples the scene FBO with inverted
+           V into ``_flip_fbo`` (~0.03 ms — replaces a ~2.5 ms CPU transpose);
+        2. ``read_into`` a cached bytearray (no per-frame allocation);
+        3. ``Image.frombuffer("RGBA", …)`` — ZERO-COPY shared view of that
+           buffer (RGB is *not* shareable in Pillow; RGBA is), no PNG encode;
+        4. present: the photo is attached ONCE per size; steady state pastes
+           into it (reconfiguring/rotating photos each frame costs 15 ms+).
+
+        The label keeps the reference so Tk's GC cannot collect a displayed
+        photo (flicker). Size changes rebuild buffer + view + photo.
+        """
+        if (
+            self._fbo is None
+            or self._label is None
+            or self._flip_fbo is None
+            or self._flip_texture is None
+            or self._flip_program is None
+            or self._flip_vao is None
+            or self._ctx is None
+        ):
             return
-        data = self._fbo.read(components=3, alignment=1)
-        image = Image.frombytes("RGB", self._fbo.size, data).transpose(
-            Image.Transpose.FLIP_TOP_BOTTOM
-        )
-        photo = ImageTk.PhotoImage(image)
-        self._label.configure(image=photo)
-        self._label._slatesync_photo = photo  # keep a reference (Tk does not)
+        size = self._fbo.size
+        length = size[0] * size[1] * 4
+        if self._blit_buf is None or len(self._blit_buf) != length:
+            self._blit_buf = bytearray(length)
+            self._blit_view = None
+            self._blit_photo = None
+        # 1) GPU flip: scene FBO (row 0 = bottom) -> flip FBO (row 0 = top).
+        # Sampler MUST be the scene texture — sampling the bound draw target
+        # would be a feedback loop (GL_INVALID_OPERATION). The sampler uniform
+        # was bound in _init_flip_pass; vao.render() makes the program current.
+        self._flip_fbo.use()
+        self._fbo_texture.use(0)
+        self._ctx.disable(moderngl.BLEND)
+        self._flip_vao.render(moderngl.TRIANGLES, vertices=3)
+        # 2) + 3) read top-first rows into the cached buffer, share them.
+        self._flip_fbo.read_into(self._blit_buf, components=4, alignment=1)
+        if self._blit_view is None:
+            self._blit_view = Image.frombuffer("RGBA", size, self._blit_buf)
+        # 4) present.
+        photo = self._blit_photo
+        if photo is None:
+            photo = ImageTk.PhotoImage(self._blit_view)
+            self._blit_photo = photo
+            self._label._slatesync_photo = photo  # keep a reference (Tk does not)
+            self._label.configure(image=photo)
+        else:
+            photo.paste(self._blit_view)
 
     def _release_gl(self) -> None:
         """Release GL objects, programs, context, and the pyglet window (idempotent)."""
@@ -702,22 +906,36 @@ class GLCanvasHost:
             except Exception:
                 logger.debug("PrimitiveRenderer release failed", exc_info=True)
             self._primitive = None
-        for target in (self._fbo, self._fbo_texture):
+        for target in (
+            self._fbo,
+            self._fbo_texture,
+            self._flip_fbo,
+            self._flip_texture,
+            self._flip_vao,
+            self._flip_program,
+        ):
             if target is not None:
                 try:
                     target.release()
                 except Exception:
-                    logger.debug("FBO release failed", exc_info=True)
+                    logger.debug("GL target release failed", exc_info=True)
         self._fbo = None
         self._fbo_texture = None
+        self._flip_fbo = None
+        self._flip_texture = None
+        self._flip_vao = None
+        self._flip_program = None
         self._label = None
+        self._blit_buf = None
+        self._blit_view = None
+        self._blit_photo = None
         self._registry.release()
         self._stroke_program = None
         if self._ctx is not None:
-            try:
-                self._ctx.release()
+            try:  # release every GL object above, but keep the context itself
+                _GL_KEEPALIVE.append(self._ctx)  # alive + current (see module note)
             except Exception:
-                logger.debug("context release failed", exc_info=True)
+                logger.debug("context keep-alive failed", exc_info=True)
             self._ctx = None
         window = self._window
         self._window = None
@@ -739,6 +957,12 @@ class GLCanvasHost:
             return
         # moderngl 5.13 has no context-activation API: this process has exactly
         # one GL context (created on the Tk main thread), which stays current.
+        if self._mode == "fallback" and self._fbo is not None:
+            # DEFAULT pure-Tk path: draw OFFSCREEN into the blit source. Without
+            # this, clear/draw hit the context's hidden default framebuffer and
+            # the FBO (what the label shows) stays black — Doc 06's FALLBACK
+            # path had this latent defect, surfaced by the round-3 pixel tests.
+            self._fbo.use()
         self._sync_pending()
         self._ctx.viewport = (0, 0, width, height)
         self._ctx.enable(moderngl.BLEND)

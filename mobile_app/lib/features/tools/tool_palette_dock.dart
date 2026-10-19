@@ -186,13 +186,24 @@ class _ToolDockState extends State<ToolDock> {
   static const Duration _anim = Duration(milliseconds: 180);
   static const ValueKey<String> _toggleKey = ValueKey<String>('dock-toggle');
 
+  // Issue 02B tip-size control: 0.5–20 dp in 0.5 dp fine steps (39 gaps).
+  static const double _tipWidthMin = 0.5;
+  static const double _tipWidthMax = 20.0;
+  static const int _tipWidthDivisions = 39;
+  static const double _opacityMin = 0.1;
+  static const double _opacityMax = 1.0;
+
+  /// Issue 02B palette: 8 swatches — ink black, theme red, accent blue,
+  /// green, yellow, true red, purple, white (ring-protected below).
+  /// `#F0546F` stays (theme danger + existing test pin); no custom picker —
+  /// swatch-only selection, a native color picker is future work.
   static const List<String> _swatchColors = <String>[
     '#1E1E1E',
     '#F0546F',
     '#4F8EF7',
     '#2ECC71',
     '#F1C40F',
-    '#E67E22',
+    '#D64550',
     '#9B59B6',
     '#FFFFFF',
   ];
@@ -244,6 +255,24 @@ class _ToolDockState extends State<ToolDock> {
     });
   }
 
+  double _clampTipWidth(double v) =>
+      v.clamp(_tipWidthMin, _tipWidthMax).toDouble();
+
+  double _clampOpacity(double v) =>
+      v.clamp(_opacityMin, _opacityMax).toDouble();
+
+  /// Clamp to 0.5–20 dp, then snap to the nearest 0.5 dp fine step.
+  void _commitTipWidth(double v) {
+    final double snapped = (_clampTipWidth(v) * 2).round() / 2;
+    _commit((ToolConfig c) => c.width = snapped);
+  }
+
+  void _commitOpacity(double v) {
+    // 10–100% in 1% fine steps (matches the slider's 90 divisions).
+    final double snapped = (_clampOpacity(v) * 100).roundToDouble() / 100;
+    _commit((ToolConfig c) => c.opacity = snapped);
+  }
+
   void _showCartesianDialog() {
     showDialog<void>(
       context: context,
@@ -270,7 +299,8 @@ class _ToolDockState extends State<ToolDock> {
     if (!mounted || picked == null) {
       return;
     }
-    final WorldRectPlanner plan = widget.planWorldRect ?? _defaultWorldRectPlanner;
+    final WorldRectPlanner plan =
+        widget.planWorldRect ?? _defaultWorldRectPlanner;
     widget.onPickImage?.call(
       PendingImage(
         bytes: picked.bytes,
@@ -474,9 +504,12 @@ class _ToolDockState extends State<ToolDock> {
                 _commit((ToolConfig c) => c.eraserMode = next.first),
           ),
           const SizedBox(height: 8),
+          _buildTipSizeRow(cfg, label: 'Hit radius'),
+          const SizedBox(height: 4),
           const Text(
             'Tap a node: DELETE_NODE of the hit-tested node. Drag: same '
-            'action per hit node. Hit-test and RPC live in the canvas page.',
+            'action per hit node. Hit radius writes ToolConfig.width; '
+            'hit-test and RPC live in the canvas page.',
             style: _captionStyle,
           ),
         ];
@@ -493,9 +526,7 @@ class _ToolDockState extends State<ToolDock> {
                     onChanged: (bool v) => _snap.value = v,
                   ),
                   const SizedBox(width: 8),
-                  const Expanded(
-                    child: Text('Snapping', style: _bodyStyle),
-                  ),
+                  const Expanded(child: Text('Snapping', style: _bodyStyle)),
                 ],
               );
             },
@@ -570,42 +601,122 @@ class _ToolDockState extends State<ToolDock> {
 
   List<Widget> _strokeRows(StudioTool tool, ToolConfig cfg) {
     return <Widget>[
-      Text(
-        'Width ${cfg.width.toStringAsFixed(1)} dp',
-        style: _captionStyle,
-      ),
-      Slider(
-        key: const ValueKey<String>('width-slider'),
-        value: cfg.width.clamp(0.5, 24.0).toDouble(),
-        min: 0.5,
-        max: 24.0,
-        onChanged: (double v) => _commit((ToolConfig c) => c.width = v),
-      ),
-      Text(
-        'Opacity ${(cfg.opacity * 100).round()}%',
-        style: _captionStyle,
-      ),
-      Slider(
-        key: const ValueKey<String>('opacity-slider'),
-        value: cfg.opacity.clamp(0.1, 1.0).toDouble(),
-        min: 0.1,
-        max: 1.0,
-        onChanged: (double v) => _commit((ToolConfig c) => c.opacity = v),
-      ),
+      _buildTipSizeRow(cfg),
+      // Issue 02B: opacity is a highlighter-panel-only control (pen strokes
+      // commit without opacity in Doc 21's StrokeProcessor; opacity drives
+      // the highlighter's multiply blend).
+      if (tool == StudioTool.highlighter) ...<Widget>[
+        const SizedBox(height: 4),
+        _buildOpacityRow(cfg),
+      ],
       const SizedBox(height: 4),
-      Wrap(
-        spacing: 8,
-        runSpacing: 8,
-        children: <Widget>[
-          for (final String hex in _swatchColors) _swatch(hex, cfg),
-        ],
-      ),
-      if (tool == StudioTool.highlighter) _multiplyNote(),
+      _buildPaletteRow(cfg),
+      if (tool == StudioTool.highlighter) ...<Widget>[
+        const SizedBox(height: 4),
+        _multiplyNote(),
+      ],
     ];
   }
 
-  Widget _swatch(String hex, ToolConfig cfg) {
+  /// Issue 02B: width slider (0.5–20 dp, 0.5 fine-step snapping) with a live
+  /// value label and a preview dot scaled to the current tip width. The
+  /// eraser panel reuses it for the precision hit radius (`ToolConfig.width`).
+  Widget _buildTipSizeRow(ToolConfig cfg, {String label = 'Width'}) {
+    final double width = _clampTipWidth(cfg.width);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: Text(
+                '$label ${width.toStringAsFixed(1)} dp',
+                key: const ValueKey<String>('tip-size-label'),
+                style: _captionStyle,
+              ),
+            ),
+            _buildTipPreviewDot(width, cfg.color),
+          ],
+        ),
+        Slider(
+          key: const ValueKey<String>('width-slider'),
+          value: width,
+          min: _tipWidthMin,
+          max: _tipWidthMax,
+          divisions: _tipWidthDivisions,
+          label: '${width.toStringAsFixed(1)} dp',
+          onChanged: _commitTipWidth,
+        ),
+      ],
+    );
+  }
+
+  /// Preview dot: a circle whose diameter equals the tip width in dp,
+  /// tinted with the current color, in a fixed 24 dp slot so the row
+  /// height never jumps while dragging.
+  Widget _buildTipPreviewDot(double width, String hex) {
+    return SizedBox(
+      width: 24,
+      height: 24,
+      child: Center(
+        child: Container(
+          key: const ValueKey<String>('tip-preview-dot'),
+          width: width,
+          height: width,
+          decoration: BoxDecoration(
+            color: _colorFromHex(hex),
+            shape: BoxShape.circle,
+            border: Border.all(color: StudioTheme.text, width: 0.5),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Issue 02B / Doc 24 §3: 10–100% opacity slider bound to
+  /// `ToolConfig.opacity`, shown on the highlighter panel only (pen strokes
+  /// commit without opacity in Doc 21's StrokeProcessor; opacity drives the
+  /// highlighter's multiply blend). The multiply note stays below.
+  Widget _buildOpacityRow(ToolConfig cfg) {
+    final double opacity = _clampOpacity(cfg.opacity);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Text(
+          'Opacity ${(opacity * 100).round()}%',
+          key: const ValueKey<String>('opacity-label'),
+          style: _captionStyle,
+        ),
+        Slider(
+          key: const ValueKey<String>('opacity-slider'),
+          value: opacity,
+          min: _opacityMin,
+          max: _opacityMax,
+          divisions: 90,
+          label: '${(opacity * 100).round()}%',
+          onChanged: _commitOpacity,
+        ),
+      ],
+    );
+  }
+
+  /// Swatch row with a selected-check indicator.
+  Widget _buildPaletteRow(ToolConfig cfg) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: <Widget>[
+        for (final String hex in _swatchColors) _buildSwatch(hex, cfg),
+      ],
+    );
+  }
+
+  Widget _buildSwatch(String hex, ToolConfig cfg) {
     final bool selected = cfg.color == hex;
+    // White gets a fixed gray ring so it stays visible on light surfaces.
+    final Color ring = hex == '#FFFFFF'
+        ? const Color(0xFF9E9E9E)
+        : StudioTheme.text;
     return InkWell(
       key: ValueKey<String>('swatch-$hex'),
       borderRadius: BorderRadius.circular(StudioTheme.radiusSmall),
@@ -613,14 +724,24 @@ class _ToolDockState extends State<ToolDock> {
       child: Container(
         width: 28,
         height: 28,
+        alignment: Alignment.center,
         decoration: BoxDecoration(
           color: _colorFromHex(hex),
           shape: BoxShape.circle,
           border: Border.all(
-            color: selected ? StudioTheme.accent : StudioTheme.text,
-            width: selected ? 2 : 0.5,
+            color: selected ? StudioTheme.accent : ring,
+            width: selected ? 2 : 1,
           ),
         ),
+        child: selected
+            ? Icon(
+                Icons.check,
+                size: 16,
+                color: _colorFromHex(hex).computeLuminance() > 0.5
+                    ? Colors.black87
+                    : Colors.white,
+              )
+            : null,
       ),
     );
   }
@@ -733,9 +854,10 @@ String? _validatePositiveDouble(String? text) {
 List<double> _asDoublePair(String text) =>
     _splitPair(text.trim())!.map(double.parse).toList();
 
-List<int> _asIntPair(String text) => _splitPair(
-  text.trim(),
-)!.map((String p) => double.parse(p).round()).toList();
+List<int> _asIntPair(String text) =>
+    _splitPair(text.trim())!
+        .map((String p) => double.parse(p).round())
+        .toList();
 
 /// Dialog producing the exact Doc 03 `CARTESIAN_2D` graph_config object.
 class _CartesianGraphDialog extends StatefulWidget {
@@ -749,9 +871,7 @@ class _CartesianGraphDialog extends StatefulWidget {
 
 class _CartesianGraphDialogState extends State<_CartesianGraphDialog> {
   final GlobalKey<FormState> _form = GlobalKey<FormState>();
-  final TextEditingController _origin = TextEditingController(
-    text: '250, 450',
-  );
+  final TextEditingController _origin = TextEditingController(text: '250, 450');
   final TextEditingController _xRange = TextEditingController(text: '-10, 10');
   final TextEditingController _yRange = TextEditingController(text: '-10, 10');
   final TextEditingController _gridStep = TextEditingController(text: '25.0');
@@ -798,8 +918,7 @@ class _CartesianGraphDialogState extends State<_CartesianGraphDialog> {
                 key: const ValueKey<String>('graph-origin'),
                 controller: _origin,
                 decoration: const InputDecoration(labelText: 'Origin (x, y)'),
-                validator: (String? v) =>
-                    _validatePair(v, integers: false),
+                validator: (String? v) => _validatePair(v, integers: false),
               ),
               TextFormField(
                 key: const ValueKey<String>('graph-x-range'),
@@ -826,8 +945,7 @@ class _CartesianGraphDialogState extends State<_CartesianGraphDialog> {
               CheckboxListTile(
                 key: const ValueKey<String>('graph-show-labels'),
                 value: _showLabels,
-                onChanged: (bool? v) =>
-                    setState(() => _showLabels = v ?? true),
+                onChanged: (bool? v) => setState(() => _showLabels = v ?? true),
                 title: const Text('Show labels', style: _bodyStyle),
                 contentPadding: EdgeInsets.zero,
                 controlAffinity: ListTileControlAffinity.leading,
@@ -917,8 +1035,7 @@ class _NumberLineDialogState extends State<_NumberLineDialog> {
               CheckboxListTile(
                 key: const ValueKey<String>('graph-show-labels'),
                 value: _showLabels,
-                onChanged: (bool? v) =>
-                    setState(() => _showLabels = v ?? true),
+                onChanged: (bool? v) => setState(() => _showLabels = v ?? true),
                 title: const Text('Show labels', style: _bodyStyle),
                 contentPadding: EdgeInsets.zero,
                 controlAffinity: ListTileControlAffinity.leading,

@@ -53,6 +53,15 @@ _ZOOM_MIN, _ZOOM_MAX = 0.05, 20.0  # template §3 zoom range
 _POLL_MS = 10  # Tk-thread poller cadence for off-thread after() requests
 _DRAG_CLEAR_MS = 300  # Issue 04: silence window this long after the last move
 
+# Issue 04 round 3 (window layout): Tk's default toplevel is ~200×200 and the
+# HUD + export bar eat ~100 px, so the mirror opened as a "thin row" — and the
+# legacy SetParent child window (see Doc 06 header) broke native resize, so the
+# user could never fix it. build() applies this default geometry + minsize
+# (wiring point chosen here, in StudioWindow.build, so run_full and the tests
+# share the same guarantee); size-only geometry preserves a caller-set +x+y.
+_DEFAULT_GEOMETRY = "1280x800"
+_DEFAULT_MINSIZE = (800, 560)
+
 
 def _move_loop_active() -> bool:
     """Issue 04: ``True`` while Win32's modal move/size loop runs on this thread.
@@ -231,6 +240,11 @@ class StudioWindow:
         self._root = parent.winfo_toplevel()
         self._tk_ident = threading.get_ident()
         self._root.title("SlateSync Studio")
+
+        # Issue 04 round 3: usable default size + hard floor (see module
+        # constants). Size-only geometry leaves any caller-set position intact.
+        self._root.geometry(_DEFAULT_GEOMETRY)
+        self._root.minsize(*_DEFAULT_MINSIZE)
 
         # Issue 04: track toplevel position changes → drag flag (child
         # <Configure> events share the toplevel's bindtag — filter them out).

@@ -536,9 +536,7 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
               style: const TextStyle(color: StudioTheme.text),
               decoration: InputDecoration(
                 hintText: 'Search canvases',
-                hintStyle: TextStyle(
-                  color: StudioTheme.text.withValues(alpha: 0.5),
-                ),
+                hintStyle: const TextStyle(color: StudioTheme.subText),
                 prefixIcon: const Icon(Icons.search),
                 filled: true,
                 fillColor: StudioTheme.surface,

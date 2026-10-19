@@ -6,6 +6,8 @@ import 'package:flutter/widgets.dart';
 import 'package:mobile_app/canvas_engine/tiled_canvas_painter.dart';
 import 'package:mobile_app/core/models/canvas_models.dart';
 
+import 'support/recording_canvas.dart';
+
 /// Doc 22 §6 acceptance: tile key math (incl. negatives), LRU eviction order
 /// + byte cap, R-tree query ≡ brute force on random fixtures, dirty-set ≤ 4
 /// rebakes per commit, and a Picture bake/replay smoke test.
@@ -508,6 +510,156 @@ void main() {
       expect(find.byType(RepaintBoundary), findsNWidgets(2));
       expect(find.byType(CustomPaint), findsNWidgets(2));
       expect(engine.cache.contains(const TileKey(0, 0)), isTrue);
+    });
+  });
+
+  group('CanvasBackgroundPainter (Issue 02 light canvas)', () {
+    test('bounded BLANK: soft shadow + white fill + 1 px frame, no pattern',
+        () {
+      final CanvasBackgroundPainter painter = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity(),
+        scale: 1.0,
+        boundary: const Rect.fromLTWH(0, 0, 2480, 3508),
+        style: 'BLANK',
+      );
+      final RecordingCanvas spy = RecordingCanvas();
+      painter.paint(spy, const Size(800, 600));
+
+      expect(spy.didCall('drawRect'), isTrue);
+      expect(spy.didCall('drawLine'), isFalse); // BLANK draws no pattern
+      expect(spy.didCall('drawCircle'), isFalse);
+      // White paper fill (default `background_color` #FFFFFF == strokeCanvas).
+      expect(
+        spy.paintsOf('drawRect').map((Paint p) => p.color.toARGB32()),
+        contains(0xFFFFFFFF),
+      );
+      // Documented feathered drop shadow (bounded presets only).
+      expect(
+        spy.paintsOf('drawRect').any((Paint p) => p.maskFilter != null),
+        isTrue,
+      );
+      // Subtle light-gray frame, screen-scaled: 1.0 / scale world units.
+      final Paint frame = spy.paintsOf('drawRect').singleWhere(
+            (Paint p) => p.color.toARGB32() == kPageBorderColor.toARGB32(),
+          );
+      expect(frame.style, PaintingStyle.stroke);
+      expect(frame.strokeWidth, 1.0);
+    });
+
+    test('INFINITE: visible-world fill only — no shadow, no frame', () {
+      final CanvasBackgroundPainter painter = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity(),
+        scale: 2.0,
+        boundary: null,
+        style: 'BLANK',
+      );
+      final RecordingCanvas spy = RecordingCanvas();
+      painter.paint(spy, const Size(400, 300));
+
+      expect(spy.paintsOf('drawRect'), hasLength(1)); // fill only
+      final Paint fill = spy.paintsOf('drawRect').single;
+      expect(fill.maskFilter, isNull);
+      expect(fill.color.toARGB32(), 0xFFFFFFFF);
+    });
+
+    test('RULED: light-gray world lines every 32 u at ≈1 screen px', () {
+      final CanvasBackgroundPainter painter = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity(),
+        scale: 2.0,
+        boundary: const Rect.fromLTWH(0, 0, 400, 400),
+        style: 'RULED',
+      );
+      final RecordingCanvas spy = RecordingCanvas();
+      painter.paint(spy, const Size(300, 300));
+
+      expect(spy.didCall('drawLine'), isTrue);
+      // y ≡ 0 (mod 32) over the page: 0, 32, …, 384 → 13 lines (Doc 08).
+      expect(spy.paintsOf('drawLine'), hasLength(13));
+      final Paint line = spy.paintsOf('drawLine').first;
+      expect(line.color.toARGB32(), kPagePatternColor.toARGB32());
+      expect(line.strokeWidth, 0.5); // 1.0 / scale ⇒ 1 device px
+    });
+
+    test('DOT_GRID: light-gray dots on the 24 u world lattice', () {
+      final CanvasBackgroundPainter painter = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity(),
+        scale: 1.0,
+        boundary: const Rect.fromLTWH(0, 0, 96, 96),
+        style: 'DOT_GRID',
+      );
+      final RecordingCanvas spy = RecordingCanvas();
+      painter.paint(spy, const Size(200, 200));
+
+      // 5 × 5 lattice points (0, 24, 48, 72, 96 on both axes).
+      expect(spy.paintsOf('drawCircle'), hasLength(25));
+      expect(
+        spy.paintsOf('drawCircle').first.color.toARGB32(),
+        kPagePatternColor.toARGB32(),
+      );
+    });
+
+    test('ISO_GRID: three Doc 26 families (-30°, +30°, vertical) at 24 u', () {
+      final CanvasBackgroundPainter painter = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity(),
+        scale: 1.0,
+        boundary: const Rect.fromLTWH(0, 0, 480, 480),
+        style: 'ISO_GRID',
+      );
+      final RecordingCanvas spy = RecordingCanvas();
+      painter.paint(spy, const Size(300, 300));
+
+      expect(spy.didCall('drawLine'), isTrue);
+      // 28 (−30°) + 28 (+30°) + 21 (vertical) world-anchored lines.
+      expect(spy.paintsOf('drawLine'), hasLength(77));
+      expect(
+        spy.paintsOf('drawLine').every(
+              (Paint p) =>
+                  p.color.toARGB32() == kPagePatternColor.toARGB32(),
+            ),
+        isTrue,
+      );
+    });
+
+    test('shouldRepaint reacts to camera, page, style and color changes', () {
+      final CanvasBackgroundPainter base = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity(),
+        scale: 1.0,
+        boundary: const Rect.fromLTWH(0, 0, 2480, 3508),
+        style: 'BLANK',
+      );
+      expect(base.shouldRepaint(base), isFalse);
+
+      final CanvasBackgroundPainter zoomed = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity(),
+        scale: 2.0,
+        boundary: const Rect.fromLTWH(0, 0, 2480, 3508),
+        style: 'BLANK',
+      );
+      expect(zoomed.shouldRepaint(base), isTrue);
+
+      final CanvasBackgroundPainter panned = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity()..setTranslationRaw(40, 20, 0),
+        scale: 1.0,
+        boundary: const Rect.fromLTWH(0, 0, 2480, 3508),
+        style: 'BLANK',
+      );
+      expect(panned.shouldRepaint(base), isTrue);
+
+      final CanvasBackgroundPainter ruled = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity(),
+        scale: 1.0,
+        boundary: const Rect.fromLTWH(0, 0, 2480, 3508),
+        style: 'RULED',
+      );
+      expect(ruled.shouldRepaint(base), isTrue);
+
+      final CanvasBackgroundPainter resized = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity(),
+        scale: 1.0,
+        boundary: const Rect.fromLTWH(0, 0, 1748, 2480),
+        style: 'BLANK',
+      );
+      expect(resized.shouldRepaint(base), isTrue);
     });
   });
 }

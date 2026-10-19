@@ -55,6 +55,214 @@ void main() {
     });
   });
 
+  group('issue 02B: tip size, palette, opacity', () {
+    const ValueKey<String> widthSlider = ValueKey<String>('width-slider');
+    const ValueKey<String> previewDot = ValueKey<String>('tip-preview-dot');
+    const ValueKey<String> tipLabel = ValueKey<String>('tip-size-label');
+    const ValueKey<String> opacitySlider = ValueKey<String>('opacity-slider');
+
+    testWidgets(
+      'width slider spans 0.5–20 dp, snaps 0.5 steps, clamps and writes '
+      'config.width',
+      (WidgetTester tester) async {
+        final ValueNotifier<ToolConfig> config = ValueNotifier<ToolConfig>(
+          ToolConfig(),
+        );
+        final ValueNotifier<StudioTool> tool = ValueNotifier<StudioTool>(
+          StudioTool.pen,
+        );
+        await pumpDock(tester, config: config, tool: tool);
+        await tester.tap(find.byKey(dockToggle));
+        await tester.pumpAndSettle();
+
+        final Slider slider = tester.widget<Slider>(find.byKey(widthSlider));
+        expect(slider.min, 0.5);
+        expect(slider.max, 20.0);
+        expect(slider.divisions, 39, reason: '0.5 dp fine steps');
+        expect(slider.value, 2.5, reason: 'default tip width');
+
+        // Snaps to the nearest 0.5 dp step.
+        slider.onChanged!(7.4);
+        await tester.pump();
+        expect(config.value.width, 7.5);
+
+        // Clamps at the top of the range.
+        slider.onChanged!(50);
+        await tester.pump();
+        expect(config.value.width, 20.0);
+        expect(tester.widget<Slider>(find.byKey(widthSlider)).value, 20.0);
+
+        // Clamps at the bottom of the range.
+        slider.onChanged!(0.1);
+        await tester.pump();
+        expect(config.value.width, 0.5);
+
+        // Live value label reflects the clamped width.
+        expect(tester.widget<Text>(find.byKey(tipLabel)).data, 'Width 0.5 dp');
+      },
+    );
+
+    testWidgets('preview dot scales with config.width', (
+      WidgetTester tester,
+    ) async {
+      final ValueNotifier<ToolConfig> config = ValueNotifier<ToolConfig>(
+        ToolConfig(),
+      );
+      final ValueNotifier<StudioTool> tool = ValueNotifier<StudioTool>(
+        StudioTool.pen,
+      );
+      await pumpDock(tester, config: config, tool: tool);
+      await tester.tap(find.byKey(dockToggle));
+      await tester.pumpAndSettle();
+
+      // Default 2.5 dp → 2.5 × 2.5 dp dot.
+      Size size = tester.getSize(find.byKey(previewDot));
+      expect(size.width, closeTo(2.5, 0.001));
+      expect(size.height, closeTo(2.5, 0.001));
+
+      tester.widget<Slider>(find.byKey(widthSlider)).onChanged!(12);
+      await tester.pump();
+      size = tester.getSize(find.byKey(previewDot));
+      expect(size.width, closeTo(12.0, 0.001));
+      expect(size.height, closeTo(12.0, 0.001));
+    });
+
+    testWidgets('palette sets exact hexes and shows the check indicator', (
+      WidgetTester tester,
+    ) async {
+      final ValueNotifier<ToolConfig> config = ValueNotifier<ToolConfig>(
+        ToolConfig(),
+      );
+      final ValueNotifier<StudioTool> tool = ValueNotifier<StudioTool>(
+        StudioTool.pen,
+      );
+      await pumpDock(tester, config: config, tool: tool);
+      await tester.tap(find.byKey(dockToggle));
+      await tester.pumpAndSettle();
+
+      const List<String> palette = <String>[
+        '#1E1E1E',
+        '#F0546F',
+        '#4F8EF7',
+        '#2ECC71',
+        '#F1C40F',
+        '#D64550',
+        '#9B59B6',
+        '#FFFFFF',
+      ];
+      expect(palette, hasLength(8));
+
+      for (final String hex in palette) {
+        await tester.tap(find.byKey(ValueKey<String>('swatch-$hex')));
+        await tester.pump();
+        expect(config.value.color, hex, reason: 'swatch $hex');
+        expect(find.byIcon(Icons.check), findsOneWidget);
+        expect(
+          find.descendant(
+            of: find.byKey(ValueKey<String>('swatch-$hex')),
+            matching: find.byIcon(Icons.check),
+          ),
+          findsOneWidget,
+          reason: 'check indicator on $hex',
+        );
+      }
+
+      // White swatch must carry a fixed gray ring when unselected.
+      await tester.tap(find.byKey(const ValueKey<String>('swatch-#1E1E1E')));
+      await tester.pump();
+      final Container white = tester.widget<Container>(
+        find.descendant(
+          of: find.byKey(const ValueKey<String>('swatch-#FFFFFF')),
+          matching: find.byType(Container),
+        ),
+      );
+      final BoxDecoration whiteDeco = white.decoration! as BoxDecoration;
+      expect(whiteDeco.border?.top.color, const Color(0xFF9E9E9E));
+      expect(config.value.color, '#1E1E1E');
+    });
+
+    testWidgets(
+      'opacity slider lives on the highlighter panel only, spans 10–100%, '
+      'clamps and writes config.opacity',
+      (WidgetTester tester) async {
+        final ValueNotifier<ToolConfig> config = ValueNotifier<ToolConfig>(
+          ToolConfig(),
+        );
+        final ValueNotifier<StudioTool> tool = ValueNotifier<StudioTool>(
+          StudioTool.pen,
+        );
+        await pumpDock(tester, config: config, tool: tool);
+        await tester.tap(find.byKey(dockToggle));
+        await tester.pumpAndSettle();
+
+        // Pen panel: no opacity slider (issue 02B: highlighter only).
+        expect(find.byKey(opacitySlider), findsNothing);
+
+        await tester.tap(
+          find.byKey(const ValueKey<String>('tool-highlighter')),
+        );
+        await tester.pumpAndSettle();
+
+        final Slider opacity = tester.widget<Slider>(find.byKey(opacitySlider));
+        expect(opacity.min, 0.1);
+        expect(opacity.max, 1.0);
+        expect(opacity.value, 1.0, reason: 'default opacity');
+
+        opacity.onChanged!(0.05);
+        await tester.pump();
+        expect(config.value.opacity, 0.1, reason: 'clamp to 10%');
+
+        opacity.onChanged!(9);
+        await tester.pump();
+        expect(config.value.opacity, 1.0, reason: 'clamp to 100%');
+
+        opacity.onChanged!(0.42);
+        await tester.pump();
+        expect(config.value.opacity, 0.42, reason: '1% fine steps');
+
+        // Multiply note stays glued to the highlighter panel.
+        expect(
+          find.byKey(const ValueKey<String>('multiply-note')),
+          findsOneWidget,
+        );
+      },
+    );
+
+    testWidgets('eraser precision reuses ToolConfig.width as hit radius', (
+      WidgetTester tester,
+    ) async {
+      final ValueNotifier<ToolConfig> config = ValueNotifier<ToolConfig>(
+        ToolConfig(),
+      );
+      final ValueNotifier<StudioTool> tool = ValueNotifier<StudioTool>(
+        StudioTool.pen,
+      );
+      await pumpDock(tester, config: config, tool: tool);
+      await tester.tap(find.byKey(const ValueKey<String>('tool-eraser')));
+      await tester.pump();
+      await tester.tap(find.byKey(dockToggle));
+      await tester.pumpAndSettle();
+
+      final Slider slider = tester.widget<Slider>(find.byKey(widthSlider));
+      expect(slider.min, 0.5);
+      expect(slider.max, 20.0);
+      expect(
+        tester.widget<Text>(find.byKey(tipLabel)).data,
+        'Hit radius 2.5 dp',
+      );
+
+      slider.onChanged!(8);
+      await tester.pump();
+      expect(config.value.width, 8.0);
+      expect(
+        tester.widget<Text>(find.byKey(tipLabel)).data,
+        'Hit radius 8.0 dp',
+      );
+      // Preview dot reuses the same scaled size for the eraser.
+      expect(tester.getSize(find.byKey(previewDot)).width, closeTo(8.0, 0.001));
+    });
+  });
+
   group('StudioTool → ToolId byte table (Doc 24 §4)', () {
     const Map<StudioTool, int> expected = <StudioTool, int>{
       StudioTool.pen: 0x01,
@@ -157,9 +365,8 @@ void main() {
 
   group('pure UI guarantee (Doc 24 §6)', () {
     test('dock source imports no network code', () {
-      final String src = File(
-        'lib/features/tools/tool_palette_dock.dart',
-      ).readAsStringSync();
+      final String src = File('lib/features/tools/tool_palette_dock.dart')
+          .readAsStringSync();
       expect(src, isNot(contains('web_socket_channel')));
       expect(src, isNot(contains('vector_sync_client.dart')));
     });
@@ -324,10 +531,7 @@ void main() {
       expect(captured!.filename, 'shot.png');
       expect(captured!.widthPx, 400);
       expect(captured!.heightPx, 200);
-      expect(
-        captured!.plannedWorldRect,
-        const Rect.fromLTWH(0, 0, 600, 300),
-      );
+      expect(captured!.plannedWorldRect, const Rect.fromLTWH(0, 0, 600, 300));
     });
 
     testWidgets('Cartesian dialog emits the exact Doc 03 object', (

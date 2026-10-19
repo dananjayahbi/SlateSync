@@ -111,6 +111,12 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
     _camera = CameraController();
     _engine = TiledCanvasEngine(camera: _camera);
     _artboard = ArtboardManager(preset: _doc.artboard.preset);
+    // Issue 02: the studio never rendered page backgrounds before — adopt the
+    // document's saved background so RULED/DOT_GRID/ISO_GRID docs paint their
+    // pattern (the manager seeds BLANK/#FFFFFF on construction).
+    _artboard.current
+      ..backgroundStyle = _doc.artboard.backgroundStyle
+      ..backgroundColor = _doc.artboard.backgroundColor;
     _toolConfig = ValueNotifier<ToolConfig>(ToolConfig());
     _tool = ValueNotifier<StudioTool>(StudioTool.pen);
     _snap = ValueNotifier<bool>(true);
@@ -527,7 +533,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
 
   void _eraseAt(Offset screen, {required bool drag}) {
     final Offset world = _camera.screenToWorld(screen, _viewport);
-    final double pad = 10.0 / math.max(_camera.scale, 1e-6);
+    // Eraser hit radius follows ToolConfig.width (dock's "Hit radius" slider, dp).
+    final double pad =
+        math.max(_toolConfig.value.width, 1.0) / math.max(_camera.scale, 1e-6);
     final Rect probe = Rect.fromLTWH(
       world.dx - pad,
       world.dy - pad,
@@ -921,6 +929,18 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
         SyncState.idle => 'Connect PC',
       };
 
+  /// Artboard `background_color` parsed to a [Color] (Issue 02: white paper
+  /// falls back to [StudioTheme.strokeCanvas] on malformed values).
+  Color get _pageColor {
+    final String digits =
+        _artboard.current.backgroundColor.replaceFirst('#', '');
+    final int? value = digits.length == 6 ? int.tryParse(digits, radix: 16) : null;
+    if (value == null) {
+      return StudioTheme.strokeCanvas;
+    }
+    return Color(0xFF000000 | value);
+  }
+
   @override
   Widget build(BuildContext context) {
     final String? banner = _bannerText;
@@ -1059,6 +1079,25 @@ class _CanvasStudioPageState extends State<CanvasStudioPage> {
         );
         return Stack(
           children: <Widget>[
+            // Issue 02 — white paper canvas: the viewport sits on
+            // `strokeCanvas`, then the artboard page/pattern/shadow layer,
+            // then the input + stroke layers above it.
+            const Positioned.fill(
+              child: ColoredBox(color: StudioTheme.strokeCanvas),
+            ),
+            Positioned.fill(
+              child: RepaintBoundary(
+                child: CustomPaint(
+                  painter: CanvasBackgroundPainter(
+                    viewMatrix: _camera.viewMatrix,
+                    scale: _camera.scale,
+                    boundary: _artboard.boundaryRect(),
+                    style: _artboard.current.backgroundStyle,
+                    pageColor: _pageColor,
+                  ),
+                ),
+              ),
+            ),
             Positioned.fill(
               child: Listener(
                 behavior: HitTestBehavior.opaque,

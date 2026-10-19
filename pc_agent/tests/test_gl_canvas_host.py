@@ -481,11 +481,10 @@ def test_mount_smoke_live_stroke_from_worker_gl_error_free() -> None:
 
         assert host._ctx is not None
         assert host._ctx.error == "GL_NO_ERROR"
-        if host._mode == "primary":
-            import ctypes
-
-            parent_hwnd = int(host._frame.winfo_id())
-            assert ctypes.windll.user32.GetParent(int(host._window._hwnd)) == parent_hwnd
+        # Round-3 default: the pure-Tk blit path — no pyglet window, no
+        # SetParent child (issue 03/04: that child corrupted Win11 drag/resize).
+        assert host._mode == "fallback", "the default mount must be the pure-Tk blit path"
+        assert host._window is None and host._user32 is None
     finally:
         try:
             host.shutdown()
@@ -495,7 +494,14 @@ def test_mount_smoke_live_stroke_from_worker_gl_error_free() -> None:
 
 
 @requires_gl
-def test_primary_embedding_uses_gl33_context_and_requested_msaa() -> None:
+def test_primary_embedding_uses_gl33_context_and_requested_msaa(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Round-3 change (documented): SetParent is NO LONGER the default — this
+    # test now proves the legacy embedding still works when explicitly opted
+    # in via SLATESYNC_EMBED=setparent (Doc 06 escape hatch), GetParent check
+    # included.
+    monkeypatch.setenv("SLATESYNC_EMBED", "setparent")
     root = _make_root()
     host = GLCanvasHost(root, AppConfig(), EventBus())
     try:
@@ -503,10 +509,14 @@ def test_primary_embedding_uses_gl33_context_and_requested_msaa() -> None:
         parent.pack(fill="both", expand=True)
         host.mount(parent)
         if host._mode != "primary":
-            pytest.skip(f"primary pyglet/SetParent embedding unavailable (mode={host._mode})")
+            pytest.skip(f"setparent pyglet embedding unavailable (mode={host._mode})")
         assert str(host._ctx.info["GL_VERSION"]).startswith("3.3")
         assert host._window.config.sample_buffers == 1
         assert host._window.config.samples == 4
+        import ctypes
+
+        parent_hwnd = int(host._frame.winfo_id())
+        assert ctypes.windll.user32.GetParent(int(host._window._hwnd)) == parent_hwnd
     finally:
         try:
             host.shutdown()
@@ -516,13 +526,16 @@ def test_primary_embedding_uses_gl33_context_and_requested_msaa() -> None:
 
 
 @requires_gl
-def test_fallback_fbo_tracks_widget_size_within_roi(monkeypatch) -> None:
+def test_fallback_fbo_tracks_widget_size_within_roi() -> None:
+    # Round-3 change (documented): Doc 06's FALLBACK is now the DEFAULT path,
+    # so the _embed_pyglet monkeypatch that used to force it is gone, and the
+    # ROI cap moved from 1280x720 to 1600x900 (issue 04: keep filling a
+    # maximized window).
     root = _make_root()
     host = GLCanvasHost(root, AppConfig(), EventBus())
     try:
         parent = tk.Frame(root, width=320, height=240)
         parent.pack(fill="both", expand=True)
-        monkeypatch.setattr(host, "_embed_pyglet", lambda: False)  # force FALLBACK
         host.mount(parent)
         assert host._mode == "fallback"
         assert host._fbo is not None and host._label is not None
@@ -530,7 +543,7 @@ def test_fallback_fbo_tracks_widget_size_within_roi(monkeypatch) -> None:
         host.resize(640, 360)
         assert host._fbo.size == (640, 360), "FBO must track the widget size"
         host.resize(2000, 900)
-        assert host._fbo.size == (1280, 720), "FALLBACK ROI is capped at 1280x720"
+        assert host._fbo.size == (1600, 900), "blit ROI is capped at 1600x900"
 
         host.request_redraw()
         for _ in range(6):
