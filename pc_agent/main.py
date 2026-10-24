@@ -149,9 +149,21 @@ def run_full() -> int:
 
     # --- 4. exports (Doc 15); output files land in config.export_dir --------
     current_doc: dict[str, CanvasDocument | None] = {"doc": None}
+    #: Round-8 issue 05 — filled in section 5 so the DOCUMENT_LOADED handler
+    #: (registered below) can reach the GL host built after it.
+    current_host: dict[str, object] = {"host": None}
 
     def remember_document(doc=None, **_extra) -> None:
         current_doc["doc"] = doc
+        # Round-8 issue 05: mirrored IMAGE nodes need the open canvas's asset
+        # folder injected into PrimitiveRenderer, otherwise
+        # resolve_asset_path(None, ref) can never find the uploaded bytes.
+        # ``host`` is looked up at call time: the GL host is built in section 5,
+        # after this handler is registered.
+        canvas_id = getattr(doc, "canvas_id", None) if doc is not None else None
+        host = current_host["host"]
+        if canvas_id and host is not None:
+            host.set_assets_root(document_store.assets_dir(str(canvas_id)))
 
     def document_for_export(_payload: dict) -> CanvasDocument:
         """Doc 15 loader: job payload → LIVE snapshot of the open document.
@@ -179,6 +191,7 @@ def run_full() -> int:
     # --- 5. Tk root → StudioWindow → GL host (Doc 16 layout) ----------------
     root = tk.Tk()  # visible at launch (withdrawn=False)
     gl_host = GLCanvasHost(root, config, bus)
+    current_host["host"] = gl_host
     window = StudioWindow(
         config,
         bus,

@@ -322,6 +322,9 @@ def test_module_imports_only_contract_models() -> None:
         "pc_agent.engine.scene_graph": {"CanvasNode"},
         "pc_agent.engine.document_store": {"Artboard"},
         "pc_agent.viewport.gl_canvas_host": {"ProgramRegistry"},
+        # Round-8 issue 02: pure leaf helper (no GL, no engine deps) for the
+        # fill-vs-outline decision the Doc 08 §5(7) contract always required.
+        "pc_agent.viewport.shape_fill": {"shape_is_filled"},
     }
     pc_modules = {module for module in imported if module.startswith("pc_agent")}
     assert pc_modules <= set(allowed), f"unexpected pc_agent imports: {pc_modules}"
@@ -554,7 +557,10 @@ def test_render_smoke_a4_ruled_number_line_image_single_frame() -> None:
             kind="SHAPE",
             layer=1,
             bbox=(1220.0, 1734.0, 1260.0, 1774.0),
-            style=NodeStyle(color="#FF0000", stroke_width=2.0),
+            # Round-8 issue 02: stroke_width == 0 is the schema's only way to
+            # request a solid shape (see pc_agent/viewport/shape_fill.py), so
+            # this node exercises the fill branch; positive widths are outlines.
+            style=NodeStyle(color="#FF0000", stroke_width=0.0),
             geometry=NodeGeometry(shape_type="RECT"),
         )
         multiplied = CanvasNode(

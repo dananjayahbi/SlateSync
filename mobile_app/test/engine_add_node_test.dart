@@ -252,7 +252,10 @@ void main() {
       expect(bottom.inkCount, greaterThan(100)); // axis below the boundary
     });
 
-    test('IMAGE: bbox outline ink + culling', () async {
+    test('IMAGE: no decodable bytes paints NOTHING (round-8 issue 05)', () async {
+      // The bug: an IMAGE node drew a filled bbox rect, so a picked photo
+      // never appeared and a missing asset looked like a solid block. Now an
+      // unresolved asset paints no ink at all.
       final TiledCanvasEngine engine = newEngine();
       engine.addNode(makeKind(
         'img',
@@ -264,9 +267,30 @@ void main() {
       expect(visibleIds(engine), <String>['img']);
       expect(engine.rebakeCount, lessThanOrEqualTo(4));
       final _Raster r = await _rasterOf(engine.getTile(const TileKey(0, 0)));
+      expect(r.inkCount, 0);
+    });
+
+    test('IMAGE: decoded bytes paint inside the bbox', () async {
+      final TiledCanvasEngine engine = newEngine();
+      // A 4×4 opaque red PNG standing in for a photo.
+      engine.assets.resolve('assets/pic.png', await _redPngBytes());
+      engine.addNode(makeKind(
+        'img',
+        'IMAGE',
+        const Rect.fromLTWH(100, 100, 300, 200),
+        pts: const <List<double>>[],
+        assetRef: 'assets/pic.png',
+      ));
+      // Decoding is async; drive it directly rather than via the bake path.
+      engine.assets.ensureDecoded(<String>['assets/pic.png']);
+      for (int i = 0; i < 50 && !engine.assets.isReady('assets/pic.png'); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(engine.assets.isReady('assets/pic.png'), isTrue);
+      engine.invalidateAllTiles();
+      final _Raster r = await _rasterOf(engine.getTile(const TileKey(0, 0)));
       expect(r.inkCount, greaterThan(2000));
-      expect(r.inkAt(100, 200), isTrue); // left edge
-      expect(r.inkAt(400, 200), isTrue); // right edge
+      expect(r.inkAt(250, 200), isTrue); // centre is painted
     });
 
     test('LINE: straight first→last segment, intermediate anchors ignored',
@@ -526,6 +550,22 @@ class _Raster {
   }
 
   bool inkAt(int x, int y) => bytes[(y * 1024 + x) * 4 + 3] >= _minAlpha;
+}
+
+/// A 4×4 opaque red PNG — real encoded bytes so the IMAGE branch decodes
+/// instead of falling back to "no ink" (round-8 issue 05).
+Future<Uint8List> _redPngBytes() async {
+  final ui.PictureRecorder recorder = ui.PictureRecorder();
+  final Canvas canvas = Canvas(recorder);
+  canvas.drawRect(
+    const Rect.fromLTWH(0, 0, 4, 4),
+    Paint()..color = const Color(0xFFCC2222),
+  );
+  final ui.Image image = await recorder.endRecording().toImage(4, 4);
+  final ByteData? png =
+      await image.toByteData(format: ui.ImageByteFormat.png);
+  image.dispose();
+  return png!.buffer.asUint8List(png.offsetInBytes, png.lengthInBytes);
 }
 
 Future<_Raster> _rasterOf(ui.Picture picture) async {

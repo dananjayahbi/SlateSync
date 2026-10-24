@@ -140,3 +140,72 @@ ToolConfig defaultToolConfig(StudioTool tool);  // §10.7 per-tool store default
 - **Wave 2.A** (Session 2 merged wave, Subagent 6 per `overview.md` §6; template matrix row 24 → 2.A). Depends only on Wave 1.A artifacts (Doc 05 constants/theme) and Doc 21 signatures — both frozen.
 - Zero overlap with the other 7 Wave 2.A docs: Creates paths are exclusive to Doc 24 (Docs 08/13/14/15/16/17 are `pc_agent/**`; Doc 26 owns `features/home` + `core/storage`; Doc 27 owns `features/export`).
 - **Never touches:** `pc_agent/**`, `shared_specs/**`, `mobile_app/lib/network/**` (Doc 25), `mobile_app/lib/features/home/**`, `mobile_app/lib/core/storage/**` (Doc 26), `mobile_app/lib/features/export/**` (Doc 27), `mobile_app/lib/canvas_engine/**` (Docs 20–23), `mobile_app/lib/core/models/**` (Doc 05). Network wiring happens in Wave 3.A, never here.
+
+---
+
+## 8. Round-8 Amendment — Hold-to-Configure, Brush Eraser, Selector (NORMATIVE)
+
+### 8.1 The expandable column and its toggle are REMOVED
+
+`dock-toggle` and the `dock-panel` scroll column no longer exist. A tool's configuration is reached
+by pressing and holding that rail button for **2000 ms** (unchanged from Doc 02 §10.7; the custom
+`Timer`, not Flutter's ~500 ms `onLongPress`). The panel is an `OverlayEntry` keyed
+`property-overlay-panel`, anchored to the right of the rail and clamped on screen.
+
+* Tapping a tool selects it instantly; releasing before 2000 ms is a tap.
+* While a panel is open, tapping a DIFFERENT tool **re-targets** the panel to that tool (it stays
+  open). This supersedes the round-6 "switch closes the panel" rule; the sync invariant it protected
+  — never showing one tool's rows against another tool's config — still holds because re-targeting
+  replaces `config.value` with the new tool's stored `ToolConfig`.
+* The panel closes on any tap outside it, and before the Cartesian/Number-Line builder dialogs open
+  (the overlay sits above the Navigator, so a dialog would otherwise be unreachable).
+
+### 8.2 `StudioTool.select` is the FIRST tool and the new default surface for edits
+
+Added as ordinal 0; it streams `ToolId.shapePreview` (0x04) and has no live ink. Selection semantics:
+
+| gesture | result |
+|---|---|
+| tap an object | selects it (topmost by layer) |
+| drag on empty space | marquee — selects every intersecting node, the only way to select free strokes |
+| drag inside the selection | moves every selected node |
+| drag a corner/edge handle | resizes — only when `canScaleSelection` holds |
+
+**Free-hand strokes are move/delete only.** `kScalableKinds` excludes `STROKE`/`HIGHLIGHT`, so the
+handle set is suppressed as soon as the selection contains one. The `delete-selection` FAB appears
+whenever something is selected and deletes the whole selection (strokes included).
+
+Transforms reuse the frozen action set — no schema change: each replaced node emits
+`DELETE_NODE(node_id)` then its own add action (`ADD_STROKE`/`ADD_SHAPE`/`ADD_GRAPH`/`ADD_IMAGE`)
+carrying the new geometry, so the PC mirrors a move/resize exactly like a fresh commit.
+
+### 8.3 Eraser: `brush` is the DEFAULT mode
+
+`EraserMode { brush, element }` replaces `{ precision, stroke }`.
+`ToolConfig.eraserMode` now defaults to `brush`.
+
+* **brush** — a real eraser. `canvas_engine/stroke_eraser.dart::splitPolyline` drops every vertex
+  inside a swept disc and cuts the polyline into the surviving contiguous runs; each run becomes its
+  own node (original `DELETE_NODE` + one `ADD_STROKE` per fragment). Bbox-based kinds
+  (SHAPE/IMAGE/GRAPH_AXES) have no polyline to split, so a disc clears them only when it lands on
+  them. A fragment shorter than 2 points is discarded.
+* **element** — the previous behaviour: the whole hit node is deleted, one `DELETE_NODE` per node per
+  drag (`_erasedInDrag` dedupe).
+* BOTH modes now follow the drag (the old `precision` mode only fired on pointer-down).
+* Radius writes `ToolConfig.width` and the panel labels it "Eraser radius".
+
+### 8.4 IMAGE nodes paint their bitmap
+
+`_drawNode` previously drew `canvas.drawRect(bbox)` for `kind == 'IMAGE'`, so a picked photo never
+appeared. `canvas_engine/asset_image_cache.dart` now holds encoded→decoded `ui.Image` per
+`geometry.asset_ref`; `TiledCanvasEngine.assets` is populated by the canvas page on pick
+(`resolve`) and on open (`_primeArchivedAssets` reads `<base>/assets/<canvasId>/`), the bake calls
+`ensureDecoded`, and `onReady` invalidates the tiles holding that node. An undecoded asset paints
+nothing rather than a misleading block.
+
+### 8.5 Acceptance
+* `mobile_app/test/stroke_eraser_test.dart` — split geometry, the move-only rule, both eraser modes.
+* `mobile_app/test/tool_palette_dock_test.dart` / `tool_panels_*.dart` — hold-to-open, re-targeting,
+  the absence of `dock-toggle`, the `brush`/`element` segmented control.
+* `mobile_app/test/engine_add_node_test.dart` — an unresolvable IMAGE paints no ink; decoded bytes
+  paint inside the bbox.

@@ -97,6 +97,16 @@ Future<void> _pumpStudio(WidgetTester tester, _FakeSyncClient client) async {
   await tester.pump(); // frame 2 applies the §10.5 post-frame fit
 }
 
+/// Round-8 issue 04: the tool's config panel opens by pressing and holding the
+/// rail button for 2000 ms (the expandable column and its toggle are gone).
+Future<void> _holdTool(WidgetTester tester, String toolKey) async {
+  final Finder button = find.byKey(ValueKey<String>(toolKey));
+  final TestGesture gesture = await tester.startGesture(tester.getCenter(button));
+  await tester.pump(const Duration(milliseconds: 2050));
+  await gesture.up();
+  await tester.pumpAndSettle();
+}
+
 Future<void> _disposeStudio(WidgetTester tester, _FakeSyncClient client) async {
   await tester.pumpWidget(const SizedBox.shrink());
   await tester.pump();
@@ -385,10 +395,8 @@ void main() {
     final _FakeSyncClient client = _FakeSyncClient();
     await _pumpStudio(tester, client);
 
-    await tester.tap(find.byKey(const ValueKey<String>('dock-toggle')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const ValueKey<String>('tool-cartesianGraph')));
-    await tester.pumpAndSettle();
+    // Round-8 issue 04: the config panel opens by holding the tool.
+    await _holdTool(tester, 'tool-cartesianGraph');
     await tester.tap(find.byKey(const ValueKey<String>('open-cartesian')));
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey<String>('graph-confirm')), findsOneWidget);
@@ -435,10 +443,7 @@ void main() {
     final _FakeSyncClient client = _FakeSyncClient();
     await _pumpStudio(tester, client);
 
-    await tester.tap(find.byKey(const ValueKey<String>('dock-toggle')));
-    await tester.pumpAndSettle();
-    await tester.tap(find.byKey(const ValueKey<String>('tool-numberLine')));
-    await tester.pumpAndSettle();
+    await _holdTool(tester, 'tool-numberLine');
     await tester.tap(find.byKey(const ValueKey<String>('open-numberline')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const ValueKey<String>('graph-confirm')));

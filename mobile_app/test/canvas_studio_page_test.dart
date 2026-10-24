@@ -188,6 +188,17 @@ Future<void> _settleIo(WidgetTester tester, {int rounds = 32}) async {
   await _flushReal(tester, rounds: 2);
 }
 
+/// Round-8 issue 04: a tool's config panel opens by pressing and holding the
+/// rail button for 2000 ms (the expandable column and its toggle are gone).
+Future<void> _holdTool(WidgetTester tester, String toolKey) async {
+  final Finder button = find.byKey(ValueKey<String>(toolKey));
+  final TestGesture gesture =
+      await tester.startGesture(tester.getCenter(button));
+  await tester.pump(const Duration(milliseconds: 2050));
+  await gesture.up();
+  await tester.pumpAndSettle();
+}
+
 void main() {
   sqfliteFfiInit();
   databaseFactory = databaseFactoryFfi;
@@ -269,7 +280,11 @@ void main() {
     expect(find.byKey(const ValueKey<String>('studio-preset')), findsOneWidget);
     expect(find.byKey(const ValueKey<String>('studio-connect')), findsOneWidget);
     expect(find.byKey(const ValueKey<String>('studio-export')), findsOneWidget);
-    expect(find.byKey(const ValueKey<String>('dock-toggle')), findsOneWidget);
+    // Round-8 issue 04: the expandable column and its toggle were removed —
+    // the dock is now just the tool rail, configured by press-and-hold.
+    expect(find.byKey(const ValueKey<String>('dock-toggle')), findsNothing);
+    expect(find.byKey(const ValueKey<String>('tool-select')), findsOneWidget);
+    expect(find.byKey(const ValueKey<String>('tool-pen')), findsOneWidget);
     expect(find.byKey(const ValueKey<String>('studio-banner')), findsOneWidget);
     expect(find.textContaining('Not paired'), findsOneWidget);
 
@@ -516,7 +531,7 @@ void main() {
     await _disposeStudio(tester, client);
   });
 
-  testWidgets('eraser precision tap hit-tests the stroke → DELETE_NODE',
+  testWidgets('element-mode eraser tap hit-tests the stroke → DELETE_NODE',
       (WidgetTester tester) async {
     final _FakeSyncClient client = _FakeSyncClient(connected: true);
     await _pumpStudio(tester, client: client);
@@ -525,7 +540,11 @@ void main() {
     final String strokeId =
         _payload(_actions(client, 'ADD_STROKE').single)['node_id'] as String;
 
-    await tester.tap(find.byKey(const ValueKey<String>('tool-eraser')));
+    // Round-8 issue 03: brush is the default, so opt into whole-element mode.
+    await _holdTool(tester, 'tool-eraser');
+    await tester.tap(find.text('element'));
+    await tester.pumpAndSettle();
+    await tester.tapAt(const Offset(4, 4)); // dismiss the config panel
     await tester.pumpAndSettle();
 
     final TestGesture tap = await tester.startGesture(const Offset(340, 320));

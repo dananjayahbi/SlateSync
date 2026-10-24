@@ -126,3 +126,29 @@ def _seq_accept(self, last: int | None, seq: int) -> bool: ...   # mod 2^16 newe
 * Zero overlap confirmed: Creates (`network/__init__.py`, `network/ws_stream_server.py`, both listed tests) are exclusive to Doc 11 — Doc 12 owns `discovery_pairing.py` + its test; Docs 09/10 own `engine/*`; Docs 06/07 own `viewport/*`.
 * **Never touches:** Doc 12’s `discovery_pairing.py`/test, `pc_agent/engine/*` (Docs 09/10), `pc_agent/core/*` (Doc 04), `pc_agent/viewport/*`, `shared_specs/*`, `pc_agent/main.py`, `mobile_app/*` — Doc 12’s token arrives only through the injected `token_provider`.
 * Intra-batch contracts (all authored in this batch): server emits exactly the envelopes Docs 09/10/15 subscribe to; Doc 12 supplies `session_token` behind `token_provider`; Docs 09/10 never import `network/*`.
+
+---
+
+## 10. Round-8 Amendment — Canvas Deletion Propagation (NORMATIVE)
+
+Deleting a canvas on a tablet used to leave it on the PC forever: `CANVAS_LIST` merge is
+union-by-id with LWW, so an absent row simply kept the hub copy. The frozen action enum has no
+`CANVAS_DELETE` and none may be added.
+
+`CanvasSyncManager` therefore treats a device's `CANVAS_LIST` as a **snapshot of what that device
+still holds**:
+
+1. `_track_device_deletions(device_id, ids)` records the id set per device; the FIRST list from a
+   device only establishes a baseline, so a freshly connected tablet cannot wipe the hub.
+2. `previous_ids − current_ids` are tombstones: `_forget_canvas` drops them from `_local_rows`,
+   `_device_rows`, the pending-pull queue, `LocalCanvasIndex` (row + archive),
+   `DocumentStore.forget` (open document + uploaded assets), and clears the mirror selection when it
+   pointed at the deleted canvas.
+3. Tombstoned ids are excluded from `_merged()` and from `_plan_pulls()`, so neither a stale hub row
+   nor a retrying device can resurrect them.
+4. The hub then broadcasts the merged list as usual, which removes the canvas from every other
+   tablet.
+
+State added is in-process only (`_device_known_ids`, `_deleted_ids`) — the wire contract is
+unchanged. Acceptance: `pc_agent/tests/test_canvas_sync_hub.py` (deletion, no-resurrection,
+no-re-pull, mirror clearing, fresh-device safety).

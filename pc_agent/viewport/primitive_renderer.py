@@ -24,6 +24,8 @@ import moderngl
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from pc_agent.viewport.shape_fill import shape_is_filled
+
 if TYPE_CHECKING:  # Doc 09/10/06 contract types only — never imported at runtime
     from pc_agent.engine.document_store import Artboard
     from pc_agent.engine.scene_graph import CanvasNode
@@ -53,6 +55,11 @@ SHADOW_OFFSET_FRACTION = 0.02   # shadow offset ≈ 0.02·min(w, h)
 SHADOW_FEATHER_FACTOR = 3.0     # feather width ≈ 3× offset
 ARROW_HEAD_FRACTION = 0.25      # head length = 0.25·shaft length
 ARROW_HEAD_HALF_WIDTH = 3.0     # head half-width = 3× style.stroke_width
+# Round-8 issue 02: the tablet's `_drawArrow` barbs (Doc 08 §4(4) export
+# geometry) — stub length max(12, 4·w), ±0.4 rad off the shaft.
+ARROW_BARB_MIN_LENGTH = 12.0
+ARROW_BARB_WIDTH_FACTOR = 4.0
+ARROW_BARB_ANGLE = 0.4
 TICK_FRACTION = 0.35            # tick length = 0.35·grid_step
 LABEL_HEIGHT_FRACTION = 0.30    # glyph label height = 0.3·grid_step (world units)
 MAX_GRAPH_TICKS = 4096          # degenerate-config guard for huge ranges
@@ -533,6 +540,43 @@ def arrow_geometry(
     return shaft, head, head_len
 
 
+def arrow_outline_segments(
+    start: tuple[float, float],
+    end: tuple[float, float],
+    stroke_width: float,
+) -> list[tuple[float, float, float, float]]:
+    """ARROW as stroked segments — shaft plus two barbs (round-8 issue 02).
+
+    Mirrors the tablet's ``_drawArrow`` exactly: one ``drawLine`` for the
+    shaft and two ``drawLine`` barbs from the tip at ±0.4 rad, each
+    ``max(12, 4·stroke_width)`` world units long. The viewport's
+    ``arrow_geometry`` instead builds a filled shaft quad with an apex that
+    extends *beyond* the end point, which is why mirrored arrows looked like
+    solid wedges while the tablet drew thin strokes.
+
+    Returns ``[(ax, ay, bx, by), ...]``; empty for a degenerate shaft.
+    """
+    sx, sy = float(start[0]), float(start[1])
+    ex, ey = float(end[0]), float(end[1])
+    dx, dy = ex - sx, ey - sy
+    length = math.hypot(dx, dy)
+    if length <= 1e-9 or not math.isfinite(length):
+        return []
+    angle = math.atan2(dy, dx)
+    head = max(ARROW_BARB_MIN_LENGTH, float(stroke_width) * ARROW_BARB_WIDTH_FACTOR)
+    segments = [(sx, sy, ex, ey)]
+    for delta in (ARROW_BARB_ANGLE, -ARROW_BARB_ANGLE):
+        segments.append(
+            (
+                ex,
+                ey,
+                ex - head * math.cos(angle + delta),
+                ey - head * math.sin(angle + delta),
+            )
+        )
+    return segments
+
+
 def line_quad(
     x0: float, y0: float, x1: float, y1: float, half_width: float
 ) -> list[float]:
@@ -967,44 +1011,50 @@ class PrimitiveRenderer:
         bbox = getattr(node, "bbox", (0.0, 0.0, 0.0, 0.0))
         pts = list(getattr(geometry, "pts", None) or [])
         outline_hw = max(stroke_width * 0.5, 0.5 / max(scale, 1e-9))
+        # Round-8 issue 02: the tablet strokes RECT/CIRCLE/TRIANGLE, so the
+        # interior must stay empty unless the style explicitly asks for a
+        # fill (stroke_width == 0). See pc_agent/viewport/shape_fill.py.
+        filled = shape_is_filled(stroke_width)
         if shape_type == "RECT":
             corners = rect_corners(pts, bbox)
             if corners is None:
                 return
-            _push_tri(fills, rect_triangles(corners), rgba)
-            if stroke_width > 0:
-                _push_line_tris(lines, outline_quads(*corners, outline_hw), rgba)
+            if filled:
+                _push_tri(fills, rect_triangles(corners), rgba)
+            _push_line_tris(lines, outline_quads(*corners, outline_hw), rgba)
         elif shape_type == "CIRCLE":
             cx, cy, rx, ry = _circle_frame(pts, bbox)
             if rx <= 0 or ry <= 0:
                 return
-            _push_tri(fills, circle_triangles(cx, cy, rx, ry), rgba)
-            if stroke_width > 0:
-                _push_line_tris(
-                    lines,
-                    polyline_quads(circle_rim_points(cx, cy, rx, ry), outline_hw),
-                    rgba,
-                )
+            if filled:
+                _push_tri(fills, circle_triangles(cx, cy, rx, ry), rgba)
+            _push_line_tris(
+                lines,
+                polyline_quads(circle_rim_points(cx, cy, rx, ry), outline_hw),
+                rgba,
+            )
         elif shape_type == "TRIANGLE":
             triangle = triangle_points(pts)
             if triangle is None:
                 return
-            _push_tri(fills, triangle, rgba)
-            if stroke_width > 0:
-                outline = polyline_quads(
-                    [(triangle[0], triangle[1]), (triangle[2], triangle[3]),
-                     (triangle[4], triangle[5])],
-                    outline_hw,
-                )
-                _push_line_tris(lines, outline, rgba)
+            if filled:
+                _push_tri(fills, triangle, rgba)
+            outline = polyline_quads(
+                [(triangle[0], triangle[1]), (triangle[2], triangle[3]),
+                 (triangle[4], triangle[5])],
+                outline_hw,
+            )
+            _push_line_tris(lines, outline, rgba)
         elif shape_type == "ARROW":
             start, end = _arrow_frame(pts, bbox)
-            built = arrow_geometry(start, end, stroke_width)
-            if built is None:
+            # ARROW is always stroked: the tablet draws its shaft and both
+            # barbs as lines, never as a filled wedge.
+            barb_hw = max(stroke_width * 0.5, 0.5 / max(scale, 1e-9))
+            segments = arrow_outline_segments(start, end, stroke_width)
+            if not segments:
                 return
-            shaft, head, _ = built
-            _push_tri(fills, shaft, rgba)
-            _push_tri(fills, head, rgba)
+            for ax, ay, bx, by in segments:
+                _push_line_tris(lines, quad_triangles(line_quad(ax, ay, bx, by, barb_hw)), rgba)
         # Unknown shape_type (incl. graph types on SHAPE nodes) — skipped per Doc 08 §4.
 
     # ------------------------------------------------------------------

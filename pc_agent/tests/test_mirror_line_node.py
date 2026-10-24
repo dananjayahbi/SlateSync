@@ -277,10 +277,21 @@ def test_tessellate_shape_line_branch_returns_before_shape_ring_or_circle() -> N
         "stroke-mesh branch"
     )
 
-    # Control: same geometry as a SHAPE really does fill — the guard above
-    # is what selected, not an unrelated empty outcome.
-    shape = _line_node("shape-ring", pts, shape_type="CIRCLE", kind="SHAPE")
+    # Control: the same geometry as a SHAPE only fills when its style asks for
+    # a fill — round-8 issue 02 made stroke_width == 0 the sole fill trigger
+    # (positive widths are outlines, which is what the tablet draws).
+    shape = _line_node(
+        "shape-ring", pts, shape_type="CIRCLE", kind="SHAPE", width=0.0
+    )
     ctrl_fills: list[float] = []
     ctrl_lines: list[float] = []
     PrimitiveRenderer._tessellate_shape(None, shape, ctrl_fills, ctrl_lines, 1.0)
-    assert ctrl_fills, "control SHAPE/CIRCLE must fill — otherwise this test is hollow"
+    assert ctrl_fills, "control SHAPE/CIRCLE (stroke_width 0) must fill"
+
+    # And the default stroked width really is outline-only.
+    stroked = _line_node("shape-ring-2", pts, shape_type="CIRCLE", kind="SHAPE")
+    out_fills: list[float] = []
+    out_lines: list[float] = []
+    PrimitiveRenderer._tessellate_shape(None, stroked, out_fills, out_lines, 1.0)
+    assert out_fills == [], "a stroked CIRCLE must not fill its interior"
+    assert out_lines, "a stroked CIRCLE must still draw its rim"

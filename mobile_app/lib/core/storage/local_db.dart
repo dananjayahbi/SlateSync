@@ -231,6 +231,22 @@ String _assetFileName(String assetRef) {
 String _assetDir(String baseDir, String canvasId) =>
     '$baseDir/assets/$canvasId';
 
+/// Round-8 issue 05 — absolute path of one extracted `asset_ref` for a canvas.
+///
+/// `loadDocument` unpacks the archive's `assets/*` entries into
+/// [canvasAssetDir], but nothing told the renderer where they were, so a
+/// reopened canvas painted its images as blank boxes. Callers use this to read
+/// the bytes back into `AssetImageCache`. [baseDir] defaults to
+/// `path_provider` app-documents/SlateSync (test-injectable).
+Future<String> canvasAssetPath(
+  String canvasId,
+  String assetRef, {
+  String? baseDir,
+}) async {
+  final String dir = baseDir ?? await _defaultBaseDir();
+  return '${_assetDir(dir, canvasId)}/${_assetFileName(assetRef)}';
+}
+
 /// Serialize [doc] into `<base>/<canvasId>.slatesync` — a real ZIP with
 /// `document.json` at the root plus `assets/*` entries (template §3).
 ///

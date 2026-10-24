@@ -181,8 +181,8 @@ void main() {
     );
 
     testWidgets(
-      'tapping a different tool while the panel is open closes it '
-      '(panel/config sync invariant)',
+      'tapping a different tool while the panel is open re-targets it '
+      '(round-8 issue 04 supersedes the round-6 close-on-switch rule)',
       (WidgetTester tester) async {
         final ValueNotifier<ToolConfig> config = ValueNotifier<ToolConfig>(
           ToolConfig(),
@@ -201,10 +201,14 @@ void main() {
         await tester.pump();
         expect(find.byKey(overlayPanel), findsOneWidget);
 
+        // The panel STAYS OPEN and now shows the newly tapped tool's rows, so
+        // the panel/config sync invariant still holds (never one tool's rows
+        // against another tool's config) with fewer taps.
         await tester.tap(find.byKey(toolHighlighter));
         await tester.pump();
-        expect(find.byKey(overlayPanel), findsNothing);
+        expect(find.byKey(overlayPanel), findsOneWidget);
         expect(tool.value, StudioTool.highlighter);
+        expect(config.value.highlighter, isTrue);
       },
     );
   });

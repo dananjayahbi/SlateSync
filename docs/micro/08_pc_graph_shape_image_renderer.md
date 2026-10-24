@@ -163,3 +163,46 @@ def glyph_atlas(self) -> "moderngl.Texture": ...     # PIL-baked once: chars "01
   (Doc 04; Wave 3.A finalizes `main.py`); `pc_agent/engine/*` (Docs 09/10);
   `network/*` (Docs 11/12); `export/*` (Docs 13–15); `gui/*` (Docs 16/17);
   `installer/*` (Docs 18/19); `shared_specs/*`; `mobile_app/*`; `qa/*`; `docs/**`.
+---
+
+## 8. Round-8 Amendment — Fill vs Outline and Image Assets (NORMATIVE)
+
+Two defects made the PC mirror disagree with the tablet. Both are fixed here and the rules below
+supersede any earlier reading of §4/§5(7)/§5(8).
+
+### 8.1 Shapes are OUTLINES unless the style asks for a fill
+
+`shared_specs/canvas_document_schema.json` `NodeStyle` is frozen at
+`color` / `stroke_width` / `opacity` / `blend_mode` — there is no fill field and none may be added.
+The fill decision is therefore derived from `stroke_width` by
+`pc_agent/viewport/shape_fill.py::shape_is_filled`:
+
+| `style.stroke_width` | RECT / CIRCLE / TRIANGLE | ARROW |
+|---|---|---|
+| `> 0` (default `2.5`) | **outline only** — stroked rim, no interior | stroked shaft + barbs |
+| `== 0` | solid fill in `style.color` | stroked shaft only |
+
+The tablet draws every geometric tool with a `PaintingStyle.stroke` paint and never sets a fill, so
+the previous unconditional `_push_tri(...)` fill made mirrored circles/rectangles/triangles solid.
+ARROW is exempt from filling at every width: the tablet strokes its shaft and both barbs
+(`_drawArrow`), so the viewport now emits `arrow_outline_segments` (shaft + two barbs at ±0.4 rad,
+length `max(12, 4·stroke_width)`) instead of the filled shaft quad whose apex extended past the end
+point. `arrow_geometry`/`ARROW_HEAD_*` remain for the exporters, which keep their own arrow rules.
+
+### 8.2 Mirrored IMAGE nodes need an injected `assets_root`
+
+`PrimitiveRenderer` has always resolved `geometry.asset_ref` against `set_assets_root(...)`, but
+nothing ever called it in production, so every mirrored image fell through to the 1×1 magenta
+placeholder even after `ASSET_START/CHUNK/DONE` wrote the bytes.
+
+`GLCanvasHost.set_assets_root(root)` is now public and `main.py::remember_document` calls it with
+`DocumentStore.assets_dir(canvas_id)` on every `DOCUMENT_LOADED`. The host stores the root before the
+GL surface exists and applies it in `_init_gl_surface`, so a document opened before mount still
+resolves. Swapping roots releases cached textures.
+
+### 8.3 Acceptance
+* A `CIRCLE` with the default width produces rim line triangles and **zero** fill triangles; the
+  same node with `stroke_width=0` produces fill triangles and no rim.
+* An `ARROW` produces only line triangles at every width, and its head stays inside the node bbox.
+* `pc_agent/tests/test_shape_fill.py` pins both tables; `test_primitive_renderer.py` and
+  `test_mirror_line_node.py` assert the outline/fill split from the renderer's own API.

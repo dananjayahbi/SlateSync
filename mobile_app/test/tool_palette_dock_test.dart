@@ -8,12 +8,25 @@ import 'package:mobile_app/features/tools/tool_palette_dock.dart';
 
 /// Doc 24 §6 acceptance: `ToolConfig` defaults, the `StudioTool` → `ToolId`
 /// byte table, Doc 03 `graph_config` builders (both example objects), the
-/// dock expand/collapse flow, eraser mode toggle, highlighter blend switching,
-/// snapping, the pluggable image flow and the Graph Builder dialogs — all
-/// pure UI: no sockets, no `sendRpc`, no platform plugins.
+/// hold-to-configure flow (round-8 issue 04 replaced the expandable column),
+/// eraser mode toggle, highlighter blend switching, snapping, the pluggable
+/// image flow and the Graph Builder dialogs — all pure UI: no sockets, no
+/// `sendRpc`, no platform plugins.
 void main() {
-  const ValueKey<String> dockToggle = ValueKey<String>('dock-toggle');
-  const ValueKey<String> dockPanel = ValueKey<String>('dock-panel');
+  // Round-8 issue 04: the overlay panel (the old `dock-panel` in the removed
+  // expandable column) is now the only configuration surface.
+  const ValueKey<String> dockPanel = ValueKey<String>('property-overlay-panel');
+
+  /// Round-8 issue 04: the expandable side panel and its `dock-toggle` are
+  /// gone — a tool's configuration is reached by pressing and holding that
+  /// tool for 2000 ms. Shared by every widget test that needs the panel.
+  Future<void> openPanel(WidgetTester tester, [StudioTool tool = StudioTool.pen]) async {
+    final Finder button = find.byKey(ValueKey<String>('tool-${tool.name}'));
+    final TestGesture gesture = await tester.startGesture(tester.getCenter(button));
+    await tester.pump(const Duration(milliseconds: 2050));
+    await gesture.up();
+    await tester.pumpAndSettle();
+  }
 
   Future<void> pumpDock(
     WidgetTester tester, {
@@ -51,7 +64,7 @@ void main() {
       expect(cfg.opacity, 1.0);
       expect(cfg.blendMode, 'SRC_OVER');
       expect(cfg.highlighter, isFalse);
-      expect(cfg.eraserMode, EraserMode.precision);
+      expect(cfg.eraserMode, EraserMode.brush);
     });
   });
 
@@ -72,7 +85,7 @@ void main() {
           StudioTool.pen,
         );
         await pumpDock(tester, config: config, tool: tool);
-        await tester.tap(find.byKey(dockToggle));
+        await openPanel(tester);
         await tester.pumpAndSettle();
 
         final Slider slider = tester.widget<Slider>(find.byKey(widthSlider));
@@ -112,7 +125,7 @@ void main() {
         StudioTool.pen,
       );
       await pumpDock(tester, config: config, tool: tool);
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester);
       await tester.pumpAndSettle();
 
       // Default 2.5 dp → 2.5 × 2.5 dp dot.
@@ -137,7 +150,7 @@ void main() {
         StudioTool.pen,
       );
       await pumpDock(tester, config: config, tool: tool);
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester);
       await tester.pumpAndSettle();
 
       const List<String> palette = <String>[
@@ -192,7 +205,7 @@ void main() {
           StudioTool.pen,
         );
         await pumpDock(tester, config: config, tool: tool);
-        await tester.tap(find.byKey(dockToggle));
+        await openPanel(tester);
         await tester.pumpAndSettle();
 
         // Pen panel: no opacity slider (issue 02B: highlighter only).
@@ -232,7 +245,7 @@ void main() {
       },
     );
 
-    testWidgets('eraser precision reuses ToolConfig.width as hit radius', (
+    testWidgets('eraser brush mode reuses ToolConfig.width as erase radius', (
       WidgetTester tester,
     ) async {
       final ValueNotifier<ToolConfig> config = ValueNotifier<ToolConfig>(
@@ -244,7 +257,7 @@ void main() {
       await pumpDock(tester, config: config, tool: tool);
       await tester.tap(find.byKey(const ValueKey<String>('tool-eraser')));
       await tester.pump();
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester, StudioTool.eraser);
       await tester.pumpAndSettle();
 
       final Slider slider = tester.widget<Slider>(find.byKey(widthSlider));
@@ -256,7 +269,7 @@ void main() {
       // stored config on selection.
       expect(
         tester.widget<Text>(find.byKey(tipLabel)).data,
-        'Hit radius 10.0 dp',
+        'Eraser radius 10.0 dp',
       );
 
       slider.onChanged!(8);
@@ -264,7 +277,7 @@ void main() {
       expect(config.value.width, 8.0);
       expect(
         tester.widget<Text>(find.byKey(tipLabel)).data,
-        'Hit radius 8.0 dp',
+        'Eraser radius 8.0 dp',
       );
       // Preview dot reuses the same scaled size for the eraser.
       expect(tester.getSize(find.byKey(previewDot)).width, closeTo(8.0, 0.001));
@@ -273,6 +286,9 @@ void main() {
 
   group('StudioTool → ToolId byte table (Doc 24 §4)', () {
     const Map<StudioTool, int> expected = <StudioTool, int>{
+      // Round-8 issue 07: `select` streams shape-preview frames (it has no
+      // live ink of its own), reusing the shared 0x04 identifier.
+      StudioTool.select: 0x04,
       StudioTool.pen: 0x01,
       StudioTool.highlighter: 0x02,
       StudioTool.eraser: 0x03,
@@ -286,8 +302,8 @@ void main() {
       StudioTool.image: 0x04,
     };
 
-    test('all 11 StudioTool values map to the expected byte', () {
-      expect(StudioTool.values.length, 11);
+    test('all 12 StudioTool values map to the expected byte', () {
+      expect(StudioTool.values.length, 12);
       expect(expected.keys, containsAll(StudioTool.values));
       expected.forEach((StudioTool tool, int byte) {
         expect(toolIdFor(tool), byte, reason: 'toolIdFor($tool)');
@@ -381,7 +397,7 @@ void main() {
   });
 
   group('dock widget flow', () {
-    testWidgets('toggle expands and collapses the sub-panel', (
+    testWidgets('hold opens the panel; the toggle button is gone', (
       WidgetTester tester,
     ) async {
       final ValueNotifier<ToolConfig> config = ValueNotifier<ToolConfig>(
@@ -392,13 +408,17 @@ void main() {
       );
       await pumpDock(tester, config: config, tool: tool);
 
+      // Round-8 issue 04: there is no expandable sub-panel and no toggle —
+      // the only way in is the 2000 ms press-and-hold on the tool itself.
       expect(find.byKey(dockPanel), findsNothing);
+      expect(find.byKey(const ValueKey<String>('dock-toggle')), findsNothing);
 
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester);
       await tester.pumpAndSettle();
       expect(find.byKey(dockPanel), findsOneWidget);
 
-      await tester.tap(find.byKey(dockToggle));
+      // Tapping outside the panel dismisses it.
+      await tester.tapAt(const Offset(4, 4));
       await tester.pumpAndSettle();
       expect(find.byKey(dockPanel), findsNothing);
     });
@@ -413,7 +433,7 @@ void main() {
         StudioTool.pen,
       );
       await pumpDock(tester, config: config, tool: tool);
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester);
       await tester.pumpAndSettle();
 
       await tester.tap(find.byKey(const ValueKey<String>('tool-highlighter')));
@@ -443,19 +463,22 @@ void main() {
 
       await tester.tap(find.byKey(const ValueKey<String>('tool-eraser')));
       await tester.pump();
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester, StudioTool.eraser);
       await tester.pumpAndSettle();
 
-      expect(config.value.eraserMode, EraserMode.precision);
-      expect(find.textContaining('DELETE_NODE'), findsOneWidget);
+      expect(config.value.eraserMode, EraserMode.brush);
+      // Round-8 issue 03: the caption now describes BRUSH (a real eraser) and
+      // names ELEMENT as the whole-node delete alternative.
+      expect(find.textContaining('split around the swept disc'), findsOneWidget);
+      expect(find.textContaining('Element'), findsOneWidget);
 
-      await tester.tap(find.text('stroke'));
+      await tester.tap(find.text('element'));
       await tester.pump();
-      expect(config.value.eraserMode, EraserMode.stroke);
+      expect(config.value.eraserMode, EraserMode.element);
 
-      await tester.tap(find.text('precision'));
+      await tester.tap(find.text('brush'));
       await tester.pump();
-      expect(config.value.eraserMode, EraserMode.precision);
+      expect(config.value.eraserMode, EraserMode.brush);
     });
 
     testWidgets('width slider and color swatch mutate ToolConfig in place', (
@@ -468,7 +491,7 @@ void main() {
         StudioTool.pen,
       );
       await pumpDock(tester, config: config, tool: tool);
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester);
       await tester.pumpAndSettle();
 
       tester
@@ -493,7 +516,7 @@ void main() {
       );
       final ValueNotifier<bool> snap = ValueNotifier<bool>(true);
       await pumpDock(tester, config: config, tool: tool, snap: snap);
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester, StudioTool.line);
       await tester.pumpAndSettle();
 
       expect(find.textContaining('15'), findsOneWidget);
@@ -529,7 +552,7 @@ void main() {
 
       await tester.tap(find.byKey(const ValueKey<String>('tool-image')));
       await tester.pump();
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester, StudioTool.image);
       await tester.pumpAndSettle();
 
       await tester.tap(find.byKey(const ValueKey<String>('pick-image')));
@@ -567,7 +590,7 @@ void main() {
         find.byKey(const ValueKey<String>('tool-cartesianGraph')),
       );
       await tester.pump();
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester, StudioTool.cartesianGraph);
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const ValueKey<String>('open-cartesian')));
       await tester.pumpAndSettle();
@@ -625,7 +648,7 @@ void main() {
 
       await tester.tap(find.byKey(const ValueKey<String>('tool-numberLine')));
       await tester.pump();
-      await tester.tap(find.byKey(dockToggle));
+      await openPanel(tester, StudioTool.numberLine);
       await tester.pumpAndSettle();
       await tester.tap(find.byKey(const ValueKey<String>('open-numberline')));
       await tester.pumpAndSettle();

@@ -21,6 +21,7 @@ import binascii
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -422,6 +423,32 @@ class DocumentStore:
         dest = self._config.assets_dir / canvas_id
         dest.mkdir(parents=True, exist_ok=True)
         return dest
+
+    def forget(self, canvas_id: str) -> bool:
+        """Round-8 issue 08 — drop a canvas deleted on a device from the store.
+
+        Clears the open document when it is the one being removed (so the
+        viewport falls back to the empty workspace instead of repainting a
+        ghost) and deletes its uploaded assets. Returns ``True`` when the open
+        document changed, which lets callers refresh dependent UI.
+        """
+        canvas_id = str(canvas_id)
+        with self._lock:
+            current = self._current
+            if current is None or str(getattr(current, "canvas_id", "")) != canvas_id:
+                closed = False
+            else:
+                self._current = None
+                self._current_path = None
+                self._dirty = False
+                closed = True
+        asset_dir = self._config.assets_dir / canvas_id
+        if asset_dir.is_dir():
+            try:
+                shutil.rmtree(asset_dir, ignore_errors=True)
+            except OSError:  # pragma: no cover - defensive
+                logger.exception("asset cleanup failed for %s", canvas_id)
+        return closed
 
     def autosave_tick(self) -> bool:
         """Called every ``config.autosave_interval_s`` by main.py's single timer:

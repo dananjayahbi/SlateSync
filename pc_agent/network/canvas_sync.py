@@ -100,6 +100,15 @@ class CanvasSyncManager:
         self._last_pull_at: float | None = None
         self._pull_interval_s = max(0.0, float(pull_interval_s))
         self._stopped = False
+        #: Round-8 issue 08 — ids a device reported as DELETED. A CANVAS_LIST
+        #: is a snapshot of the rows a device still has, so an id that used to
+        #: be there and is now absent has to be removed here too; this set
+        #: remembers what a device used to advertise so absence is detectable.
+        #: Not part of the frozen wire contract (no schema change).
+        self._device_known_ids: dict[str, set[str]] = {}
+        #: ids deleted by a device — suppressed from the merge even if a hub
+        #: copy or another device still carries them.
+        self._deleted_ids: set[str] = set()
         #: Round 7 — connection-keyed device roster + the PC's mirror authority
         #: (issue 03/04/07). The first canvas a device opens becomes the
         #: mirrored one; Settings can switch it; only that canvas's mutations
@@ -399,6 +408,11 @@ class CanvasSyncManager:
             # §9.2: missing device_id ⇒ legacy-<conn> (last connected peer).
             device_id = f"legacy-{self._last_peer or 'unknown'}"
         device_name = payload.get("device_name")
+        # Round-8 issue 08: a device's CANVAS_LIST is a snapshot of the rows it
+        # still holds, so anything it previously advertised but no longer lists
+        # was deleted on the tablet and must disappear here (and everywhere
+        # else) — the frozen schema has no explicit CANVAS_DELETE action.
+        removed = self._track_device_deletions(device_id, {row["id"] for row in rows})
         with self._lock:
             self._devices[device_id] = {
                 "device_id": device_id,
@@ -410,10 +424,55 @@ class CanvasSyncManager:
             current = self._device_rows.get(row["id"])
             if current is None or _updated(row) > _updated(current):
                 self._device_rows[row["id"]] = row
+        for canvas_id in removed:
+            self._forget_canvas(canvas_id)
 
         self._emit_list()          # §9.4.1 step 2: merged store to local UI
         self.broadcast_hub_list()  # §9.4.1 step 3: merged store to every device
         self._plan_pulls(rows, device_id)  # §9.4.2: pull ids the hub lacks/older
+
+    def _track_device_deletions(self, device_id: str, current_ids: set[str]) -> set[str]:
+        """Record this device's live ids; return ids it stopped advertising.
+
+        The first list a device sends only establishes a baseline — without it
+        every pre-existing hub canvas would look deleted.
+        """
+        with self._lock:
+            previous = self._device_known_ids.get(device_id)
+            self._device_known_ids[device_id] = set(current_ids)
+        if previous is None:
+            return set()
+        return previous - current_ids
+
+    def _forget_canvas(self, canvas_id: str) -> None:
+        """Round-8 issue 08 — drop one canvas from every hub-side view.
+
+        Removes the row from the merge inputs, the local index/archive, a
+        pending pull, and the mirror selection when it pointed at this canvas.
+        """
+        canvas_id = str(canvas_id)
+        with self._lock:
+            self._local_rows.pop(canvas_id, None)
+            self._device_rows.pop(canvas_id, None)
+            self._deleted_ids.add(canvas_id)
+            self._pull_queue = [
+                item for item in self._pull_queue if item.get("canvas_id") != canvas_id
+            ]
+            self._pull_pending.pop(canvas_id, None)
+        store = getattr(self._store, "forget", None)
+        if callable(store):
+            try:
+                store.forget(canvas_id)
+            except Exception:
+                logger.exception("hub store forget failed for %s", canvas_id)
+        if self._index is not None:
+            try:
+                self._index.remove(canvas_id)
+            except Exception:
+                logger.exception("hub index remove failed for %s", canvas_id)
+        if self.mirrored_canvas_id == canvas_id:
+            self._roster.select_mirror(None)
+        logger.info("canvas %s deleted by a device; dropped from the hub", canvas_id)
 
     def _on_canvas_put(self, payload: dict) -> None:
         """CANVAS_PUT → LWW → index persist → list refresh (NO UI switch)."""
@@ -565,7 +624,11 @@ class CanvasSyncManager:
     # ------------------------------------------------------------------
     def _merged(self) -> list[dict]:
         """Union by id with LWW: index rows (or the in-memory hub rows) are
-        the base; strictly-newer device rows displace them (§9.4)."""
+        the base; strictly-newer device rows displace them (§9.4).
+
+        Round-8 issue 08: ids a device deleted are excluded outright — a hub
+        copy must never resurrect a canvas the user removed on the tablet.
+        """
         base: dict[str, dict] = {}
         if self._index is not None:
             try:
@@ -577,6 +640,10 @@ class CanvasSyncManager:
                 current = base.get(canvas_id)
                 if current is None or _updated(row) > _updated(current):
                     base[canvas_id] = dict(row)
+        with self._lock:
+            deleted = set(self._deleted_ids)
+        for canvas_id in deleted:
+            base.pop(canvas_id, None)
         return sorted(base.values(), key=_updated, reverse=True)
 
     def _emit_list(self) -> None:
@@ -607,8 +674,12 @@ class CanvasSyncManager:
         """§9.4 flow 2: queue CANVAS_PULL (one id per message) for ids the hub
         lacks or has an older updated_at, then drain sequentially."""
         needed: list[tuple[str, int]] = []
+        with self._lock:
+            deleted = set(self._deleted_ids)
         for row in rows:
             canvas_id = row["id"]
+            if canvas_id in deleted:
+                continue  # round-8 issue 08: deleted on the tablet — never re-pull
             local = self._local_row(canvas_id)
             have = _updated(local) if local is not None else 0
             if local is None or have < _updated(row):

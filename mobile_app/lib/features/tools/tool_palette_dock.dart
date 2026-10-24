@@ -8,14 +8,16 @@ import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show OverflowBoxFit;
 import 'package:image_picker/image_picker.dart';
 import 'package:mobile_app/core/models/canvas_models.dart';
 import 'package:mobile_app/core/theme/studio_theme.dart';
 import 'package:mobile_app/features/tools/tool_property_panels.dart';
 
-/// Tools exposed by the dock rail (Doc 24 §4).
+/// Tools exposed by the dock rail (Doc 24 §4; round-8 issue 07 added
+/// [select] as the FIRST tool — tapping an object to move/resize it is now
+/// the default way to work with existing content).
 enum StudioTool {
+  select,
   pen,
   highlighter,
   eraser,
@@ -29,20 +31,28 @@ enum StudioTool {
   image,
 }
 
-/// Eraser behavior (Doc 24 §4). Both modes commit via DELETE_NODE of the
-/// hit-tested node; the hit-test itself lives in the canvas page (Doc 22).
-enum EraserMode { precision, stroke }
+/// Eraser behavior (Doc 24 §4; round-8 issue 03 changed the default).
+///
+/// * [brush] — **the default.** A real eraser: strokes are SPLIT around the
+///   swept disc so a bite is taken out of the line, leaving the rest intact.
+///   Bbox-based elements (shapes/images/graphs) are cleared only when the disc
+///   actually lands on them.
+/// * [element] — the previous behaviour: the whole hit element is deleted
+///   (one DELETE_NODE per node per drag). Kept as an explicit choice because
+///   "remove this object" is genuinely useful for shapes.
+enum EraserMode { brush, element }
 
 /// Mutable tool styling with Doc 24 §6 defaults: `#1E1E1E` @ `2.5` @ `1.0`,
-/// `SRC_OVER`, non-highlighter, precision eraser. `blendMode` is forced to
-/// `MULTIPLY` while [highlighter] is true.
+/// `SRC_OVER`, non-highlighter, **brush** eraser (round-8 issue 03 — the
+/// destructive whole-element mode is no longer the default). `blendMode` is
+/// forced to `MULTIPLY` while [highlighter] is true.
 class ToolConfig {
   String color = '#1E1E1E';
   double width = 2.5;
   double opacity = 1.0;
   String blendMode = 'SRC_OVER';
   bool highlighter = false;
-  EraserMode eraserMode = EraserMode.precision;
+  EraserMode eraserMode = EraserMode.brush;
 }
 
 /// Doc 05 `ToolId` byte for [tool]. Pen streams `LIVE_POINT`, highlighter
@@ -50,6 +60,7 @@ class ToolConfig {
 /// tool streams `ToolId.shapePreview` previews — image streams no frames
 /// either, but shares byte `0x04` as its placement identifier.
 int toolIdFor(StudioTool tool) => switch (tool) {
+  StudioTool.select => ToolId.shapePreview,
   StudioTool.pen => ToolId.pen,
   StudioTool.highlighter => ToolId.highlighter,
   StudioTool.eraser => ToolId.eraser,
@@ -150,6 +161,7 @@ typedef WorldRectPlanner = Rect Function(int widthPx, int heightPx);
 ToolConfig defaultToolConfig(StudioTool tool) {
   final ToolConfig cfg = ToolConfig();
   switch (tool) {
+    case StudioTool.select:
     case StudioTool.pen:
     case StudioTool.line:
     case StudioTool.rect:
@@ -236,8 +248,6 @@ class ToolDock extends StatefulWidget {
 
 class _ToolDockState extends State<ToolDock> {
   static const double _panelWidth = toolPanelWidth;
-  static const Duration _anim = Duration(milliseconds: 180);
-  static const ValueKey<String> _toggleKey = ValueKey<String>('dock-toggle');
 
   /// Doc 02 §10.7: press-and-hold duration. A CUSTOM [Timer] — Flutter's
   /// ~500 ms `onLongPress` is intentionally never used for this flow.
@@ -247,7 +257,6 @@ class _ToolDockState extends State<ToolDock> {
   /// cancels a pending hold.
   static const double _holdSlop = 18.0;
 
-  bool _expanded = false;
   late final ValueNotifier<bool> _snap;
   bool _ownsSnap = false;
 
@@ -309,11 +318,11 @@ class _ToolDockState extends State<ToolDock> {
   void _selectTool(StudioTool next) {
     // Flush the outgoing tool's live instance into the store FIRST.
     _perTool[widget.tool.value] = widget.config.value;
-    // A property panel is bound to the tool it was opened for; switching
-    // tools closes it so panel rows can never desync from `config.value`.
-    if (_panelTool != null && _panelTool != next) {
-      _closePropertyPanel();
-    }
+    // Round-8 issue 04: an open panel belongs to the tool it was opened for.
+    // Tapping a DIFFERENT tool re-targets the panel to that tool (so the
+    // "hold to configure" panel keeps tracking the active tool) rather than
+    // closing it — a tap outside still closes, via the overlay barrier.
+    final bool retarget = _panelTool != null && _panelTool != next;
     widget.tool.value = next;
     // Doc 02 §10.7: REPLACE the notifier's value with the stored per-tool
     // config — never mutate the old instance in place on a switch.
@@ -322,17 +331,10 @@ class _ToolDockState extends State<ToolDock> {
     cfg.highlighter = wantHighlighter;
     cfg.blendMode = wantHighlighter ? 'MULTIPLY' : 'SRC_OVER';
     widget.config.value = cfg;
-  }
-
-  void _toggleDock() {
-    _cancelHold();
-    // The panel is anchored to the dock's rect; collapsing/expanding moves
-    // it, so dismiss it (a tap on the dock is "outside the panel").
-    _closePropertyPanel();
-    setState(() {
-      _pressingTool = null;
-      _expanded = !_expanded;
-    });
+    if (retarget) {
+      _closePropertyPanel();
+      _anchorPropertyPanel(next);
+    }
   }
 
   /// Compact rail buttons: 13×40 dp + dividers must fit a 600 dp-tall
@@ -415,8 +417,18 @@ class _ToolDockState extends State<ToolDock> {
   /// the held tool first, then opens its property panel — so the overlay
   /// can never show one tool's rows against another tool's config.
   void _openPropertyPanel(StudioTool tool) {
-    _selectTool(tool); // may close a previous panel (bound to its tool)
+    _selectTool(tool); // may re-target a previous panel to this tool
     if (!mounted || _panelTool == tool) {
+      return;
+    }
+    _anchorPropertyPanel(tool);
+  }
+
+  /// Places [tool]'s panel beside the rail, clamped on-screen, and inserts
+  /// the overlay. Split out of [_openPropertyPanel] so a tool switch can move
+  /// an already-open panel (round-8 issue 04).
+  void _anchorPropertyPanel(StudioTool tool) {
+    if (!mounted) {
       return;
     }
     Offset anchor = Offset.zero;
@@ -584,6 +596,11 @@ class _ToolDockState extends State<ToolDock> {
   }
 
   void _showCartesianDialog() {
+    // Round-8 issue 04: the property panel is an OverlayEntry inserted above
+    // the app's Navigator, so a dialog opened from it would sit UNDERNEATH the
+    // panel and be unreachable. Dismiss the panel first — the dialog replaces
+    // it as the configuration surface.
+    _closePropertyPanel();
     showDialog<void>(
       context: context,
       builder: (BuildContext dialogContext) => _CartesianGraphDialog(
@@ -594,6 +611,7 @@ class _ToolDockState extends State<ToolDock> {
   }
 
   void _showNumberLineDialog() {
+    _closePropertyPanel(); // same ordering constraint as _showCartesianDialog
     showDialog<void>(
       context: context,
       builder: (BuildContext dialogContext) => _NumberLineDialog(
@@ -655,40 +673,11 @@ class _ToolDockState extends State<ToolDock> {
 
   @override
   Widget build(BuildContext context) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: <Widget>[
-        _buildRail(),
-        AnimatedContainer(
-          duration: _anim,
-          curve: Curves.easeOut,
-          width: _expanded ? _panelWidth : 0,
-          clipBehavior: Clip.hardEdge,
-          decoration: BoxDecoration(
-            color: StudioTheme.surface,
-            borderRadius: BorderRadius.circular(StudioTheme.radiusLarge),
-          ),
-          child: _expanded
-              ? OverflowBox(
-                  fit: OverflowBoxFit.deferToChild,
-                  alignment: Alignment.topLeft,
-                  minWidth: _panelWidth,
-                  maxWidth: _panelWidth,
-                  minHeight: 0,
-                  maxHeight: double.infinity,
-                  child: Material(
-                    type: MaterialType.transparency,
-                    child: SingleChildScrollView(
-                      key: const ValueKey<String>('dock-panel'),
-                      child: _buildPanelContent(),
-                    ),
-                  ),
-                )
-              : null,
-        ),
-      ],
-    );
+    // Round-8 issue 04: the expandable side panel and its toggle are gone —
+    // a tool's configuration is reached by PRESSING AND HOLDING that tool for
+    // 2000 ms, which opens a compact panel anchored beside the rail
+    // (_openPropertyPanel). The dock is now just the rail.
+    return _buildRail();
   }
 
   Widget _buildRail() {
@@ -700,18 +689,6 @@ class _ToolDockState extends State<ToolDock> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
-          IconButton(
-            key: _toggleKey,
-            tooltip: _expanded ? 'Collapse tools' : 'Expand tools',
-            onPressed: _toggleDock,
-            style: _railButtonStyle(),
-            icon: Icon(
-              _expanded ? Icons.chevron_left : Icons.chevron_right,
-              size: 22,
-              color: StudioTheme.text,
-            ),
-          ),
-          const Divider(height: 1, thickness: 1, indent: 6, endIndent: 6),
           const SizedBox(height: 4),
           for (final StudioTool t in StudioTool.values) _buildToolButton(t),
           const SizedBox(height: 4),
@@ -768,24 +745,6 @@ class _ToolDockState extends State<ToolDock> {
       },
     );
   }
-
-  Widget _buildPanelContent() {
-    return ValueListenableBuilder<StudioTool>(
-      valueListenable: widget.tool,
-      builder: (BuildContext context, StudioTool tool, Widget? child) {
-        return ToolPropertyPanel(
-          tool: tool,
-          config: widget.config,
-          snap: _snap,
-          commit: _commit,
-          onOpenCartesian: _showCartesianDialog,
-          onOpenNumberLine: _showNumberLineDialog,
-          onImportImage: _pickAndDeliverImage,
-        );
-      },
-    );
-  }
-
 }
 
 const TextStyle _bodyStyle = TextStyle(
@@ -804,6 +763,7 @@ Rect _defaultWorldRectPlanner(int widthPx, int heightPx) {
 }
 
 String _toolLabel(StudioTool tool) => switch (tool) {
+  StudioTool.select => 'Select',
   StudioTool.pen => 'Pen',
   StudioTool.highlighter => 'Highlighter',
   StudioTool.eraser => 'Eraser',
@@ -818,6 +778,7 @@ String _toolLabel(StudioTool tool) => switch (tool) {
 };
 
 IconData _toolIcon(StudioTool tool) => switch (tool) {
+  StudioTool.select => Icons.near_me_outlined,
   StudioTool.pen => Icons.draw,
   StudioTool.highlighter => Icons.highlight,
   StudioTool.eraser => Icons.cleaning_services,

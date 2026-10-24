@@ -8,7 +8,6 @@ import 'package:mobile_app/features/tools/tool_palette_dock.dart';
 /// edits writing back into the store, and tap-outside closing of the
 /// long-press property overlay. Pure UI — no sockets, no plugins.
 void main() {
-  const ValueKey<String> dockToggle = ValueKey<String>('dock-toggle');
   const ValueKey<String> widthSlider = ValueKey<String>('width-slider');
   const ValueKey<String> overlayPanel = ValueKey<String>(
     'property-overlay-panel',
@@ -54,7 +53,7 @@ void main() {
       expect(pen.opacity, 1.0);
       expect(pen.blendMode, 'SRC_OVER');
       expect(pen.highlighter, isFalse);
-      expect(pen.eraserMode, EraserMode.precision);
+      expect(pen.eraserMode, EraserMode.brush);
 
       final ToolConfig highlighter = defaultToolConfig(
         StudioTool.highlighter,
@@ -67,7 +66,7 @@ void main() {
 
       final ToolConfig eraser = defaultToolConfig(StudioTool.eraser);
       expect(eraser.width, 10.0, reason: 'hit radius');
-      expect(eraser.eraserMode, EraserMode.precision);
+      expect(eraser.eraserMode, EraserMode.brush);
       expect(eraser.color, '#1E1E1E');
 
       for (final StudioTool tool in <StudioTool>[
@@ -147,7 +146,7 @@ void main() {
         await tester.tap(find.byKey(const ValueKey<String>('tool-eraser')));
         await tester.pump();
         expect(config.value.width, 10.0);
-        expect(config.value.eraserMode, EraserMode.precision);
+        expect(config.value.eraserMode, EraserMode.brush);
 
         // Graph tools: accent blue @ 2.0.
         await tester.tap(
@@ -184,8 +183,7 @@ void main() {
           StudioTool.pen,
         );
         await pumpDock(tester, config: config, tool: tool);
-        await tester.tap(find.byKey(dockToggle));
-        await tester.pumpAndSettle();
+        await holdOpenPanel(tester, const ValueKey<String>('tool-pen'));
 
         // Round-5 controls write into the pen entry of the store.
         tester.widget<Slider>(find.byKey(widthSlider)).onChanged!(7.5);

@@ -362,6 +362,10 @@ class GLCanvasHost:
         self._doc: CanvasDocument | None = None
         self._artboard = None
         self._content_bounds: dict[str, float] = {}
+        #: Round-8 issue 05 — the open canvas's asset folder (Doc 10
+        #: ``assets_dir``), forwarded to PrimitiveRenderer so mirrored IMAGE
+        #: nodes resolve instead of falling back to the magenta placeholder.
+        self._assets_root: object = None
         #: Round 7 issue 06 — live element mirror. ``doc.elements`` is only the
         #: snapshot taken when the document was opened; every later
         #: COMMITTED_NODE keeps this registry current so SHAPE/GRAPH_AXES/IMAGE
@@ -514,6 +518,31 @@ class GLCanvasHost:
             self._content_bounds = {}
         self._update_empty_state()
         self.request_redraw()
+
+    def set_assets_root(self, root: object) -> None:
+        """Round-8 issue 05 — point image assets at the open canvas's folder.
+
+        ``PrimitiveRenderer`` resolves ``geometry.asset_ref`` against an
+        injected ``assets_root`` (Doc 08 §5(8) / Doc 10 ``assets_dir``), but
+        nothing ever injected one in production: every mirrored IMAGE fell
+        through to the 1×1 magenta placeholder even when the bytes had
+        arrived over ``ASSET_START/CHUNK/DONE``. ``main.py`` calls this with
+        the store's live ``assets_dir`` whenever the open canvas changes.
+
+        Swapping roots releases cached textures so a different canvas's
+        same-named asset can never reuse a stale texture.
+        """
+        setter = getattr(self._primitive, "set_assets_root", None)
+        if setter is None:
+            # No GL surface yet (renderer is built on mount) — remember it so
+            # _init_gl_surface can apply the pending root.
+            self._assets_root = root
+            return
+        self._assets_root = root
+        try:
+            setter(root)
+        except Exception:
+            logger.exception("PrimitiveRenderer.set_assets_root failed (Doc 08)")
 
     def fit_viewport(self) -> None:
         """Doc 02 §10.5 (frozen): zoom-to-fit the open document.
@@ -891,6 +920,8 @@ class GLCanvasHost:
             from pc_agent.viewport.primitive_renderer import PrimitiveRenderer
 
             self._primitive = PrimitiveRenderer(self._ctx, self._registry)
+            if self._assets_root is not None:
+                self._primitive.set_assets_root(self._assets_root)
         except ImportError:
             self._primitive = None
 

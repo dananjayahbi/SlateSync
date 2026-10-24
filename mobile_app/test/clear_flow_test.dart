@@ -122,16 +122,24 @@ Future<void> _stroke(WidgetTester tester, Offset start, Offset by) async {
   await tester.pump(const Duration(milliseconds: 16));
 }
 
-Future<void> _selectStrokeEraser(WidgetTester tester) async {
-  await tester.tap(find.byKey(const ValueKey<String>('dock-toggle')));
+Future<void> _selectElementEraser(WidgetTester tester) async {
+  // Round-8 issue 03: brush is the DEFAULT now; these tests pin the
+  // whole-element mode, so switch to it explicitly.
+  await _holdTool(tester, 'tool-eraser');
+  await tester.tap(find.text('element'));
   await tester.pumpAndSettle();
-  await tester.tap(find.byKey(const ValueKey<String>('tool-eraser')));
+  // Close the panel: it overlays the canvas and would swallow the erase drag.
+  await tester.tapAt(const Offset(4, 4));
   await tester.pumpAndSettle();
-  await tester.tap(find.text('stroke'));
-  await tester.pumpAndSettle();
-  // Collapse again: the expanded panel overlays the canvas (x ≈ 54–314)
-  // and would swallow the erase drag's pointer events.
-  await tester.tap(find.byKey(const ValueKey<String>('dock-toggle')));
+}
+
+/// Round-8 issue 04: a tool's config panel opens by holding it for 2000 ms.
+Future<void> _holdTool(WidgetTester tester, String toolKey) async {
+  final Finder button = find.byKey(ValueKey<String>(toolKey));
+  final TestGesture gesture =
+      await tester.startGesture(tester.getCenter(button));
+  await tester.pump(const Duration(milliseconds: 2050));
+  await gesture.up();
   await tester.pumpAndSettle();
 }
 
@@ -151,7 +159,7 @@ void main() {
     expect(_actions(client, 'ADD_STROKE'), hasLength(3));
     expect(_engine(tester).queryVisible(allWorld), hasLength(3));
 
-    await _selectStrokeEraser(tester);
+    await _selectElementEraser(tester);
 
     // One continuous drag: 11 × 30 px steps from x = 180 → 510. Steps land
     // inside each stroke's bbox (windows ≈ 60 px wide) while the gaps are
@@ -177,7 +185,7 @@ void main() {
     await _disposeStudio(tester, client);
   });
 
-  testWidgets('precision tap still deletes exactly the hit-tested node',
+  testWidgets('element-mode tap deletes exactly the hit-tested node',
       (WidgetTester tester) async {
     final _FakeSyncClient client = _FakeSyncClient(connected: true);
     await _pumpStudio(tester, client);
@@ -185,9 +193,8 @@ void main() {
     await _stroke(tester, const Offset(200, 300), const Offset(60, 0));
     expect(_actions(client, 'ADD_STROKE'), hasLength(1));
 
-    // Default eraser mode is precision (fresh ToolConfig).
-    await tester.tap(find.byKey(const ValueKey<String>('tool-eraser')));
-    await tester.pumpAndSettle();
+    // Round-8 issue 03: brush is the default, so opt into element mode.
+    await _selectElementEraser(tester);
 
     TestGesture tap = await tester.startGesture(const Offset(230, 300));
     await tester.pump(const Duration(milliseconds: 16));

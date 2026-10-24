@@ -19,6 +19,7 @@ import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
+import 'package:mobile_app/canvas_engine/asset_image_cache.dart'; // round-8 issue 05
 import 'package:mobile_app/canvas_engine/tile_chunks.dart'; // Issue 05
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 
@@ -771,9 +772,46 @@ class TiledCanvasEngine {
   /// Doc 22 §4 freeze shape `TiledCanvasEngine({required CameraController
   /// camera})`; see the library doc for the Wave 1.B structural typing note —
   /// the object must expose `double scale` (Doc 20's camera).
-  TiledCanvasEngine({required this.camera});
+  TiledCanvasEngine({required this.camera}) {
+    wireAssetInvalidation();
+  }
 
   final TileCache cache = TileCache();
+
+  /// Round-8 issue 05 — decoded IMAGE assets. Populated by the canvas page
+  /// (picked bytes / loaded archive), consumed by [_drawNode]'s IMAGE branch,
+  /// and re-bakes the affected tiles whenever a decode completes.
+  final AssetImageCache assets = AssetImageCache();
+
+  /// Round-8 issue 05 — after an asset finishes decoding, the tiles holding
+  /// its IMAGE node must be re-baked (their cached pictures predate the
+  /// bitmap). Set by the constructor-adjacent `wireAssetInvalidation()` so the
+  /// cache can call back without the engine capturing a stale `this`.
+  void wireAssetInvalidation() {
+    assets.onReady = _invalidateAssetTiles;
+  }
+
+  /// Drops every cached tile so the next paint re-bakes from the index.
+  /// Used when content the bake depends on changes outside the tile
+  /// dirty-set — e.g. an IMAGE asset finishing its decode.
+  void invalidateAllTiles() {
+    cache.invalidateAll();
+    _dirty.clear();
+    _bakedBucket.clear();
+  }
+
+  void _invalidateAssetTiles(String assetRef) {
+    for (final CanvasNodeModel node in _tree.query(Rect.largest)) {
+      if (node.kind != 'IMAGE' || node.geometry.assetRef != assetRef) {
+        continue;
+      }
+      for (final TileKey k in tilesCovering(_rectOfNode(node))) {
+        cache.invalidate(k);
+        _dirty.add(k);
+      }
+    }
+    _rebakeCount++;
+  }
 
   /// Structural camera (Doc 20): only `scale` is read.
   final dynamic camera;
@@ -1095,7 +1133,8 @@ class TiledCanvasEngine {
     canvas.scale(bucketFactorForExponent(bucket));
     canvas.translate(-origin.left, -origin.top);
     canvas.clipRect(origin);
-    _drawNode(canvas, node);
+    _ensureAssets(<CanvasNodeModel>[node]);
+    _drawNode(canvas, node, assets);
     canvas.restore();
     return recorder.endRecording();
   }
@@ -1148,12 +1187,28 @@ class TiledCanvasEngine {
     final List<CanvasNodeModel> nodes = _tree.query(origin);
     nodes.sort((CanvasNodeModel a, CanvasNodeModel b) =>
         a.layer.compareTo(b.layer));
+    _ensureAssets(nodes);
     for (final CanvasNodeModel n in nodes) {
-      _drawNode(canvas, n);
+      _drawNode(canvas, n, assets);
     }
     bakeStats.strokeReplays += nodes.length;
     canvas.restore();
     return recorder.endRecording();
+  }
+
+  /// Kicks off decoding for any IMAGE node in [nodes] whose bytes are known
+  /// but whose `ui.Image` is not ready yet (round-8 issue 05).
+  void _ensureAssets(List<CanvasNodeModel> nodes) {
+    List<String>? pending;
+    for (final CanvasNodeModel n in nodes) {
+      final String? ref = n.geometry.assetRef;
+      if (n.kind == 'IMAGE' && ref != null && !assets.isReady(ref)) {
+        (pending ??= <String>[]).add(ref);
+      }
+    }
+    if (pending != null) {
+      assets.ensureDecoded(pending);
+    }
   }
 
   static Rect? _unionOf(List<CanvasNodeModel> nodes) {
@@ -1190,7 +1245,11 @@ Color _colorFrom(String hex, double opacity) {
   return Color((alpha << 24) | (argb & 0x00FFFFFF));
 }
 
-void _drawNode(Canvas canvas, CanvasNodeModel n) {
+/// Paints one node. [assets] resolves `geometry.asset_ref` → decoded
+/// `ui.Image`; without it an IMAGE node paints nothing (round-8 issue 05:
+/// it used to paint an empty filled rect, which is why a picked photo never
+/// appeared).
+void _drawNode(Canvas canvas, CanvasNodeModel n, [AssetImageCache? assets]) {
   final Paint paint = _paintFor(n);
   final List<List<double>> pts = n.geometry.pts;
   switch (n.kind) {
@@ -1199,12 +1258,36 @@ void _drawNode(Canvas canvas, CanvasNodeModel n) {
     case 'GRAPH_AXES':
       _drawGraph(canvas, n, paint);
     case 'IMAGE':
-      canvas.drawRect(_rectOfNode(n), paint);
+      _drawImage(canvas, n, assets);
     case 'LINE':
       _drawLine(canvas, pts, paint);
     default:
       _drawPolyline(canvas, pts, paint);
   }
+}
+
+/// IMAGE — draw the decoded bitmap stretched over the node bbox.
+///
+/// While the asset is still decoding this paints nothing (a placeholder box
+/// would be a lie); the engine re-bakes the tile once
+/// [AssetImageCache.onReady] reports it, because a tile bake is cached.
+void _drawImage(Canvas canvas, CanvasNodeModel n, AssetImageCache? assets) {
+  final ui.Image? image = assets?.imageOf(n.geometry.assetRef);
+  final Rect rect = _rectOfNode(n);
+  if (image == null) {
+    return;
+  }
+  canvas.drawImageRect(
+    image,
+    Rect.fromLTWH(
+      0,
+      0,
+      image.width.toDouble(),
+      image.height.toDouble(),
+    ),
+    rect,
+    Paint()..filterQuality = FilterQuality.medium,
+  );
 }
 
 void _drawShape(

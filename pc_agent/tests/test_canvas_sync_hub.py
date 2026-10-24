@@ -474,3 +474,67 @@ def test_shutdown_stops_pull_drain_and_unsubscribes(env: _Hub) -> None:
     assert env.push.messages == []  # handlers gone: no broadcast, no pulls
     assert env.events == []
     assert env.manager._pull_queue == []
+
+
+# ---------------------------------------------------------------------------
+# Round-8 issue 08 — a canvas deleted on a device disappears from the hub
+# ---------------------------------------------------------------------------
+
+
+def test_device_deleting_a_canvas_removes_it_from_the_hub(env: _Hub) -> None:
+    """The tablet's CANVAS_LIST is a snapshot: an id it stops listing was
+    deleted there and must vanish here (no CANVAS_DELETE action exists)."""
+    env.index.save_document(_doc(env, canvas_id="c-1", updated_at=1000), source="hub")
+    env.index.save_document(_doc(env, canvas_id="c-2", updated_at=900), source="hub")
+
+    # First list only establishes the baseline — nothing is deleted yet.
+    _device_list(env, [_row("c-1", 1000), _row("c-2", 900)], device_id="dev-1")
+    assert {row["id"] for row in _merged(env)} == {"c-1", "c-2"}
+
+    # The tablet deleted c-2: it disappears from the hub store AND the disk.
+    _device_list(env, [_row("c-1", 1000)], device_id="dev-1")
+    assert [row["id"] for row in _merged(env)] == ["c-1"]
+    assert env.index.get("c-2") is None
+    assert not env.index.archive_path("c-2").exists()
+
+
+def test_deleted_canvas_is_not_resurrected_by_a_stale_hub_row(env: _Hub) -> None:
+    env.index.save_document(_doc(env, canvas_id="c-1", updated_at=1000), source="hub")
+    env.index.save_document(_doc(env, canvas_id="c-2", updated_at=500), source="hub")
+    _device_list(env, [_row("c-1", 1000), _row("c-2", 500)], device_id="dev-1")
+    _device_list(env, [_row("c-1", 1000)], device_id="dev-1")
+
+    # A later, eager list from the same device still names the dead id: the
+    # tombstone keeps it out of the merge.
+    _device_list(env, [_row("c-1", 1000), _row("c-2", 500)], device_id="dev-1")
+    assert "c-2" not in {row["id"] for row in _merged(env)}
+
+
+def test_deleted_canvas_is_never_pulled_back(env: _Hub) -> None:
+    env.index.save_document(_doc(env, canvas_id="c-1", updated_at=1000), source="hub")
+    env.index.save_document(_doc(env, canvas_id="c-2", updated_at=100), source="hub")
+    _device_list(env, [_row("c-1", 1000), _row("c-2", 100)], device_id="dev-1")
+    _device_list(env, [_row("c-1", 1000)], device_id="dev-1")
+    env.push.messages.clear()
+
+    # The device re-lists c-2 with a NEWER stamp (a stale retry): because the
+    # id is tombstoned, no CANVAS_PULL is planned for it.
+    _device_list(env, [_row("c-1", 1000), _row("c-2", 9999)], device_id="dev-1")
+    assert [m["action"] for m in env.push.of("CANVAS_PULL")] == []
+
+
+def test_delete_clears_the_mirror_selection(env: _Hub) -> None:
+    env.index.save_document(_doc(env, canvas_id="c-1", updated_at=1000), source="hub")
+    _device_list(env, [_row("c-1", 1000)], device_id="dev-1")
+    assert env.manager.select_mirror("c-1", "Note") is True
+    assert env.manager.mirrored_canvas_id == "c-1"
+
+    _device_list(env, [], device_id="dev-1")
+    assert env.manager.mirrored_canvas_id is None
+
+
+def test_first_list_from_a_new_device_never_deletes_anything(env: _Hub) -> None:
+    """A newly connected tablet knowing nothing must not wipe the hub."""
+    env.index.save_document(_doc(env, canvas_id="c-1", updated_at=1000), source="hub")
+    _device_list(env, [], device_id="fresh-device")
+    assert [row["id"] for row in _merged(env)] == ["c-1"]

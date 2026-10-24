@@ -18,12 +18,17 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
 import 'package:mobile_app/canvas_engine/artboard_manager.dart'; // Doc 23
 import 'package:mobile_app/canvas_engine/camera_controller.dart'; // Doc 20
+import 'package:mobile_app/canvas_engine/selection_transform.dart'; // round-8 issue 07
+import 'package:mobile_app/canvas_engine/stroke_eraser.dart'; // round-8 issue 03
+import 'package:mobile_app/canvas_engine/stroke_eraser_controller.dart';
 import 'package:mobile_app/canvas_engine/stroke_processor.dart'; // Doc 21
 import 'package:mobile_app/canvas_engine/tiled_canvas_painter.dart'; // Doc 22
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
@@ -32,6 +37,7 @@ import 'package:mobile_app/core/theme/studio_theme.dart'; // Doc 05
 import 'package:mobile_app/features/canvas/canvas_shape_conventions.dart';
 import 'package:mobile_app/features/canvas/image_source_popup.dart';
 import 'package:mobile_app/features/canvas/remote_mutation_applier.dart';
+import 'package:mobile_app/features/canvas/selection_overlay.dart'; // round-8 issue 07
 import 'package:mobile_app/features/export/export_modal_sheet.dart'; // Doc 27
 import 'package:mobile_app/features/home/home_canvas_dashboard.dart'; // Doc 26
 import 'package:mobile_app/features/pairing/pairing_screen.dart'; // Issue 03
@@ -47,8 +53,18 @@ const int kAssetChunkRawCap = 262144;
 /// [client] is the app-lifetime Doc 25 client owned by `main.dart`. [db] and
 /// [baseDir] mirror the Doc 26 test seams so widget tests never touch
 /// path_provider.
-class CanvasStudioPage extends StatefulWidget {
-  const CanvasStudioPage({
+/// Round-8 issue 07 — the topmost node under a selector tap (`null` = empty
+/// space, which starts a marquee).
+class _SelectHit {
+  const _SelectHit(this.node);
+
+  final CanvasNodeModel? node;
+
+  /// True when the tap landed on empty space rather than an object.
+  bool get belongsToNewNode => node == null;
+}
+
+class CanvasStudioPage extends StatefulWidget {  const CanvasStudioPage({
     super.key,
     required this.document,
     required this.client,
@@ -103,6 +119,21 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   Offset? _shapeStart;
   Offset? _shapeEnd;
 
+  // -- Round-8 issue 07: selector tool -------------------------------------
+  /// Ids currently selected. Move/delete work on all of them; resize is
+  /// blocked when any member is a free-hand stroke (see
+  /// `selection_transform.dart` `canScaleSelection`).
+  final Set<String> _selected = <String>{};
+  /// Marquee drag in WORLD units while rubber-banding an empty-space drag.
+  Rect? _marquee;
+  Offset? _marqueeStart;
+  /// Active move/resize drag.
+  Offset? _transformStart;
+  Rect? _transformFrom;
+  Rect? _transformTo;
+  ResizeHandle? _activeHandle;
+  bool _transforming = false;
+
   /// Issue 05 — one Gallery/Camera popup at a time per image-tool tap.
   bool _imageFlowActive = false;
 
@@ -149,6 +180,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     }
 
     _engine.setDocument(_doc);
+    unawaited(_primeArchivedAssets());
     _remote = RemoteMutationApplier(
       doc: _doc,
       engine: _engine,
@@ -330,14 +362,274 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   // Pointer input (Listener) + camera gestures (GestureDetector)
   // -------------------------------------------------------------------------
 
+  // -------------------------------------------------------------------------
+  // Round-8 issue 07 — selector tool (tap to select, marquee for strokes,
+  // drag to move, handle-drag to resize). Free-hand strokes are MOVE-ONLY:
+  // scaling a drawn path would visibly distort the ink, so the handles are
+  // suppressed whenever the selection contains one.
+  // -------------------------------------------------------------------------
+
+  static const double _handleHitPx = 22.0;
+  static const double _tapSlopPx = 6.0;
+
+  bool get _selectionCanScale =>
+      canScaleSelection(_selected.map((String id) {
+        final CanvasNodeModel? n = _nodeById(id);
+        return n?.kind ?? '';
+      }));
+
+  Rect get _selectionRect {
+    final List<List<double>> boxes = <List<double>>[
+      for (final String id in _selected)
+        if (_nodeById(id) case final CanvasNodeModel n) n.bbox,
+    ];
+    return selectionBounds(boxes);
+  }
+
+  CanvasNodeModel? _nodeById(String id) {
+    for (final CanvasNodeModel n in _doc.elements) {
+      if (n.nodeId == id) {
+        return n;
+      }
+    }
+    return null;
+  }
+
+  void _onSelectDown(PointerDownEvent e) {
+    final Offset world = _camera.screenToWorld(e.localPosition, _viewport);
+    // 1) A resize handle of the current selection wins over everything else.
+    if (_selected.isNotEmpty && _selectionCanScale) {
+      final Rect bounds = _selectionRect;
+      final double grab =
+          _handleHitPx / math.max(_camera.scale, 1e-6);
+      for (final ResizeHandle handle in ResizeHandle.values) {
+        if ((handlePosition(handle, bounds) - world).distance <= grab) {
+          _activeHandle = handle;
+          _transformStart = world;
+          _transformFrom = bounds;
+          _transformTo = bounds;
+          _transforming = true;
+          _canvasTick.value++;
+          return;
+        }
+      }
+    }
+    // 2) Tapping inside the current selection starts a MOVE of it.
+    if (_selected.isNotEmpty) {
+      final Rect bounds = _selectionRect.inflate(_tapSlopPx / math.max(_camera.scale, 1e-6));
+      if (bounds.contains(world) && !_hitTopmost(world).belongsToNewNode) {
+        _transformStart = world;
+        _transformFrom = _selectionRect;
+        _transformTo = _selectionRect;
+        _transforming = true;
+        _canvasTick.value++;
+        return;
+      }
+    }
+    // 3) Tap on a node selects it (shift-free single selection).
+    final _SelectHit hit = _hitTopmost(world);
+    if (hit.node != null) {
+      setState(() {
+        _selected
+          ..clear()
+          ..add(hit.node!.nodeId);
+        _marquee = null;
+      });
+      _canvasTick.value++;
+      return;
+    }
+    // 4) Empty space starts a MARQUEE (the only way to select free strokes).
+    setState(() => _selected.clear());
+    _marqueeStart = world;
+    _marquee = Rect.fromPoints(world, world);
+    _canvasTick.value++;
+  }
+
+  void _onSelectMove(PointerMoveEvent e) {
+    final Offset world = _camera.screenToWorld(e.localPosition, _viewport);
+    if (_activeHandle != null && _transformFrom != null) {
+      _transformTo = resizeRect(_transformFrom!, _activeHandle!, world);
+      _canvasTick.value++;
+      return;
+    }
+    if (_transforming && _transformStart != null) {
+      final Offset delta = world - _transformStart!;
+      _transformTo = _transformFrom!.shift(delta);
+      _canvasTick.value++;
+      return;
+    }
+    if (_marqueeStart != null) {
+      _marquee = normalizedRect(Rect.fromPoints(_marqueeStart!, world));
+      _canvasTick.value++;
+    }
+  }
+
+  void _onSelectUp() {
+    // --- finish a marquee: select every intersecting node ------------------
+    if (_marquee != null && _marqueeStart != null) {
+      final Rect box = _marquee!;
+      final double slop = _tapSlopPx / math.max(_camera.scale, 1e-6);
+      if (box.width <= slop && box.height <= slop) {
+        setState(() => _selected.clear()); // a tap on empty space
+      } else {
+        final Set<String> picked = <String>{
+          for (final CanvasNodeModel n in _engine.queryVisible(box))
+            if (intersectsMarquee(_rectOf(n), box)) n.nodeId,
+        };
+        setState(() {
+          _selected
+            ..clear()
+            ..addAll(picked);
+        });
+      }
+      _marquee = null;
+      _marqueeStart = null;
+      _canvasTick.value++;
+      return;
+    }
+    // --- commit a move / resize -------------------------------------------
+    if (_transforming && _transformFrom != null && _transformTo != null) {
+      final Rect from = _transformFrom!;
+      final Rect to = _transformTo!;
+      final bool moved = (to.topLeft - from.topLeft).distance > 1e-6;
+      final bool resized = _activeHandle != null &&
+          (to.width - from.width).abs() > 1e-6 ||
+          _activeHandle != null && (to.height - from.height).abs() > 1e-6;
+      if (moved || resized) {
+        _applyTransform(
+          from: from,
+          to: to,
+          scale: _activeHandle != null,
+        );
+      }
+      _transforming = false;
+      _transformStart = null;
+      _transformFrom = null;
+      _transformTo = null;
+      _activeHandle = null;
+      _canvasTick.value++;
+    }
+  }
+
+  Rect _rectOf(CanvasNodeModel n) {
+    final List<double> b = n.bbox;
+    if (b.length < 4) {
+      return Rect.zero;
+    }
+    return Rect.fromLTRB(
+      math.min(b[0], b[2]),
+      math.min(b[1], b[3]),
+      math.max(b[0], b[2]),
+      math.max(b[1], b[3]),
+    );
+  }
+
+  _SelectHit _hitTopmost(Offset world) {
+    CanvasNodeModel? found;
+    final double slop = _tapSlopPx / math.max(_camera.scale, 1e-6);
+    final Rect probe = Rect.fromCircle(center: world, radius: slop);
+    for (final CanvasNodeModel n in _engine.queryVisible(probe)) {
+      if (_rectOf(n).inflate(slop).contains(world)) {
+        found = n; // ascending layer order ⇒ the last hit is topmost
+      }
+    }
+    return _SelectHit(found);
+  }
+
+  /// Emits the mutation set for a move/resize: DELETE_NODE of each replaced
+  /// node plus ADD_* for its replacement, so the PC mirrors the transform
+  /// through the existing frozen actions (no schema change).
+  void _applyTransform({
+    required Rect from,
+    required Rect to,
+    required bool scale,
+  }) {
+    for (final String id in List<String>.of(_selected)) {
+      final CanvasNodeModel? node = _nodeById(id);
+      if (node == null) {
+        continue;
+      }
+      final bool scalable = kScalableKinds.contains(node.kind);
+      final bool doScale = scale && scalable;
+      if (scale && !scalable) {
+        continue; // resize is suppressed for this node — leave it untouched
+      }
+      final List<List<double>> pts = doScale
+          ? scalePoints(node.geometry.pts, from, to)
+          : translatePoints(node.geometry.pts, to.topLeft - from.topLeft);
+      final List<double> bbox = doScale
+          ? scaleBbox(node.bbox, from, to)
+          : translateBbox(node.bbox, to.topLeft - from.topLeft);
+      final CanvasNodeModel updated = CanvasNodeModel(
+        nodeId: node.nodeId,
+        kind: node.kind,
+        layer: node.layer,
+        bbox: bbox,
+        style: NodeStyleModel(
+          color: node.style.color,
+          strokeWidth: node.style.strokeWidth,
+          opacity: node.style.opacity,
+          blendMode: node.style.blendMode,
+        ),
+        geometry: NodeGeometryModel(
+          pts: pts,
+          shapeType: node.geometry.shapeType,
+          graphConfig: node.geometry.graphConfig,
+          assetRef: node.geometry.assetRef,
+        ),
+      );
+      _doc.elements.removeWhere((CanvasNodeModel n) => n.nodeId == node.nodeId);
+      _doc.elements.add(updated);
+      _engine.addNode(updated); // replace semantics: re-bakes the union
+      _artboard.noteContent(_rectOf(updated));
+      _dirty = true;
+      final String action = _addActionForKind(node.kind);
+      unawaited(
+        widget.client.sendRpc(
+          _commitEnvelope('DELETE_NODE', <String, dynamic>{
+            'node_id': node.nodeId,
+          }),
+        ),
+      );
+      unawaited(
+        widget.client.sendRpc(_commitEnvelope(action, updated.toJson())),
+      );
+    }
+  }
+
+  /// Frozen Doc 02 action that re-creates a node of [kind] on the PC.
+  static String _addActionForKind(String kind) => switch (kind) {
+        'STROKE' || 'HIGHLIGHT' || 'LINE' => 'ADD_STROKE',
+        'SHAPE' => 'ADD_SHAPE',
+        'GRAPH_AXES' => 'ADD_GRAPH',
+        'IMAGE' => 'ADD_IMAGE',
+        _ => 'ADD_STROKE',
+      };
+
+  /// Deletes the current selection (works for free strokes too).
+  void _deleteSelection() {
+    if (_selected.isEmpty) {
+      return;
+    }
+    for (final String id in List<String>.of(_selected)) {
+      _deleteNode(id);
+    }
+    setState(() => _selected.clear());
+  }
+
   void _onPointerDown(PointerDownEvent e) {
     _pointers.add(e.pointer);
     _palm.noteDown(e);
     final StudioTool tool = _tool.value;
 
+    if (tool == StudioTool.select) {
+      _onSelectDown(e);
+      return;
+    }
     if (tool == StudioTool.eraser) {
       _erasing = true;
       _erasedInDrag.clear();
+      _eraseDiscs.clear();
       _eraseAt(e.localPosition);
       return;
     }
@@ -374,8 +666,16 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   void _onPointerMove(PointerMoveEvent e) {
+    if (_tool.value == StudioTool.select) {
+      _onSelectMove(e);
+      return;
+    }
     if (toolIsEraser()) {
-      if (_erasing && _toolConfig.value.eraserMode == EraserMode.stroke) {
+      // Round-8 issue 03: BOTH modes follow the drag. Brush needs the tail of
+      // discs to erase continuously; element mode needs it to sweep across
+      // several nodes in one pass (the old `precision` mode only fired once
+      // on pointer-down, which felt broken).
+      if (_erasing) {
         _eraseAt(e.localPosition);
       }
       return;
@@ -436,6 +736,10 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     if (_pointers.isEmpty) {
       _erasing = false;
       _erasedInDrag.clear();
+      // Round-8 issue 07: a completed selector interaction settles here.
+      if (_tool.value == StudioTool.select) {
+        _onSelectUp();
+      }
     }
     if (_pointers.length < 2) {
       _cameraEngaged = false;
@@ -615,44 +919,111 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   // -------------------------------------------------------------------------
-  // Eraser hit-testing (Doc 22 queryVisible → Doc 25 DELETE_NODE)
+  // Eraser (Doc 22 queryVisible → Doc 25 DELETE_NODE / ADD_STROKE)
+  //
+  // Round-8 issue 03: the DEFAULT mode is now a real brush eraser. It cannot
+  // delete a stroke node — the node IS the stroke — so it replaces each
+  // touched stroke with the fragments outside the swept disc. Bbox elements
+  // (shapes/images/graphs) are cleared only when a disc actually lands on
+  // them. `EraserMode.element` keeps the previous whole-node delete.
   // -------------------------------------------------------------------------
+
+  /// Discs swept during the current press/drag, so a fast stroke erases a
+  /// continuous swathe instead of isolated dabs.
+  final List<EraseDisc> _eraseDiscs = <EraseDisc>[];
+  static const StrokeEraser _strokeEraser = StrokeEraser();
 
   void _eraseAt(Offset screen) {
     final Offset world = _camera.screenToWorld(screen, _viewport);
-    // Eraser hit radius follows ToolConfig.width (dock's "Hit radius" slider, dp).
-    final double pad =
+    // Radius follows ToolConfig.width (dock's "Eraser radius" slider, dp).
+    final double radius =
         math.max(_toolConfig.value.width, 1.0) / math.max(_camera.scale, 1e-6);
-    final Rect probe = Rect.fromLTWH(
-      world.dx - pad,
-      world.dy - pad,
-      pad * 2,
-      pad * 2,
-    );
-    CanvasNodeModel? victim;
-    // queryVisible returns ascending layer order — the last bbox hit wins.
-    for (final CanvasNodeModel n in _engine.queryVisible(probe)) {
-      final List<double> b = n.bbox;
-      if (b.length != 4) {
+    final EraseDisc disc = EraseDisc(world, radius);
+    _eraseDiscs.add(disc);
+    // Discs are consumed by every candidate, so keep only those that can
+    // still reach a node near this point plus the previous few (drag tail).
+    if (_eraseDiscs.length > 24) {
+      _eraseDiscs.removeRange(0, _eraseDiscs.length - 24);
+    }
+    final Rect probe = Rect.fromCircle(center: world, radius: radius);
+    final bool elementMode =
+        _toolConfig.value.eraserMode == EraserMode.element;
+    bool changed = false;
+    for (final CanvasNodeModel node in _engine.queryVisible(probe)) {
+      final EraseOutcome outcome = _strokeEraser.apply(
+        node,
+        _eraseDiscs,
+        elementMode: elementMode,
+      );
+      if (!outcome.changesAnything) {
         continue;
       }
-      if (world.dx >= b[0] &&
-          world.dx <= b[2] &&
-          world.dy >= b[1] &&
-          world.dy <= b[3]) {
-        victim = n;
+      if (!_erasedInDrag.add(node.nodeId)) {
+        continue; // already handled during this press/drag
+      }
+      changed = true;
+      if (outcome.fragments.isEmpty) {
+        _deleteNode(node.nodeId);
+      } else {
+        _replaceWithFragments(node, outcome.fragments);
       }
     }
-    if (victim == null) {
-      return;
+    if (changed) {
+      _dirty = true;
+      _canvasTick.value++;
     }
-    if (!_erasedInDrag.add(victim.nodeId)) {
-      // One DELETE_NODE per node per press/drag (Doc 24 §4): the
-      // precision/stroke down-hit records the id too, so a stroke-mode drag
-      // that starts ON a node (or crosses it twice) never double-fires.
-      return;
+  }
+
+  /// Replaces [original] with nodes carrying its style, one per surviving
+  /// fragment, and mirrors the swap to the PC (`DELETE_NODE` + `ADD_STROKE`).
+  void _replaceWithFragments(
+    CanvasNodeModel original,
+    List<List<List<double>>> fragments,
+  ) {
+    _doc.elements.removeWhere((CanvasNodeModel n) => n.nodeId == original.nodeId);
+    _engine.removeCommitted(original.nodeId);
+    unawaited(
+      widget.client.sendRpc(
+        _commitEnvelope('DELETE_NODE', <String, dynamic>{
+          'node_id': original.nodeId,
+        }),
+      ),
+    );
+    for (final List<List<double>> pts in fragments) {
+      final List<double> bbox = polylineBounds(
+        pts.map((List<double> p) => Offset(p[0], p[1])).toList(growable: false),
+        // Half the stroke width so the rounded caps are inside the bbox.
+        padding: math.max(original.style.strokeWidth, 1.0) / 2,
+      );
+      final CanvasNodeModel node = CanvasNodeModel(
+        nodeId: uuidV4(),
+        kind: original.kind,
+        layer: original.layer,
+        bbox: bbox,
+        style: NodeStyleModel(
+          color: original.style.color,
+          strokeWidth: original.style.strokeWidth,
+          opacity: original.style.opacity,
+          blendMode: original.style.blendMode,
+        ),
+        geometry: NodeGeometryModel(
+          pts: pts,
+          shapeType: original.geometry.shapeType,
+          graphConfig: original.geometry.graphConfig,
+          assetRef: original.geometry.assetRef,
+        ),
+      );
+      _engine.addNode(node);
+      _doc.elements.add(node);
+      _artboard.noteContent(
+        Rect.fromLTRB(bbox[0], bbox[1], bbox[2], bbox[3]),
+      );
+      unawaited(
+        widget.client.sendRpc(
+          _commitEnvelope('ADD_STROKE', node.toJson()),
+        ),
+      );
     }
-    _deleteNode(victim.nodeId);
   }
 
   void _deleteNode(String nodeId) {
@@ -805,6 +1176,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     final String safeName = name.isEmpty ? 'image.png' : name;
     final String ref = 'assets/$safeName';
     _pendingAssets[ref] = img.bytes;
+    // Round-8 issue 05: hand the encoded bytes to the engine's image cache so
+    // the IMAGE node can actually paint (it used to draw an empty rect).
+    _engine.assets.resolve(ref, Uint8List.fromList(img.bytes));
 
     final int total =
         (img.bytes.length + kAssetChunkRawCap - 1) ~/ kAssetChunkRawCap;
@@ -863,6 +1237,51 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
 
   double? _numOf(Object? v) => v is num ? v.toDouble() : null;
 
+  /// Round-8 issue 05 — restores IMAGE bytes for a document that already
+  /// carries them.
+  ///
+  /// `loadDocument` extracts the archive's `assets/*` entries to
+  /// `<base>/assets/<canvasId>/`, but nothing ever fed them to the renderer,
+  /// so a REOPENED canvas showed its images as blank boxes. This reads each
+  /// IMAGE node's `asset_ref` back and registers the bytes with the engine's
+  /// image cache. Best effort: a missing file is skipped (the node renders
+  /// nothing rather than something wrong).
+  Future<void> _primeArchivedAssets() async {
+    final List<String> refs = <String>[];
+    for (final CanvasNodeModel n in _doc.elements) {
+      final String? ref = n.geometry.assetRef;
+      if (n.kind == 'IMAGE' && ref != null && ref.isNotEmpty) {
+        if (!refs.contains(ref)) {
+          refs.add(ref);
+        }
+      }
+    }
+    if (refs.isEmpty) {
+      return;
+    }
+    try {
+      for (final String ref in refs) {
+        if (_engine.assets.isReady(ref)) {
+          continue;
+        }
+        final File file = File(
+          await canvasAssetPath(
+            _doc.canvasId,
+            ref,
+            baseDir: widget.baseDir,
+          ),
+        );
+        if (!await file.exists()) {
+          continue;
+        }
+        _engine.assets.resolve(ref, await file.readAsBytes());
+      }
+      _engine.assets.ensureDecoded(refs);
+    } catch (_) {
+      // Offline/partial environment (widget tests) — images stay blank.
+    }
+  }
+
   CanvasNodeModel _buildNode({
     required String kind,
     required String? shapeType,
@@ -893,7 +1312,6 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   void _commitElement(CanvasNodeModel node, Rect content, String action) {
-    // Issue 05 root cause: shape/graph/image commits landed only in the
     // document + RPC — never in the engine index — so their ink vanished on
     // mobile at pen-lift (live preview cleared, nothing rebaked) while the
     // PC, applying the same RPC, kept rendering it. Every element commit
@@ -1265,6 +1683,23 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                 ),
               ),
             ),
+            // Round-8 issue 07 — selector chrome above the ink, below the dock.
+            if (_tool.value == StudioTool.select)
+              ValueListenableBuilder<int>(
+                valueListenable: _canvasTick,
+                builder: (BuildContext context, int tick, Widget? child) {
+                  final Rect shown = _transforming && _transformTo != null
+                      ? _transformTo!
+                      : _selectionRect;
+                  return CanvasSelectionOverlay(
+                    viewMatrix: _camera.viewMatrix,
+                    rect: shown,
+                    scale: _camera.scale,
+                    showHandles: _selected.isNotEmpty && _selectionCanScale,
+                    marquee: _marquee,
+                  );
+                },
+              ),
             Positioned(
               left: 6,
               top: 6,
@@ -1284,6 +1719,22 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                 ),
               ),
             ),
+            // Round-8 issue 07 — deleting a selection (free strokes included)
+            // needs a target that is not a drag, so it gets a floating action
+            // that only appears while something is selected.
+            if (_tool.value == StudioTool.select && _selected.isNotEmpty)
+              Positioned(
+                right: 16,
+                bottom: 16,
+                child: FloatingActionButton.small(
+                  key: const ValueKey<String>('delete-selection'),
+                  heroTag: 'delete-selection',
+                  tooltip: 'Delete selection',
+                  backgroundColor: StudioTheme.danger,
+                  onPressed: _deleteSelection,
+                  child: const Icon(Icons.delete_outline, color: Colors.white),
+                ),
+              ),
           ],
         );
       },

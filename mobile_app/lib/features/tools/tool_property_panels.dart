@@ -138,6 +138,8 @@ class ToolPropertyPanel extends StatelessWidget {
 
   List<Widget> _rows(StudioTool tool, ToolConfig cfg) {
     switch (tool) {
+      case StudioTool.select:
+        return _selectRows();
       case StudioTool.pen:
         return _strokeRows(tool, cfg);
       case StudioTool.highlighter:
@@ -244,19 +246,39 @@ class ToolPropertyPanel extends StatelessWidget {
     ];
   }
 
-  /// Eraser: precision/stroke mode + hit radius (ToolConfig.width) and a
-  /// caption naming the RPC contract; hit-test itself lives in Doc 22.
+  /// Round-8 issue 07 — the selector's own panel. The tool has no paint
+  /// settings; it documents the gesture set (and the free-stroke resize
+  /// restriction, which is the one non-obvious rule).
+  List<Widget> _selectRows() {
+    return <Widget>[
+      const Text('Tap an object to select it', style: toolPanelCaptionStyle),
+      const SizedBox(height: 6),
+      const Text(
+        'Drag inside the selection to move it. Drag a corner or edge '
+        'handle to resize — except free-hand pen strokes, which can only '
+        'be moved or deleted (drag a marquee around them to select).',
+        style: toolPanelCaptionStyle,
+      ),
+    ];
+  }
+
+  /// Eraser: brush (default) vs whole-element mode + eraser radius
+  /// (ToolConfig.width) and a caption naming the RPC contract.
+  ///
+  /// Round-8 issue 03: brush splits strokes into the fragments outside the
+  /// swept disc (ADD_STROKE ×N + DELETE_NODE of the original) so it behaves
+  /// like a real eraser; element mode keeps the old whole-node delete.
   List<Widget> _eraserRows(ToolConfig cfg) {
     return <Widget>[
       SegmentedButton<EraserMode>(
         segments: const <ButtonSegment<EraserMode>>[
           ButtonSegment<EraserMode>(
-            value: EraserMode.precision,
-            label: Text('precision'),
+            value: EraserMode.brush,
+            label: Text('brush'),
           ),
           ButtonSegment<EraserMode>(
-            value: EraserMode.stroke,
-            label: Text('stroke'),
+            value: EraserMode.element,
+            label: Text('element'),
           ),
         ],
         selected: <EraserMode>{cfg.eraserMode},
@@ -265,12 +287,12 @@ class ToolPropertyPanel extends StatelessWidget {
             commit((ToolConfig c) => c.eraserMode = next.first),
       ),
       const SizedBox(height: 8),
-      _tipSizeRow(cfg, label: 'Hit radius'),
+      _tipSizeRow(cfg, label: 'Eraser radius'),
       const SizedBox(height: 4),
       const Text(
-        'Tap a node: DELETE_NODE of the hit-tested node. Drag: same '
-        'action per hit node. Hit radius writes ToolConfig.width; '
-        'hit-test and RPC live in the canvas page.',
+        'Brush: the stroke is split around the swept disc — the rest '
+        'survives. Element: the whole hit node is deleted. Radius writes '
+        'ToolConfig.width; RPC lives in the canvas page.',
         style: toolPanelCaptionStyle,
       ),
     ];
@@ -463,6 +485,7 @@ Color _colorFromHex(String hex) =>
     Color(int.parse(hex.substring(1), radix: 16) | 0xFF000000);
 
 String _toolLabel(StudioTool tool) => switch (tool) {
+  StudioTool.select => 'Select',
   StudioTool.pen => 'Pen',
   StudioTool.highlighter => 'Highlighter',
   StudioTool.eraser => 'Eraser',
