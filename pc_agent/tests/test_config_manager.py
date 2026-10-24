@@ -4,7 +4,7 @@ import json
 import os
 from pathlib import Path
 
-from pc_agent.core.config_manager import AppConfig, ConfigManager
+from pc_agent.core.config_manager import AppConfig, ConfigManager, default_export_dir
 
 
 def test_first_run_creates_config_json(tmp_path: Path) -> None:
@@ -19,7 +19,9 @@ def test_first_run_creates_config_json(tmp_path: Path) -> None:
     assert data["log_level"] == "INFO"
     assert data["appdata_dir"] == str(tmp_path)
     assert data["assets_dir"] == str(tmp_path / "assets")
-    assert data["export_dir"] == str(tmp_path / "exports")
+    # Round 7: exports default to the OS Downloads folder so the user can find
+    # the file without digging through appdata (Settings overrides it).
+    assert data["export_dir"] == str(default_export_dir())
 
 
 def test_master_constant_defaults() -> None:

@@ -20,3 +20,6 @@ AppData/
 appdata/
 
 # NOTE: pc_agent/installer/slatesync_agent.spec (PyInstaller) stays TRACKED — do not add *.spec here.
+
+# Flutter widget-test scratch dirs (each suite isolates its own appdata/db root)
+mobile_app/test/.*_tmp/

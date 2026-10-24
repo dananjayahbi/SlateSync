@@ -469,3 +469,82 @@ On opening a document: zoom-to-fit with **48 world-unit padding**, centered via 
 
 ### 10.8 Round-6 ownership matrix (write-conflict guard)
 PC: viewport+fit (`pc_agent/viewport/**`) · export+thumbnail renderer+extents (`pc_agent/export/**`, `engine/document_store.py`) · clear/relay/protocol mirrors+`engine/scene_graph.py`+`network/ws_stream_server.py`+`main.py`+spec JSONs (`shared_specs/**`, Doc 02 §5 body, `core/**`, `network/**`, `engine/scene_graph.py`, `main.py`) · gallery+studio (`pc_agent/gui/**`, its tests). Mobile: engine (`mobile_app/lib/canvas_engine/**` EXCEPT thumbnail_renderer which is frozen) · canvas page (`mobile_app/lib/features/canvas/**`) · dock (`mobile_app/lib/features/tools/**`) · home (`mobile_app/lib/features/home/**`, `core/storage/**`). Docs agent: `docs/overview.md` + `docs/micro/**` EXCEPT Doc 02. Contract tests: new `mobile_app/test/contract_*` files only.
+
+## 11. Round-7 Extension — PC Authority, Device Roster, Static Pairing (NORMATIVE)
+
+Round 7 keeps the §4–§10 wire contract byte-identical (still **20** actions, no new
+envelope types, no new payload keys on existing messages) and adds **PC-side
+orchestration state**. The PC agent is the single authority: a device mutation is
+applied to the PC scene first, announced on the bus, and only then fanned out.
+
+### 11.1 New bus events (additive — `core/events.py`)
+
+| Event | Frozen payload | Emitted by |
+|---|---|---|
+| `RPC_ORIGIN` | `{msg: dict, connection_id: str\|None}` | Doc 11 `WsStreamServer` — right AFTER `RPC_MESSAGE` for the same envelope, only for frames that arrived off the wire |
+| `DEVICES_UPDATED` | `{devices: [{connection_id, device_id, name, peer, open_canvas_id, open_canvas_title, mirrored, last_seen}], mirrored_canvas_id: str\|None, count: int}` | Doc 02 §9 hub (`DeviceRoster.emit_devices`) |
+| `MIRROR_CHANGED` | `{canvas_id: str\|None, title: str, connection_id: str\|None}` | hub — first `OPEN_CANVAS` or a Settings switch |
+
+`CONNECTION_STATE` gains an **optional** `connection_id` key (the per-connection
+uuid minted by Doc 11); handlers must keep tolerating its absence.
+`CANVAS_LIST_UPDATED` stays frozen at `{canvases, devices:int}` — the roster lives on
+`DEVICES_UPDATED` so the round-5 payload is untouched.
+
+### 11.2 Authority rules
+
+1. **Apply-then-relay.** `WsStreamServer` dispatches locally (scene graph/store),
+   emits `RPC_ORIGIN`, then relays through `set_relay_filter(...)`. The hub installs
+   `CanvasSyncManager.allows_relay`, which returns `True` when no canvas is mirrored
+   yet, and otherwise only for the mirrored `canvas_id`. Unmirrored canvases never
+   cross devices.
+2. **First open wins the mirror** (`DeviceRoster.note_open`). Two tablets on two
+   canvases ⇒ the PC mirrors the first; the second is persisted (`CANVAS_PUT`/index)
+   without moving the viewport. `select_mirror(canvas_id, title)` switches it from
+   Settings and loads the stored body through `DocumentStore.open_payload`.
+3. **The mirror is a canvas, not a connection.** A disconnecting device never blanks
+   the PC viewport; only the source attribution is released.
+
+### 11.3 Static pairing (Doc 12)
+
+The session token moved from per-process to per-install: `network/pairing_store.py`
+persists `{version, token, device_id, device_name, created_at, qr_payload}` in
+`<appdata_dir>/pairing.json` (atomic tmp + `os.replace`). `pairing_qr.png` is written
+**once** — a restart reuses the recorded `qr_payload` and skips re-encoding. The
+tablet saves host/port/token and re-handshakes on every later launch (Doc 25).
+`rotate_token()` (Settings → *Reset pairing*) is the only way to invalidate it.
+
+### 11.4 Mirror rendering (Docs 06/08)
+
+`viewport/mirror_scene.py::MirrorScene` is the live element registry: seeded from
+`DOCUMENT_LOADED`, kept current by `COMMITTED_NODE` (upsert) / `CANVAS_CLEARED`
+(clear). `GLCanvasHost._render` feeds `PrimitiveRenderer` from it instead of the
+open-time `doc.elements`, which is why SHAPE / GRAPH_AXES / IMAGE commits from a
+tablet now paint. With elements but no document/artboard, `MirrorArtboard` (infinite,
+white) is substituted so primitives are never skipped.
+
+### 11.5 Export destination & freshness (Doc 15)
+
+`AppConfig.export_dir` defaults to the OS **Downloads** folder
+(`config_manager.default_export_dir()`); `ConfigManager.set_export_dir(path)` persists
+a Settings choice and takes effect on the next job (no restart). The output name is
+`<slug(title)>.<ext>` (or `payload["filename"]`), collision-suffixed `(2)`, never a
+job uuid and never allowed outside `export_dir`. `DocumentStore.snapshot_current()`
+rebuilds the document from the **live scene graph**, so an edit made after the open
+is in the file.
+
+### 11.6 Settings panel (Doc 16)
+
+`gui/settings_panel.py::SettingsPanel` lists connected devices (name, peer, open
+canvas, which one is mirrored + a *Mirror* button), an **Export folder** row with a
+native folder picker, and *Reset pairing*. `StudioWindow` owns it via
+`open_settings()` (HUD **Settings** button + Tools → Settings…) with three injected
+callbacks: `select_mirror`, `set_export_dir`, `rotate_pairing`.
+
+### 11.7 Round-7 ownership matrix (write-conflict guard)
+PC: `network/device_roster.py`, `network/pairing_store.py`, `network/discovery_pairing.py`,
+`network/canvas_sync.py`, `network/ws_stream_server.py`, `viewport/mirror_scene.py`,
+`viewport/empty_state_overlay.py`, `viewport/gl_canvas_host.py`, `gui/settings_panel.py`,
+`gui/studio_window.py`, `export/export_coordinator.py`, `engine/document_store.py`,
+`core/events.py`, `core/config_manager.py`, `main.py` + their tests. Mobile:
+`network/vector_sync_client.dart`, `features/sync/**`, `core/storage/**` + their tests.
+Docs agent: `docs/micro/**` EXCEPT the §5 body of Doc 02 (still schema-locked).

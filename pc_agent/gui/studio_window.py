@@ -36,14 +36,17 @@ from pc_agent.core.events import (
     ARTBOARD_CHANGED,
     CANVAS_LIST_UPDATED,
     CONNECTION_STATE,
+    DEVICES_UPDATED,
     DOCUMENT_LOADED,
     EXPORT_FINISHED,
     EXPORT_PROGRESS,
     EXPORT_STARTED,
+    MIRROR_CHANGED,
     PAIRING_INFO,
     EventBus,
 )
 from pc_agent.gui.canvas_gallery_panel import CanvasGalleryPanel
+from pc_agent.gui.settings_panel import SettingsPanel
 
 if TYPE_CHECKING:  # Doc 06 GLCanvasHost — consumed, never redefined
     from pc_agent.viewport.gl_canvas_host import GLCanvasHost
@@ -151,6 +154,9 @@ class StudioWindow:
         thumbnail_fn: Callable[[dict, Path, int], object] | None = None,
         thumbs_dir: str | Path | None = None,
         canvases_dir: str | Path | None = None,
+        select_mirror: Callable[[str | None], object] | None = None,
+        rotate_pairing: Callable[[], object] | None = None,
+        set_export_dir: Callable[[Path], object] | None = None,
     ) -> None:
         """``open_request`` (round 4, optional): injected File → "Open synced
         canvas…" callback wired by main.py to
@@ -171,6 +177,14 @@ class StudioWindow:
         self._thumbnail_fn = thumbnail_fn
         self._thumbs_dir = thumbs_dir
         self._canvases_dir = canvases_dir
+        #: Round 7 — Settings panel wiring (devices, mirror switch, export dir,
+        #: pairing reset). All injected; the window never touches the hub.
+        self._select_mirror = select_mirror
+        self._rotate_pairing = rotate_pairing
+        self._set_export_dir = set_export_dir
+        self._settings: SettingsPanel | None = None
+        self._device_rows: list[dict] = []
+        self._mirrored_canvas_id: str | None = None
 
         # Tk scaffolding — set by build(); None until then.
         self._root: tk.Misc | None = None
@@ -185,6 +199,7 @@ class StudioWindow:
         self._zoom_label: ctk.CTkLabel | None = None
         self._preset_label: ctk.CTkLabel | None = None
         self._qr_btn: ctk.CTkButton | None = None
+        self._settings_btn: ctk.CTkButton | None = None
         self._viewport: ctk.CTkFrame | None = None
         self._format_combo: ctk.CTkComboBox | None = None
         self._dpi_combo: ctk.CTkComboBox | None = None
@@ -223,6 +238,8 @@ class StudioWindow:
         # Data (Doc 16 §5.1)
         self._pairing: dict | None = None
         self._canvas_id: str | None = None
+        #: Round 7: canvas title, used to name the exported file.
+        self._canvas_title: str | None = None
         self._last_scale = 1.0
         self._last_raise = 0.0
         self._job_id: str | None = None
@@ -251,6 +268,8 @@ class StudioWindow:
             (EXPORT_FINISHED, self._on_export_finished),
             (PAIRING_INFO, self._on_pairing_info),
             (CANVAS_LIST_UPDATED, self._on_canvas_list_updated),
+            (DEVICES_UPDATED, self._on_devices_updated),
+            (MIRROR_CHANGED, self._on_mirror_changed),
         ]
         for event, handler in self._subscriptions:
             bus.on(event, handler)
@@ -516,6 +535,10 @@ class StudioWindow:
             hud, text="Pair / QR", width=110, command=self.open_qr_dialog
         )
         self._qr_btn.pack(side="right", padx=8, pady=6)
+        self._settings_btn = ctk.CTkButton(
+            hud, text="Settings", width=90, command=self.open_settings
+        )
+        self._settings_btn.pack(side="right", padx=(0, 4), pady=6)
         return hud
 
     def _build_center(self) -> ctk.CTkFrame:
@@ -568,6 +591,11 @@ class StudioWindow:
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="About", command=self._menu_about)
         menubar.add_cascade(label="Help", menu=help_menu)
+        edit_menu = tk.Menu(menubar, tearoff=0)
+        # Round 7: Settings lives on the menu bar so the device roster and the
+        # export folder are always reachable (issue 03/04/05/07).
+        edit_menu.add_command(label="Settings…", command=self._menu_settings)
+        menubar.insert_cascade(1, label="Tools", menu=edit_menu)
         self._root.configure(menu=menubar)
         self._menubar = menubar
 
@@ -602,6 +630,16 @@ class StudioWindow:
         # optional so older/no-device emits still land (Issue 02 default: none).
         self.after(0, self._apply_canvas_list, canvases, devices)
 
+    def _on_devices_updated(
+        self, devices=None, mirrored_canvas_id=None, count=None, **_extra
+    ) -> None:
+        """Round 7: live device roster from the hub (Settings panel)."""
+        self.after(0, self._apply_devices_updated, devices, mirrored_canvas_id, count)
+
+    def _on_mirror_changed(self, canvas_id=None, title=None, **_extra) -> None:
+        """Round 7: the mirrored canvas changed (auto on first open, or Settings)."""
+        self.after(0, self._apply_mirror_changed, canvas_id)
+
     # ------------------------------------------------------------------
     # Tk-thread appliers
     # ------------------------------------------------------------------
@@ -609,6 +647,9 @@ class StudioWindow:
         canvas_id, preset = self._doc_view(doc)
         if canvas_id is not None:
             self._canvas_id = str(canvas_id)
+        self._canvas_title = (
+            str(doc.get("title")) if isinstance(doc, dict) and doc.get("title") else None
+        )
         self.update_hud(1.0, preset)
         if self._start_btn is not None:
             self._start_btn.configure(state="normal")
@@ -675,6 +716,60 @@ class StudioWindow:
             self._gallery.set_current(self._canvas_id)
         self._refresh_pairing_affordance()
 
+    def _apply_devices_updated(self, devices, mirrored_canvas_id, count=None) -> None:
+        """Round 7: cache the roster and push it into the open Settings panel."""
+        self._device_rows = (
+            [dict(row) for row in devices] if isinstance(devices, list) else []
+        )
+        if isinstance(mirrored_canvas_id, str) and mirrored_canvas_id:
+            self._mirrored_canvas_id = mirrored_canvas_id
+        elif mirrored_canvas_id is None and not self._device_rows:
+            self._mirrored_canvas_id = None
+        if count is not None:
+            try:
+                self._devices = int(count)  # roster is authoritative for "paired"
+            except (TypeError, ValueError):
+                logger.warning("bad DEVICES_UPDATED count=%r", count)
+        elif self._device_rows:
+            self._devices = len(self._device_rows)
+        panel = self._settings
+        if panel is not None and panel.exists():
+            panel.refresh_devices(self._device_rows, self._mirrored_canvas_id)
+        self._refresh_pairing_affordance()
+
+    def _apply_mirror_changed(self, canvas_id) -> None:
+        """Round 7: follow the hub's mirror choice (issue 07)."""
+        self._mirrored_canvas_id = str(canvas_id) if canvas_id else None
+        panel = self._settings
+        if panel is not None and panel.exists():
+            panel.refresh_devices(self._device_rows, self._mirrored_canvas_id)
+
+    def open_settings(self) -> None:
+        """Open (or raise) the PC Settings panel — devices/mirror/export folder."""
+        root = self._root
+        if root is None:
+            return
+        panel = self._settings
+        if panel is not None and panel.exists():
+            panel.window.lift()
+            panel.refresh_devices(self._device_rows, self._mirrored_canvas_id)
+            return
+        self._settings = SettingsPanel(
+            root,
+            set_export_dir=self._set_export_dir,
+            select_mirror=self._select_mirror,
+            rotate_pairing=self._rotate_pairing,
+            export_dir=self._config.export_dir,
+            on_close=self._on_settings_closed,
+        )
+        self._settings.refresh_devices(self._device_rows, self._mirrored_canvas_id)
+
+    def _on_settings_closed(self) -> None:
+        self._settings = None
+
+    def _menu_settings(self) -> None:
+        self.open_settings()
+
     # ------------------------------------------------------------------
     # Issue 02/03-PC pairing affordances
     # ------------------------------------------------------------------
@@ -728,7 +823,14 @@ class StudioWindow:
         )
         env = self._rpc_envelope(
             "EXPORT_JOB", "START_EXPORT", self._canvas_id,
-            {"format": fmt, "dpi": dpi, "target": target},
+            {
+                "format": fmt,
+                "dpi": dpi,
+                "target": target,
+                # Round 7: name the file after the canvas so the user can find
+                # it in the (Settings-selectable) export folder.
+                "title": self._canvas_title or self._canvas_id,
+            },
         )
         self._job_id = self._export_submit(env)
         if self._start_btn is not None:

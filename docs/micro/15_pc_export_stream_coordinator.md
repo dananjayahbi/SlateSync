@@ -141,3 +141,42 @@ Acceptance: progress ≤10 Hz yet complete per strip/batch; bus events and pushe
 
 **Wave 2.A** (template §6 — Subagent 3 executes Doc 15; Subagent 2 executes Docs 13 + 14) alongside Docs 08, 13, 14, 16, 17, 24, 26, 27. Zero path overlap: this doc alone owns `export_coordinator.py` and its test; it **consumes** the frozen `TiledRasterExporter`/`VectorPdfExporter` APIs (Docs 13/14) with no intra-wave ordering — constructor injection makes the dependency symmetric and compile-time safe.
 **Never touches:** this doc never edits `pc_agent/viewport/`, `pc_agent/network/`, `pc_agent/engine/`, `pc_agent/gui/`, `pc_agent/core/`, `pc_agent/main.py`, or any `mobile_app/` file — those are read-only imports (Docs 04, 09–12) or owned by other same-wave subagents; `main.py` wiring of `push = WsStreamServer.broadcast_json` happens only in Wave 3.A (Doc 04/18 scope).
+
+## 8. Round-7 Amendment — Export Destination & Document Freshness (NORMATIVE)
+
+Round-7 fixes two user-reported defects: *"we should be able to set the export path
+(select a folder), the default is the downloads folder"* and *"the export does not
+export the latest canvas, just an older one"*.
+
+### 8.1 Destination
+* `AppConfig.export_dir` now defaults to `config_manager.default_export_dir()`
+  (`~/Downloads`), not an appdata subfolder. Existing `config.json` files keep
+  whatever path they store.
+* `ConfigManager.set_export_dir(path)` / `update(**changes)` persist a Settings choice;
+  `AppConfig` is no longer frozen so the running `ExportCoordinator` sees the new
+  directory on the very next job (no restart). `ConfigManager._coerce` accepts both
+  `str` and `Path` for the four path fields.
+* `ExportCoordinator._out_path(job_id, payload)` resolves
+  `Path(config.export_dir)` at job time and names the file
+  `payload["filename"]` when present (title/extension sanitized, directory components
+  stripped) else `<slug(payload["title"] or canvas_id)>.<ext>`. Existing files are
+  never overwritten: `name (2).ext`, `name (3).ext`, … The job uuid is no longer the
+  filename.
+* `StudioWindow` adds `payload["title"]` to the `EXPORT_JOB`/`START_EXPORT` envelope so
+  the file lands under the human canvas title.
+
+### 8.2 Freshness
+* New `DocumentStore.snapshot_current() -> CanvasDocument | None` returns a **shallow
+  copy** of the open document carrying `SceneGraph.nodes()`, `SceneGraph.content_bounds()`
+  and the scene's live artboard. `doc.elements` is only the opener's snapshot — every
+  tablet edit after the open lives in the scene graph — which is exactly why exports
+  used to serialize an older canvas.
+* `main.py::document_for_export` now returns `store.snapshot_current() or current_doc["doc"]`
+  and still raises `ValueError("export rejected: no document is open")` when nothing is
+  open (surfaced as `EXPORT_FINISHED ok=false`).
+
+### 8.3 Tests (`tests/test_export_coordinator.py`, `tests/test_export_destination.py`)
+Default destination is Downloads; `set_export_dir` round-trips through `config.json`;
+`_out_path` uses the title, honours `filename`, corrects the extension, refuses to
+overwrite; a Settings change applies to the next job; the exported document contains a
+node inserted after the document was opened.

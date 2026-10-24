@@ -119,3 +119,66 @@ Future<File> writeExportTemp(String transferId, int totalChunks, Map<int, Uint8L
 - Seq-rule note (reconciled): ONE per-connection u16 counter shared by all frame types — template §3, Doc 02 and Doc 11's single `last_seq` gate all lock this. The client increments it once per frame sent, so interleaved camera/live frames remain strictly increasing and Doc 11's mod-2^16 newer-than gate accepts every frame.
 - Zero file overlap with sibling 1.B docs (20/21/22/23 own `canvas_engine/`; 06–12 own `pc_agent/`). Exports (`PairingInfo`, `VectorSyncClient`, `SyncEvent`, `PairingScanner`) are consumed later by Docs 24/26/27 and Wave 3.A without editing this file.
 - **Never touches:** `pc_agent/**`, `shared_specs/**`, `mobile_app/lib/core/**` (Doc 05), `mobile_app/lib/canvas_engine/**` (Docs 20–23), `mobile_app/lib/features/**` (Docs 24/26/27), `mobile_app/lib/main.dart`.
+
+## 8. Round-7 Amendment — Persistent Pairing & Silent Reconnect (NORMATIVE)
+
+The PC now keeps a **static** pairing token (`pc_agent/network/pairing_store.py`,
+Doc 12 §8), so one QR scan must stay valid forever. The tablet therefore remembers
+its last successful pairing and dials it again on launch.
+
+### 8.1 `network/pairing_credentials_store.dart` (new)
+```dart
+class PairingCredentials {                       // immutable value object
+  PairingCredentials({required String host, required int port,
+                      required String token, String? deviceName});
+  factory PairingCredentials.fromPairingInfo(PairingInfo info, {String? deviceName});
+  factory PairingCredentials.fromJson(Map<String, dynamic> json);   // FormatException if bad
+  Map<String, dynamic> toJson();                  // {version, host, port, token, device_name}
+  PairingInfo toPairingInfo();
+}
+
+class PairingCredentialsStore {
+  PairingCredentialsStore({String? filePath});    // null ⇒ path_provider app-support
+  static const String fileName = 'slatesync_pairing.json';
+  Future<PairingCredentials?> load();             // null ⇒ none / corrupt / unreadable
+  Future<void> save(PairingCredentials credentials);
+  Future<void> clear();
+}
+```
+Same storage mechanism as `DeviceIdentity` (`features/sync/hub_sync.dart`) — no new
+package dependency. Reads/writes never throw; the token is masked in `toString()`.
+
+### 8.2 `features/pairing/pairing_session_controller.dart` (new)
+`PairingSessionController({required VectorSyncClient client, PairingCredentialsStore?
+store, String? deviceName, Duration attemptTimeout = 8s})` watches the Doc 25
+`events` stream:
+* `autoConnect() -> Future<bool>` — loads the saved pairing and connects; returns
+  `true` once `SyncState.online`. A `SyncState.authFailed` (close `4001`, i.e. the PC
+  rotated its token) **forgets** the credentials and returns `false`; any other failure
+  keeps them (PC off / different network). Never throws, bounded by `attemptTimeout`.
+* save-on-online — every transition to `SyncState.online` persists
+  `client.pairing` (so QR scan, manual entry, mDNS discovery and the auto-connect all
+  become the remembered pairing); duplicate saves are skipped.
+* `forget()`, `dispose()`, and the `kPairingAutoConnectFailedNotice` /
+  `kPairingAuthFailedNotice` copy used by the UI.
+
+### 8.3 Shell wiring (`main.dart`)
+`SlateSyncApp` gains three optional seams: `credentialsStore`, `deviceName` and
+`autoConnect` (default `true`). On start it runs `_restorePairing()`: nothing saved ⇒
+the home gallery stays (existing "Connect" entry point); saved but unreachable ⇒
+`PairingScreen(notice: …)` is pushed with the failure copy. The gallery remains usable
+offline and the app never hangs on a dead pairing. `PairingScreen` gains an optional
+`notice` string (key `pairing-auto-connect-notice`) rendered above the pairing modes.
+
+### 8.4 Device identity on open (`features/sync/canvas_sync_bridge.dart`)
+`announceOpen` now also sends `payload.device_id` / `payload.device_name` from the
+persisted `DeviceIdentity`, so the PC hub can attribute an `OPEN_CANVAS` to a device in
+its roster (Doc 02 §11.1/§11.2). The §8.2 `payload.canvas` body and every existing key
+are unchanged; the identity keys are omitted when no identity file exists.
+
+### 8.5 Tests (`test/pairing_credentials_store_test.dart`)
+JSON round-trip and validation (legacy `ipv4` key tolerated), store save/load/clear
+against an injected path, corrupt/unwritable files, controller auto-connect
+success/timeout/throw/auth-failure, save-on-online, the `PairingScreen` notice, and
+three shell-level auto-connect widget tests. `test/sync_canvas_bridge_test.dart` asserts
+the additive identity keys.

@@ -102,7 +102,7 @@ def test_stop_without_start_is_noop(pairing_factory: Any, zc_cls: Any) -> None:
 
 
 def test_session_token_stable_urlsafe_and_per_instance(
-    pairing_factory: Any, zc_cls: Any, lan_ip: Any
+    pairing_factory: Any, zc_cls: Any, lan_ip: Any, tmp_path: Path
 ) -> None:
     pairing, _, _ = pairing_factory()
     tokens = [pairing.session_token for _ in range(5)]
@@ -114,7 +114,13 @@ def test_session_token_stable_urlsafe_and_per_instance(
     pairing.start()
     assert pairing.session_token == tokens[0]
 
-    other, _, _ = pairing_factory()  # fresh instance mints a new token
+    # Round 7: the token is persisted in appdata, so a fresh instance on the
+    # same profile reuses it (the QR is now a static, one-time pairing code).
+    restarted, _, _ = pairing_factory()
+    assert restarted.session_token == tokens[0]
+
+    # A different profile (other appdata dir) mints its own token.
+    other, _, _ = pairing_factory(appdata=tmp_path / "other" / "SlateSync")
     assert other.session_token != tokens[0]
 
 
@@ -166,9 +172,15 @@ def test_start_creates_appdata_dir_on_clean_profile(
     assert (target / "pairing_qr.png").is_file()
 
 
-def test_fresh_instance_rewrites_qr_with_new_token(
+def test_restart_keeps_qr_payload_stable(
     pairing_factory: Any, zc_cls: Any, lan_ip: Any
 ) -> None:
+    """The pairing QR is a static one-time artifact (round 7).
+
+    A restart on the same profile reuses the persisted token, so the payload
+    stays valid for devices that already stored the credentials, and the PNG
+    is not needlessly re-encoded.
+    """
     first, config, first_events = pairing_factory()
     first.start()
     qr_path = config.appdata_dir / "pairing_qr.png"
@@ -176,12 +188,32 @@ def test_fresh_instance_rewrites_qr_with_new_token(
     first.stop()
 
     second, _, second_events = pairing_factory()  # same default appdata path
-    second.start()
-    assert second.session_token != first.session_token
-    assert qr_path.read_bytes() != first_bytes  # rewritten for the new token
+    with patch("pc_agent.network.discovery_pairing.qrcode.make") as make:
+        second.start()
+    assert second.session_token == first.session_token
+    assert qr_path.read_bytes() == first_bytes  # payload unchanged → no rewrite
+    make.assert_not_called()
     assert len(second_events) == 1
     assert second_events[0]["token"] == second.session_token
-    assert second_events[0]["token"] != first_events[0]["token"]
+    assert second_events[0]["token"] == first_events[0]["token"]
+
+
+def test_rotate_token_mints_new_token_and_rewrites_qr(
+    pairing_factory: Any, zc_cls: Any, lan_ip: Any
+) -> None:
+    """Settings → Reset pairing invalidates previously paired devices."""
+    pairing, config, _ = pairing_factory()
+    pairing.start()
+    qr_path = config.appdata_dir / "pairing_qr.png"
+    old_bytes = qr_path.read_bytes()
+    old_token = pairing.session_token
+    pairing.stop()
+
+    new_token = pairing.rotate_token()
+    assert new_token != old_token
+    assert pairing.session_token == new_token
+    pairing.start()
+    assert qr_path.read_bytes() != old_bytes  # rewritten for the new token
 
 
 def test_port_consistency_across_config_mdns_qr(

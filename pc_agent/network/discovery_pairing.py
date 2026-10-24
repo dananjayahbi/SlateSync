@@ -6,12 +6,17 @@ injected ``token_provider``), announces ``_slatesync._tcp.local.`` via
 ``zeroconf`` with TXT ``{v:"1", token:<session_token>}``, and renders the
 fallback pairing QR at ``<appdata_dir>/pairing_qr.png`` whose payload yields
 the Doc 25 connect URL ``ws://<ipv4>:50606/ws?token=<session_token>``.
+
+Round 7 — the token is no longer minted per process: it is loaded from (or
+created once in) ``<appdata_dir>/pairing.json`` by :class:`PairingStore`, so
+the QR payload is **static** across restarts. A device that paired once keeps
+handshaking with the token it saved. The QR PNG is only re-rendered when the
+payload actually changes (new IP / port / rotated token).
 """
 
 from __future__ import annotations
 
 import logging
-import secrets
 import socket
 from pathlib import Path
 
@@ -20,6 +25,7 @@ from zeroconf import ServiceInfo, Zeroconf
 
 from pc_agent.core.config_manager import AppConfig
 from pc_agent.core.events import PAIRING_INFO, EventBus
+from pc_agent.network.pairing_store import PairingIdentity, PairingStore
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +46,38 @@ class DiscoveryPairing:
     def __init__(self, bus: EventBus, config: AppConfig) -> None:
         self._bus = bus
         self._config = config
-        self._token = secrets.token_urlsafe(32)  # minted once; stable for life
+        # Round 7: persistent identity — the token survives restarts, so the
+        # QR is a one-time thing instead of a per-launch secret.
+        self._store = PairingStore(config.appdata_dir)
+        self._identity: PairingIdentity = self._store.load_or_create()
         self._zc: Zeroconf | None = None
         self._info: ServiceInfo | None = None
 
     @property
     def session_token(self) -> str:
-        return self._token
+        return self._identity.token
+
+    @property
+    def identity(self) -> PairingIdentity:
+        """Persisted identity (token + device id/name + creation time)."""
+        return self._identity
+
+    def rotate_token(self) -> str:
+        """Settings → "Reset pairing": new token, old scan codes stop working.
+
+        The running mDNS record is stopped so the next ``start()`` advertises
+        the freshly minted token; the QR is re-rendered on that start.
+        """
+        previous = self._identity
+        if self._zc is not None:  # keep mDNS in step with the new token
+            self.stop()
+        self._identity = self._store.rotate()
+        logger.info(
+            "pairing token rotated (device_id %s -> %s)",
+            previous.device_id,
+            self._identity.device_id,
+        )
+        return self._identity.token
 
     def start(self) -> None:
         """Register mDNS, write the QR, then emit ``PAIRING_INFO`` exactly once.
@@ -63,7 +94,7 @@ class DiscoveryPairing:
             name=f"{self._config.mdns_service_name}.{self._config.mdns_service_type}",
             port=self._config.ws_port,
             addresses=[socket.inet_aton(ipv4)],
-            properties={"v": "1", "token": self._token},
+            properties={"v": "1", "token": self._identity.token},
         )
         zc = Zeroconf()
         try:
@@ -83,8 +114,10 @@ class DiscoveryPairing:
             PAIRING_INFO,
             ipv4=ipv4,
             port=self._config.ws_port,
-            token=self._token,
+            token=self._identity.token,
             qr_png_path=str(qr_png_path),
+            device_id=self._identity.device_id,
+            device_name=self._identity.device_name,
         )
 
     def stop(self) -> None:
@@ -105,10 +138,28 @@ class DiscoveryPairing:
         self._info = None
 
     def _render_qr(self, ipv4: str) -> Path:
+        """Write the QR PNG — only when its payload changed (static pairing).
+
+        The image is derived from (ip, port, token); with a persisted token the
+        payload is byte-identical between launches, so the recorded payload in
+        ``pairing.json`` lets a restart reuse the existing file without
+        re-encoding anything.
+        """
         path = self._config.appdata_dir / _QR_FILENAME
+        payload = _pairing_payload(ipv4, self._config.ws_port, self._identity.token)
+        if payload == self._identity.qr_payload and path.is_file():
+            return path
         path.parent.mkdir(parents=True, exist_ok=True)  # clean profile, first run
-        image = qrcode.make(_pairing_payload(ipv4, self._config.ws_port, self._token))
+        image = qrcode.make(payload)
         image.save(str(path))
+        self._store.remember_qr_payload(payload)
+        self._identity = PairingIdentity(
+            token=self._identity.token,
+            device_id=self._identity.device_id,
+            device_name=self._identity.device_name,
+            created_at=self._identity.created_at,
+            qr_payload=payload,
+        )
         return path
 
     def _lan_ipv4(self) -> str:

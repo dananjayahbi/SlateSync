@@ -51,8 +51,10 @@ from pc_agent.core.events import (
     CANVAS_LIST_UPDATED,
     CONNECTION_STATE,
     RPC_MESSAGE,
+    RPC_ORIGIN,
     EventBus,
 )
+from pc_agent.network.device_roster import DeviceRoster
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,8 @@ class CanvasSyncManager:
         self._devices: dict[str, dict] = {}  # registry keyed by device_id (§9.2)
         self._connections = 0  # live connection count (the `devices` field)
         self._last_peer: str | None = None  # legacy-<conn> fallback source
+        self._legacy_conn_seq = 0  # synthetic ids for CONNECTION_STATE w/o id
+        self._legacy_conns: set[str] = set()
         self._hub_device_id: str | None = None
         self._lock = threading.Lock()
         self._pull_queue: list[dict] = []  # sequential CANVAS_PULL drain (§9.4.2)
@@ -96,9 +100,15 @@ class CanvasSyncManager:
         self._last_pull_at: float | None = None
         self._pull_interval_s = max(0.0, float(pull_interval_s))
         self._stopped = False
+        #: Round 7 — connection-keyed device roster + the PC's mirror authority
+        #: (issue 03/04/07). The first canvas a device opens becomes the
+        #: mirrored one; Settings can switch it; only that canvas's mutations
+        #: are relayed to the other tablets.
+        self._roster = DeviceRoster(bus)
         self._subscriptions: list[tuple[str, object]] = [
             (CONNECTION_STATE, self._on_connection_state),
             (RPC_MESSAGE, self._on_rpc),
+            (RPC_ORIGIN, self._on_rpc_origin),
         ]
         for event, handler in self._subscriptions:
             bus.on(event, handler)  # type: ignore[arg-type]
@@ -122,6 +132,59 @@ class CanvasSyncManager:
         ``{device_id, device_name, last_list, last_seen}`` per device."""
         with self._lock:
             return {key: dict(value) for key, value in self._devices.items()}
+
+    # ------------------------------------------------------------------
+    # Round 7 — device roster + PC mirror authority (issues 03/04/07)
+    # ------------------------------------------------------------------
+    @property
+    def roster(self) -> DeviceRoster:
+        """Connection-keyed live roster (Settings panel + relay gating)."""
+        return self._roster
+
+    def device_rows(self) -> list[dict]:
+        """Frozen ``DEVICES_UPDATED.devices`` rows for the Settings panel."""
+        return self._roster.roster()
+
+    @property
+    def mirrored_canvas_id(self) -> str | None:
+        """Canvas the PC currently mirrors (first opened, or Settings choice)."""
+        return self._roster.mirrored_canvas_id
+
+    def select_mirror(self, canvas_id: str | None, title: str | None = None) -> bool:
+        """PC Settings → switch the mirrored canvas (issue 07).
+
+        Loads the requested canvas into the PC mirror from the hub store when
+        it is available, then announces ``MIRROR_CHANGED``. Returns ``True``
+        when the selection changed.
+        """
+        if not self._roster.select_mirror(canvas_id, title):
+            return False
+        self._roster.emit_mirror()
+        self._roster.emit_devices()
+        if canvas_id and canvas_id != self._current_open_id():
+            doc = self._load_stored(canvas_id)
+            if doc is not None:
+                try:
+                    self._store.open_payload(self._store.document_to_json(doc))
+                except Exception:
+                    logger.exception("switching the mirrored canvas to %s failed", canvas_id)
+        return True
+
+    def allows_relay(self, msg: dict, connection_id: str | None = None) -> bool:
+        """Relay gate consulted by the WS server (round 7 — PC authority).
+
+        A mutation leaves the PC only when it belongs to the mirrored canvas,
+        so two tablets on two different canvases never cross-contaminate. With
+        no mirror selected yet, mutations are still relayed (the first open
+        selects it) to keep a single-device session behaving exactly as before.
+        """
+        mirrored = self._roster.mirrored_canvas_id
+        if mirrored is None:
+            return True
+        canvas_id = msg.get("canvas_id")
+        if not isinstance(canvas_id, str) or not canvas_id:
+            return True
+        return canvas_id == mirrored
 
     @property
     def hub_device_id(self) -> str:
@@ -231,16 +294,30 @@ class CanvasSyncManager:
     # ------------------------------------------------------------------
     # Bus handlers
     # ------------------------------------------------------------------
-    def _on_connection_state(self, connected=None, peer=None, **_extra) -> None:
+    def _on_connection_state(
+        self, connected=None, peer=None, connection_id=None, **_extra
+    ) -> None:
         if not connected:
             with self._lock:
                 self._connections = max(0, self._connections - 1)
+                if connection_id is None and self._legacy_conns:
+                    connection_id = self._legacy_conns.pop()
+            self._roster.detach(connection_id)
+            self._roster.emit_devices()
             self._emit_list()  # devices transition (registry rows stay cached)
             return
         with self._lock:
             self._connections += 1
             if peer:
                 self._last_peer = str(peer)
+            if connection_id is None:
+                # Legacy emit without a transport id: still give the roster a
+                # stable key so Settings can list the device.
+                self._legacy_conn_seq += 1
+                connection_id = f"legacy-conn-{self._legacy_conn_seq}"
+                self._legacy_conns.add(connection_id)
+        self._roster.attach(connection_id, peer)
+        self._roster.emit_devices()
         self._emit_list()
         # §9.2: hub list on each new connection, then §8.3 flow 2 asks for
         # the device's own list (it also pushes one unsolicited).
@@ -268,6 +345,41 @@ class CanvasSyncManager:
             self._on_open_canvas(payload)
         # OPEN_CANVAS without 'canvas' is the PC-internal path dialect (§8.2):
         # never handled here and never accepted from the wire.
+
+    def _on_rpc_origin(self, msg=None, connection_id=None, **_extra) -> None:
+        """Round 7: bind device identity / open canvas to a connection.
+
+        Emitted by the WS server right AFTER ``RPC_MESSAGE``, so the roster
+        never gets ahead of the handlers that actually apply the envelope.
+        """
+        if not isinstance(msg, dict):
+            return
+        payload = msg.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        device_id = payload.get("device_id")
+        device_name = payload.get("device_name")
+        if isinstance(device_id, str) or isinstance(device_name, str):
+            self._roster.identify(
+                connection_id,
+                device_id if isinstance(device_id, str) else None,
+                device_name if isinstance(device_name, str) else None,
+            )
+            self._roster.emit_devices()
+        if msg.get("type") != "CANVAS_LIFECYCLE" or msg.get("action") != "OPEN_CANVAS":
+            return
+        canvas = payload.get("canvas")
+        if not isinstance(canvas, dict):
+            return
+        canvas_id = canvas.get("canvas_id")
+        if not isinstance(canvas_id, str) or not canvas_id:
+            return
+        title = canvas.get("title")
+        if self._roster.note_open(
+            connection_id, canvas_id, title if isinstance(title, str) else None
+        ):
+            # Issue 07: the FIRST canvas opened becomes the mirrored one.
+            self._roster.emit_mirror()
+        self._roster.emit_devices()
 
     def _on_canvas_list(self, payload: dict) -> None:
         """Device CANVAS_LIST (v2) → registry + merge → emit → hub list → pulls."""
@@ -376,7 +488,13 @@ class CanvasSyncManager:
     def _on_open_canvas(self, payload: dict) -> None:
         """OPEN_CANVAS {canvas}: persist-on-open happens inside
         ``store.open_payload`` (§9.3, BEFORE the switch), then the mirror
-        loads; a store change is announced via the hub list."""
+        loads; a store change is announced via the hub list.
+
+        Round 7 (issue 07): with two tablets on two different canvases the PC
+        mirrors only ONE of them — the first one opened (or whatever Settings
+        selects). A later open from another device is still persisted, but it
+        does not steal the mirror.
+        """
         if "canvas" not in payload:
             return  # path dialect is PC-internal only (§8.2)
         data = payload.get("canvas")
@@ -385,18 +503,62 @@ class CanvasSyncManager:
             return
         canvas_id = data.get("canvas_id")
         canvas_id = canvas_id if isinstance(canvas_id, str) and canvas_id else None
+        mirrored = self._roster.mirrored_canvas_id
+        if mirrored is not None and canvas_id is not None and canvas_id != mirrored:
+            # Persist the newly opened canvas without moving the mirror.
+            self._persist_open(data)
+            return
         before = self._index.get(canvas_id) if (self._index and canvas_id) else None
         try:
             self._store.open_payload(data)
         except Exception:
             logger.exception("OPEN_CANVAS (canvas dialect) failed")
             return
+        if canvas_id and self._roster.note_open(
+            None,
+            canvas_id,
+            data.get("title") if isinstance(data.get("title"), str) else None,
+        ):
+            # Issue 07: the FIRST canvas opened becomes the mirrored one. When
+            # the envelope came off the wire, ``_on_rpc_origin`` has already
+            # tagged the session and this returns False (no double emit).
+            self._roster.emit_mirror()
+            self._roster.emit_devices()
         if self._index is None:
             return
         after = self._index.get(canvas_id) if canvas_id else None
         if after != before:  # persist-on-open actually stored something (§9.2)
             self._emit_list()
             self.broadcast_hub_list()
+
+    def _persist_open(self, data: dict) -> None:
+        """Store a canvas that another device opened without mirroring it."""
+        if self._index is None:
+            return
+        try:
+            doc = self._store.parse_document(data)
+            self._index.save_document_if_newer(doc, source="device")
+        except Exception:
+            logger.exception("persisting a non-mirrored OPEN_CANVAS failed")
+            return
+        self._emit_list()
+        self.broadcast_hub_list()
+
+    def _current_open_id(self) -> str | None:
+        """Canvas id currently loaded in the PC store, if any."""
+        doc = getattr(self._store, "_current", None)
+        canvas_id = getattr(doc, "canvas_id", None)
+        return str(canvas_id) if canvas_id else None
+
+    def _load_stored(self, canvas_id: str):
+        """Load a persisted canvas body from the hub index (or ``None``)."""
+        doc = None
+        if self._index is not None:
+            try:
+                doc = self._index.load(canvas_id)
+            except Exception:
+                logger.exception("hub index load failed for %s", canvas_id)
+        return doc
 
     # ------------------------------------------------------------------
     # Merge, emission, pull drain (§9.4)

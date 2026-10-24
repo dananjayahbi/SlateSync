@@ -180,20 +180,34 @@ class CanvasSyncBridge {
 
   /// Broadcasts `OPEN_CANVAS {canvas: <full Doc 03 body>}` for a
   /// tablet-driven open/create/switch so the PC mirrors it (§8.3.1).
+  ///
+  /// The payload also carries the device identity ([DeviceIdentity]) so the
+  /// PC hub can attribute the open to a device in its roster; existing keys
+  /// and values are untouched (extra keys are tolerated by the PC).
   Future<void> announceOpen(CanvasDocumentModel doc) async {
     if (_disposed) return;
-    await client.sendRpc(_openEnvelope(doc));
+    await client.sendRpc(await _openEnvelope(doc));
   }
 
   /// §8.2 cross-device dialect: `payload.canvas` carries the complete
   /// snake_case document body; top-level `canvas_id` mirrors the open id.
-  Map<String, dynamic> _openEnvelope(CanvasDocumentModel doc) =>
-      <String, dynamic>{
-        'type': 'CANVAS_LIFECYCLE',
-        'action': 'OPEN_CANVAS',
-        'canvas_id': doc.canvasId,
-        'payload': <String, dynamic>{'canvas': doc.toJson()},
-      };
+  /// `device_id` / `device_name` are added from the persisted identity when
+  /// one is reachable, and omitted otherwise (legacy payload shape).
+  Future<Map<String, dynamic>> _openEnvelope(CanvasDocumentModel doc) async {
+    final DeviceIdentity? identity = await _identity();
+    return <String, dynamic>{
+      'type': 'CANVAS_LIFECYCLE',
+      'action': 'OPEN_CANVAS',
+      'canvas_id': doc.canvasId,
+      'payload': <String, dynamic>{
+        'canvas': doc.toJson(),
+        if (identity != null) ...<String, dynamic>{
+          'device_id': identity.deviceId,
+          'device_name': identity.deviceName,
+        },
+      },
+    };
+  }
 
   // -------------------------------------------------------------------------
   // Receive side (Doc 02 §8.2–§8.3; unknown actions tolerated)
@@ -292,7 +306,7 @@ class CanvasSyncBridge {
     if (_disposed) return;
     try {
       final CanvasDocumentModel doc = await _loader(canvasId);
-      await client.sendRpc(_openEnvelope(doc));
+      await client.sendRpc(await _openEnvelope(doc));
       _fireRemote(doc);
     } catch (_) {
       // No local cache for that id — nothing to broadcast or switch to.

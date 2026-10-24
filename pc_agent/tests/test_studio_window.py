@@ -28,10 +28,12 @@ from pc_agent.core.events import (
     ARTBOARD_CHANGED,
     CANVAS_LIST_UPDATED,
     CONNECTION_STATE,
+    DEVICES_UPDATED,
     DOCUMENT_LOADED,
     EXPORT_FINISHED,
     EXPORT_PROGRESS,
     EXPORT_STARTED,
+    MIRROR_CHANGED,
     PAIRING_INFO,
     EventBus,
 )
@@ -46,6 +48,8 @@ _MATRIX_EVENTS = [
     EXPORT_FINISHED,
     PAIRING_INFO,
     CANVAS_LIST_UPDATED,
+    DEVICES_UPDATED,
+    MIRROR_CHANGED,
 ]
 
 _GREEN, _GREY, _RED = "#2ECC71", "#9E9E9E", "#E74C3C"
@@ -215,10 +219,11 @@ def test_start_button_invokes_export_submit_with_frozen_envelope() -> None:
         assert env["type"] == "EXPORT_JOB"
         assert env["action"] == "START_EXPORT"
         assert env["canvas_id"] == "cv-42"
-        assert set(env["payload"]) == {"format", "dpi", "target"}
+        assert set(env["payload"]) == {"format", "dpi", "target", "title"}
         assert env["payload"]["format"] == "PNG"
         assert env["payload"]["dpi"] == 300
         assert env["payload"]["target"] == "BOTH"
+        assert env["payload"]["title"] == "T"  # round 7: names the export file
         assert isinstance(env["id"], str) and env["id"]
         assert isinstance(env["timestamp"], int)
         assert win._job_id == "job-1"
@@ -298,7 +303,12 @@ def test_pdf_disables_dpi_combo_and_sends_null_dpi() -> None:
         bus.emit(DOCUMENT_LOADED, doc=_doc())
         assert _pump_until(root, lambda: str(win._start_btn.cget("state")) == "normal")
         win._start_btn.invoke()
-        assert submit.calls[-1]["payload"] == {"format": "PDF", "dpi": None, "target": "PC"}
+        assert submit.calls[-1]["payload"] == {
+            "format": "PDF",
+            "dpi": None,
+            "target": "PC",
+            "title": "T",
+        }
 
         win._format_combo.set("PNG")
         win._on_format_change("PNG")
@@ -681,3 +691,148 @@ def test_spec_datas_include_both_branding_assets() -> None:
     text = spec.read_text(encoding="utf-8")
     assert '"slatesync.ico", "slatesync_64.png"' in text
     assert "pc_agent/assets" in text
+
+
+# ---------------------------------------------------------------------------
+# 12. Round 7 — Settings panel wiring (devices / mirror / export folder)
+# ---------------------------------------------------------------------------
+
+
+def test_settings_button_and_menu_open_the_panel() -> None:
+    with _studio() as (root, win, bus, _gl, _submit):
+        assert win._settings_btn is not None
+        win._settings_btn.invoke()
+        assert win._settings is not None and win._settings.exists()
+        win._settings.close()
+        assert win._settings is None
+
+        win._menu_settings()
+        assert win._settings is not None and win._settings.exists()
+        win._settings.close()
+
+
+def test_open_settings_raises_the_existing_panel() -> None:
+    with _studio() as (root, win, _bus, _gl, _submit):
+        win.open_settings()
+        first = win._settings
+        win.open_settings()  # second call reuses, never stacks a second window
+        assert win._settings is first
+        win._settings.close()
+
+
+def test_devices_updated_drives_the_panel_and_pairing_affordance() -> None:
+    with _studio() as (root, win, bus, _gl, _submit):
+        win.open_settings()
+        rows = [
+            {
+                "connection_id": "c1",
+                "device_id": "dev-1",
+                "name": "Pixel Tablet",
+                "peer": "10.0.0.5:1111",
+                "open_canvas_id": "cv-1",
+                "open_canvas_title": "Alpha",
+                "mirrored": True,
+                "last_seen": 1760760000,
+            }
+        ]
+        bus.emit(DEVICES_UPDATED, devices=rows, mirrored_canvas_id="cv-1", count=1)
+        assert _pump_until(root, lambda: win._device_rows == rows)
+        assert win._devices == 1
+        assert win._mirrored_canvas_id == "cv-1"
+        assert win._qr_btn.winfo_manager() == ""  # paired → Pair/QR hidden
+        assert _pump_until(
+            root, lambda: win._settings.mirrored_selection == "cv-1"
+        )
+        win._settings.close()
+
+
+def test_empty_roster_restores_the_pair_button() -> None:
+    with _studio() as (root, win, bus, _gl, _submit):
+        bus.emit(DEVICES_UPDATED, devices=[], mirrored_canvas_id=None, count=0)
+        assert _pump_until(root, lambda: win._devices == 0)
+        assert win._device_rows == []
+        assert win._mirrored_canvas_id is None
+        assert win._qr_btn.winfo_manager() == "pack"
+
+
+def test_mirror_changed_updates_the_panel_selection() -> None:
+    with _studio() as (root, win, bus, _gl, _submit):
+        win.open_settings()
+        rows = [
+            {
+                "connection_id": "c1",
+                "device_id": "dev-1",
+                "name": "Tablet",
+                "peer": "a:1",
+                "open_canvas_id": "cv-1",
+                "open_canvas_title": "Alpha",
+                "mirrored": True,
+                "last_seen": 1,
+            },
+            {
+                "connection_id": "c2",
+                "device_id": "dev-2",
+                "name": "Phone",
+                "peer": "b:2",
+                "open_canvas_id": "cv-2",
+                "open_canvas_title": "Beta",
+                "mirrored": False,
+                "last_seen": 1,
+            },
+        ]
+        bus.emit(DEVICES_UPDATED, devices=rows, mirrored_canvas_id="cv-1", count=2)
+        assert _pump_until(root, lambda: win._mirrored_canvas_id == "cv-1")
+
+        bus.emit(MIRROR_CHANGED, canvas_id="cv-2", title="Beta", connection_id="c2")
+        assert _pump_until(root, lambda: win._mirrored_canvas_id == "cv-2")
+        assert _pump_until(root, lambda: win._settings.mirrored_selection == "cv-2")
+        win._settings.close()
+
+
+def test_settings_callbacks_are_injected_into_the_panel(tmp_path: Path) -> None:
+    mirror_calls: list[str | None] = []
+    export_calls: list[Path] = []
+    rotate_calls: list[int] = []
+
+    root = _make_root()
+    try:
+        win = StudioWindow(
+            AppConfig(),
+            EventBus(),
+            _FakeGLHost(),
+            _SubmitSpy(),
+            select_mirror=mirror_calls.append,
+            set_export_dir=export_calls.append,
+            rotate_pairing=lambda: rotate_calls.append(1),
+        )
+        win.build(root)
+        win.open_settings()
+        panel = win._settings
+        panel.refresh_devices(
+            [
+                {
+                    "connection_id": "c1",
+                    "device_id": "dev-1",
+                    "name": "Tablet",
+                    "peer": "a:1",
+                    "open_canvas_id": "cv-1",
+                    "open_canvas_title": "Alpha",
+                    "mirrored": True,
+                    "last_seen": 1,
+                }
+            ],
+            "cv-1",
+        )
+        panel.select_mirror("cv-1")
+        panel.set_export_dir(tmp_path / "exports")
+        panel._reset_btn.invoke()
+
+        assert mirror_calls == ["cv-1"]
+        assert export_calls == [tmp_path / "exports"]
+        assert rotate_calls == [1]
+        panel.close()
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass

@@ -41,6 +41,7 @@ from pc_agent.core.config_manager import AppConfig
 from pc_agent.core.events import (
     ARTBOARD_CHANGED,
     CAMERA_DELTA,
+    CANVAS_CLEARED,
     COMMITTED_NODE,
     DOCUMENT_LOADED,
     LIVE_FRAME,
@@ -55,6 +56,8 @@ from pc_agent.core.protocol import (
     LiveFrame,
     is_newer_seq,
 )
+from pc_agent.viewport.empty_state_overlay import EmptyStateOverlay
+from pc_agent.viewport.mirror_scene import MirrorArtboard, MirrorScene
 from pc_agent.viewport.stroke_tessellator import (
     CAP_VERTS,
     DEFAULT_STROKE_WIDTH,
@@ -83,6 +86,16 @@ FIT_FALLBACK_RECT = (-500.0, -500.0, 1000.0, 1000.0)
 # GL_SCISSOR_TEST raw enum — moderngl exposes no SCISSOR capability constant,
 # so enable_direct/disable_direct take the raw enum (as in primitive_renderer).
 _GL_SCISSOR_TEST = 0x0C11
+
+# --- Round 7 issue 02: "no canvas yet" surface -------------------------------
+#: Workspace colour shown when NOTHING is open. The viewport used to clear to
+#: pure white with no document loaded, which read as a blank sheet the user
+#: could not tell apart from a real (empty) artboard. A neutral slate makes
+#: the disconnected/empty state obviously "no canvas"; the real artboard
+#: background takes over the moment a document loads.
+EMPTY_STATE_BG = "#3A3D42"
+#: Centred hint drawn over the empty workspace (Tk text, not GL).
+EMPTY_STATE_HINT = "No canvas open — pair a device or press Ctrl+N"
 
 # --- Doc 06 §4/§5 tuning ---------------------------------------------------
 TICK_MS = 16  # Tk after(16) pump — never pyglet.app.run()
@@ -307,6 +320,7 @@ class GLCanvasHost:
         self._fbo_texture: moderngl.Texture | None = None
         self._label: tk.Label | None = None
         self._frame: tk.Frame | None = None
+        self._empty_state: EmptyStateOverlay | None = None
         self._parent_widget: tk.Misc | None = None
         # Blit-pipeline reuse state (DEFAULT pure-Tk path, issue 04 round 3):
         # one cached read buffer, one zero-copy frombuffer view, two PhotoImage
@@ -348,6 +362,11 @@ class GLCanvasHost:
         self._doc: CanvasDocument | None = None
         self._artboard = None
         self._content_bounds: dict[str, float] = {}
+        #: Round 7 issue 06 — live element mirror. ``doc.elements`` is only the
+        #: snapshot taken when the document was opened; every later
+        #: COMMITTED_NODE keeps this registry current so SHAPE/GRAPH_AXES/IMAGE
+        #: edits from a tablet actually paint in the PC mirror.
+        self._scene = MirrorScene()
         self._committed: dict[
             str, tuple[TessellatedMesh, tuple[float, float, float, float], int]
         ] = {}
@@ -366,13 +385,14 @@ class GLCanvasHost:
         self._laser_key: tuple[float, float, float] | None = None
         self._laser_meshes: list[TessellatedMesh] = []
 
-        # Template §4 event matrix — exactly these five subscriptions.
+        # Template §4 event matrix + round 7 CANVAS_CLEARED (mirror wipe).
         self._subscriptions = [
             (LIVE_FRAME, self._on_live_frame),
             (CAMERA_DELTA, self._on_camera_delta),
             (DOCUMENT_LOADED, self._on_document_loaded),
             (COMMITTED_NODE, self._on_committed_node),
             (ARTBOARD_CHANGED, self._on_artboard_changed),
+            (CANVAS_CLEARED, self._on_canvas_cleared),
         ]
         for event, handler in self._subscriptions:
             bus.on(event, handler)
@@ -404,7 +424,7 @@ class GLCanvasHost:
         if self._mounted or self._shutdown:
             return
         self._parent_widget = parent_widget
-        self._frame = tk.Frame(parent_widget, bg="#FFFFFF")
+        self._frame = tk.Frame(parent_widget, bg=EMPTY_STATE_BG)
         self._frame.pack(fill="both", expand=True)
         self._frame.bind("<Configure>", self._on_configure)
 
@@ -474,6 +494,9 @@ class GLCanvasHost:
         self._doc = doc
         self._committed.clear()
         self._pending_nodes = []
+        # Round 7 issue 06: elements come from the LIVE mirror registry, not
+        # from the opener's snapshot, so later commits keep painting.
+        self._scene.reset(getattr(doc, "elements", None) if doc is not None else None)
         if doc is not None:
             self._artboard = getattr(doc, "artboard", self._artboard)
             bounds = getattr(doc, "content_bounds", None)
@@ -483,6 +506,13 @@ class GLCanvasHost:
                 node for node in (getattr(doc, "elements", None) or []) if node is not None
             ]
             self.fit_viewport()
+        else:
+            # Round 7 issue 02: closing the document must release the page so
+            # the viewport falls back to the neutral empty workspace instead of
+            # repainting the previous artboard's paper colour.
+            self._artboard = None
+            self._content_bounds = {}
+        self._update_empty_state()
         self.request_redraw()
 
     def fit_viewport(self) -> None:
@@ -591,6 +621,9 @@ class GLCanvasHost:
         self._drain_after_id = None
         for event, handler in self._subscriptions:
             self._bus.off(event, handler)
+        if self._empty_state is not None:
+            self._empty_state.destroy()
+            self._empty_state = None
         self._release_gl()
         frame = self._frame
         self._frame = None
@@ -688,9 +721,26 @@ class GLCanvasHost:
         if node is None:
             if deleted_node_id is not None:
                 self._committed.pop(str(deleted_node_id), None)
+                self._scene.remove(deleted_node_id)
                 self.request_redraw()
             return
+        # Round 7 issue 06: keep the live mirror in step with every commit and
+        # re-derive the content bounds, so SHAPE/GRAPH_AXES/IMAGE nodes that
+        # arrive AFTER the document was opened still paint (PrimitiveRenderer
+        # needs the node list + bounds; doc.elements is a stale snapshot).
+        self._scene.upsert(node)
+        bounds = self._scene.bounds()
+        if bounds["max_x"] > bounds["min_x"] or bounds["max_y"] > bounds["min_y"]:
+            self._content_bounds = bounds
         self._pending_nodes.append(node)  # tessellated on the Tk main thread
+        self.request_redraw()
+
+    def _on_canvas_cleared(self, canvas_id=None, **_extra) -> None:
+        """Round 7 issue 06: a CLEAR_CANVAS wipes the mirrored element set too."""
+        self._scene.clear()
+        self._committed.clear()
+        self._pending_nodes = []
+        self._content_bounds = {}
         self.request_redraw()
 
     def _on_artboard_changed(self, artboard=None, content_bounds=None, **_extra) -> None:
@@ -910,8 +960,23 @@ class GLCanvasHost:
     def _build_fallback_label(self) -> None:
         # DEFAULT pure-Tk surface: an ordinary tk.Label — zero foreign child
         # windows, so the toplevel keeps native drag/resize/maximize (issue 03/04).
-        self._label = tk.Label(self._frame, bg="#FFFFFF", bd=0)
+        self._label = tk.Label(self._frame, bg=EMPTY_STATE_BG, bd=0)
         self._label.pack(fill="both", expand=True)
+        # Round 7 issue 02: explain the neutral workspace instead of showing an
+        # apparently blank (white) canvas before anything is connected.
+        try:
+            self._empty_state = EmptyStateOverlay(self._frame, EMPTY_STATE_HINT)
+        except tk.TclError:  # pragma: no cover - teardown race
+            logger.debug("empty-state overlay unavailable", exc_info=True)
+            self._empty_state = None
+        self._update_empty_state()
+
+    def _update_empty_state(self) -> None:
+        """Show the workspace hint only while no document is loaded (issue 02)."""
+        overlay = self._empty_state
+        if overlay is None:
+            return
+        overlay.set_visible(self._doc is None)
 
     def _blit_fallback(self) -> None:
         """Present the scene FBO on the Tk label — DEFAULT pure-Tk pipeline.
@@ -1065,13 +1130,25 @@ class GLCanvasHost:
         self._ctx.enable(moderngl.BLEND)
         background = _parse_color(self._background_color(), 1.0)
         self._ctx.clear(background[0], background[1], background[2], 1.0)
-        if self._primitive is not None and self._doc is not None and self._artboard is not None:
-            nodes = list(getattr(self._doc, "elements", None) or [])
+        # Round 7 issue 06: mirror elements live in ``self._scene`` (refreshed
+        # by COMMITTED_NODE) — falling back to ``doc.elements`` only keeps the
+        # first frame of a freshly opened document identical to before. An
+        # artboard-less mirror (mutations before any OPEN_CANVAS) borrows an
+        # infinite board so primitive nodes are never silently skipped.
+        artboard = self._artboard
+        if artboard is None and self._doc is not None:
+            artboard = getattr(self._doc, "artboard", None)
+        if artboard is None and len(self._scene):
+            artboard = MirrorArtboard()
+        if self._primitive is not None and artboard is not None:
+            nodes = self._scene.nodes()
+            if not nodes:
+                nodes = list(getattr(self._doc, "elements", None) or [])
             bounds = self._content_bounds or dict(
                 getattr(self._doc, "content_bounds", None) or {}
             )
             try:
-                self._primitive.render(nodes, self._camera, self._artboard, bounds)
+                self._primitive.render(nodes, self._camera, artboard, bounds)
             except Exception:
                 logger.exception("PrimitiveRenderer.render failed (Doc 08)")
         for mesh, color, blend_mode in self._committed.values():
@@ -1190,9 +1267,18 @@ class GLCanvasHost:
             )
 
     def _background_color(self) -> str:
+        """Clear colour: the artboard paper, else the neutral empty workspace.
+
+        Round 7 issue 02: with no document/artboard the viewport must NOT look
+        like a white page — it clears to :data:`EMPTY_STATE_BG` so a freshly
+        launched PC agent is visibly idle instead of showing an apparently
+        blank canvas before anything is connected.
+        """
         artboard = self._artboard
         if artboard is None and self._doc is not None:
             artboard = getattr(self._doc, "artboard", None)
+        if artboard is None:
+            return EMPTY_STATE_BG
         return str(getattr(artboard, "background_color", "#FFFFFF") or "#FFFFFF")
 
     # ------------------------------------------------------------------

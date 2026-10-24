@@ -15,7 +15,10 @@ import 'core/models/canvas_models.dart';
 import 'core/theme/studio_theme.dart';
 import 'features/canvas/canvas_studio_page.dart';
 import 'features/home/home_canvas_dashboard.dart';
+import 'features/pairing/pairing_screen.dart';
+import 'features/pairing/pairing_session_controller.dart';
 import 'features/sync/canvas_sync_bridge.dart';
+import 'network/pairing_credentials_store.dart';
 import 'network/vector_sync_client.dart';
 
 void main() {
@@ -23,11 +26,28 @@ void main() {
 }
 
 class SlateSyncApp extends StatefulWidget {
-  const SlateSyncApp({super.key, this.client});
+  const SlateSyncApp({
+    super.key,
+    this.client,
+    this.credentialsStore,
+    this.deviceName,
+    this.autoConnect = true,
+  });
 
   /// Optional app-lifetime sync client (tests inject a fake; `null` ⇒ the
   /// State creates and owns one, exactly as before).
   final VectorSyncClient? client;
+
+  /// Credentials persistence seam (tests inject a sandboxed store file;
+  /// `null` ⇒ path_provider app-support `slatesync_pairing.json`).
+  final PairingCredentialsStore? credentialsStore;
+
+  /// Optional tablet display name published as `device_name`.
+  final String? deviceName;
+
+  /// Silent reconnect from the saved pairing on start; tests that drive the
+  /// shell without storage pass `false`.
+  final bool autoConnect;
 
   @override
   State<SlateSyncApp> createState() => _SlateSyncAppState();
@@ -41,6 +61,10 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
   /// Doc 02 §8 canvas sync bridge: `CANVAS_LIST` pushes + `OPEN_CANVAS`
   /// (canvas dialect) hand-off for PC-initiated switches.
   late final CanvasSyncBridge _bridge;
+
+  /// Remembers the last successful pairing and silently reconnects on start
+  /// (the PC keeps a static token, so one QR scan is permanent).
+  late final PairingSessionController _pairing;
 
   /// Route pushes go through the `MaterialApp` navigator directly: this
   /// State's `context` sits ABOVE `MaterialApp`, so `Navigator.of(context)`
@@ -59,14 +83,65 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
   void initState() {
     super.initState();
     _client = widget.client ?? VectorSyncClient();
-    _bridge = CanvasSyncBridge(client: _client);
+    _pairing = PairingSessionController(
+      client: _client,
+      store: widget.credentialsStore ?? PairingCredentialsStore(),
+      deviceName: widget.deviceName,
+    );
+    _bridge = CanvasSyncBridge(client: _client, deviceName: widget.deviceName);
     _bridge.remoteOpen.addListener(_onRemoteOpen);
+    if (widget.autoConnect) {
+      // Silent reconnect with the saved pairing; on failure the normal
+      // pairing screen takes over with a status line.
+      unawaited(_restorePairing());
+    }
+  }
+
+  /// Auto-connect on start. Nothing saved ⇒ stay on the home gallery (the
+  /// existing "Connect" entry point); saved but unreachable ⇒ fall back to
+  /// [PairingScreen] with an explanatory notice. Never hangs, never crashes,
+  /// and the gallery stays usable offline.
+  Future<void> _restorePairing() async {
+    final bool online = await _pairing.autoConnect();
+    if (!mounted || online || !_pairing.hadSavedCredentials) {
+      return;
+    }
+    _showPairingFallback(_pairing.lastError);
+  }
+
+  /// Opens [PairingScreen] with [notice]. Direct push when the navigator is
+  /// already mounted (the normal case — auto-connect awaits real I/O), else
+  /// deferred to the first frame.
+  void _showPairingFallback(String? notice) {
+    void push() {
+      final NavigatorState? navigator = _navigatorKey.currentState;
+      // The user may have navigated (studio/pairing) meanwhile.
+      if (!mounted || navigator == null || navigator.canPop()) {
+        return;
+      }
+      unawaited(
+        navigator.push(
+          MaterialPageRoute<void>(
+            builder: (BuildContext context) =>
+                PairingScreen(client: _client, notice: notice),
+          ),
+        ),
+      );
+    }
+
+    if (_navigatorKey.currentState != null) {
+      push();
+      return;
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) => push());
+    WidgetsBinding.instance.scheduleFrame();
   }
 
   @override
   void dispose() {
     _bridge.remoteOpen.removeListener(_onRemoteOpen);
     unawaited(_bridge.dispose());
+    unawaited(_pairing.dispose());
     if (widget.client == null) {
       unawaited(_client.dispose()); // only dispose the client we created
     }

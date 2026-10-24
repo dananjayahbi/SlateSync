@@ -25,7 +25,7 @@ import threading
 import time
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from pc_agent.core.config_manager import AppConfig
@@ -449,6 +449,32 @@ class DocumentStore:
     def is_dirty(self) -> bool:
         with self._lock:
             return self._dirty
+
+    def snapshot_current(self) -> CanvasDocument | None:
+        """Live copy of the open document — scene graph state, not the opener's.
+
+        Round 7 (issue 06): exporters used to serialize ``current_doc["doc"]``,
+        the object captured when ``DOCUMENT_LOADED`` fired. Every tablet edit
+        after that lives in the ``SceneGraph`` only (``doc.elements`` is
+        refreshed on save), so exports produced the canvas as it looked when it
+        was opened — the "exports an older canvas" bug. This returns a shallow
+        copy carrying the CURRENT ``scene.nodes()`` + ``content_bounds()``.
+        """
+        with self._lock:
+            current = self._current
+            if current is None:
+                return None
+            return replace(
+                current,
+                elements=self._scene.nodes(),
+                content_bounds=self._scene.content_bounds(),
+                artboard=self._scene_artboard(current.artboard),
+            )
+
+    def _scene_artboard(self, fallback: Artboard) -> Artboard:
+        """Artboard currently bound to the scene (upgrades mutate it in place)."""
+        artboard = getattr(self._scene, "artboard", None)
+        return artboard if artboard is not None else fallback
 
     # ------------------------------------------------------------------
     # Bus subscriptions

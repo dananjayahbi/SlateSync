@@ -80,6 +80,7 @@ def run_full() -> int:
     from pc_agent.core.config_manager import ConfigManager
     from pc_agent.core.events import (
         CANVAS_LIST_UPDATED,
+        DEVICES_UPDATED,
         DOCUMENT_LOADED,
         PAIRING_INFO,
         RPC_MESSAGE,
@@ -142,6 +143,9 @@ def run_full() -> int:
         store=document_store,
         index=local_index,
     )
+    # Round 7 (issue 03) — the PC is the orchestrator: a device mutation only
+    # reaches the other tablets when it belongs to the canvas the PC mirrors.
+    server.set_relay_filter(canvas_sync.allows_relay)
 
     # --- 4. exports (Doc 15); output files land in config.export_dir --------
     current_doc: dict[str, CanvasDocument | None] = {"doc": None}
@@ -150,8 +154,14 @@ def run_full() -> int:
         current_doc["doc"] = doc
 
     def document_for_export(_payload: dict) -> CanvasDocument:
-        """Doc 15 loader: job payload → the open document (single-doc PC)."""
-        doc = current_doc["doc"]
+        """Doc 15 loader: job payload → LIVE snapshot of the open document.
+
+        Round 7 (issue 06): must not return the ``DOCUMENT_LOADED`` object —
+        tablet edits after the open only live in the SceneGraph, so that
+        snapshot exported a stale canvas. Prefer the store's live copy and fall
+        back to the remembered document only when the store has nothing open.
+        """
+        doc = document_store.snapshot_current() or current_doc["doc"]
         if doc is None:
             raise ValueError("export rejected: no document is open")
         return doc
@@ -175,6 +185,10 @@ def run_full() -> int:
         gl_host,
         export_submit=coordinator.submit,
         open_request=canvas_sync.request_open,  # File → Open synced canvas…
+        # Round 7 Settings panel wiring (devices / mirror / export folder).
+        select_mirror=canvas_sync.select_mirror,
+        rotate_pairing=pairing.rotate_token,
+        set_export_dir=manager.set_export_dir,
     )
     window.build(root)  # gridded layout; build() mounts the GL host (Doc 16 §5.4)
     if pairing_info:  # replay the pre-GUI PAIRING_INFO for the window
@@ -185,6 +199,14 @@ def run_full() -> int:
         CANVAS_LIST_UPDATED,
         canvases=canvas_sync.canvases,
         devices=canvas_sync.devices,
+    )
+    # Round 7: seed the Settings device roster too (it may already be non-empty
+    # when a tablet reconnected with its saved pairing credentials).
+    bus.emit(
+        DEVICES_UPDATED,
+        devices=canvas_sync.device_rows(),
+        mirrored_canvas_id=canvas_sync.mirrored_canvas_id,
+        count=canvas_sync.roster.count,
     )
 
     # Doc 02 §10.5 — view-fit-on-open: every DOCUMENT_LOADED zooms the viewport

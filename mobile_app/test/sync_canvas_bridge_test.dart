@@ -169,6 +169,7 @@ void main() {
     String? baseDir,
     void Function(CanvasDocumentModel doc)? onRemoteOpen,
     String? deviceFilePath,
+    String? deviceName,
     Future<String> Function(CanvasDocumentModel doc, {String? baseDir})?
         saver,
   }) {
@@ -179,6 +180,7 @@ void main() {
       db: db,
       baseDir: baseDir,
       onRemoteOpen: onRemoteOpen,
+      deviceName: deviceName,
       // §9.2 identity file lives under this test's scratch dir — no
       // path_provider in unit tests, deterministic per-test device_id.
       deviceFilePath: deviceFilePath ?? '${tmp.path}/slatesync_device.json',
@@ -415,7 +417,10 @@ void main() {
       expect(env['canvas_id'], 'c-pick');
       final Map<String, dynamic> payload =
           Map<String, dynamic>.from(env['payload'] as Map);
-      expect(payload.keys, <String>['canvas']);
+      expect(
+        payload.keys,
+        unorderedEquals(<String>['canvas', 'device_id', 'device_name']),
+      );
 
       // Full-doc roundtrip: save → load → toJson equals the source doc.
       final Map<String, dynamic> sentCanvas =
@@ -559,7 +564,7 @@ void main() {
   // -------------------------------------------------------------------------
 
   group('announceOpen & dispose', () {
-    test('sends OPEN_CANVAS with the exact §8.2 envelope/payload keys',
+    test('sends OPEN_CANVAS with the §8.2 keys plus device identity',
         () async {
       final CanvasDocumentModel doc = buildDoc(
         id: 'local-1',
@@ -579,8 +584,32 @@ void main() {
       expect(env['canvas_id'], 'local-1');
       final Map<String, dynamic> payload =
           Map<String, dynamic>.from(env['payload'] as Map);
-      expect(payload.keys, <String>['canvas']);
+      // §8.2 keys unchanged; the persisted identity rides along so the PC
+      // hub can attribute the open to a device.
+      expect(
+        payload.keys,
+        unorderedEquals(<String>['canvas', 'device_id', 'device_name']),
+      );
       expect(payload['canvas'], equals(doc.toJson()));
+      expect(payload['device_id'], isA<String>());
+      expect((payload['device_id'] as String).isNotEmpty, isTrue);
+    });
+
+    test('OPEN_CANVAS keeps the §8.2 canvas body byte-identical', () async {
+      final CanvasDocumentModel doc = buildDoc(
+        id: 'local-2',
+        title: 'Named Device',
+      );
+      final (_FakeClient client, CanvasSyncBridge bridge) = makeBridge(
+        deviceName: 'Slate A',
+      );
+
+      await bridge.announceOpen(doc);
+
+      final Map<String, dynamic> payload =
+          Map<String, dynamic>.from(client.sent.single['payload'] as Map);
+      expect(payload['canvas'], equals(doc.toJson()));
+      expect(payload['device_name'], 'Slate A');
     });
 
     test('dispose stops publishing, handling and announcing', () async {

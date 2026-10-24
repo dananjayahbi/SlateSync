@@ -185,6 +185,16 @@ class SceneGraph:
         with self._lock:
             return dict(self._bounds)
 
+    @property
+    def artboard(self) -> Artboard | None:
+        """Artboard currently bound to the scene (upgrades mutate it in place).
+
+        Round 7: exporters take this instead of the opener's ``doc.artboard`` so
+        an ``UPGRADE_SIZE`` applied after the open is reflected in the output.
+        """
+        with self._lock:
+            return self._artboard
+
     # ------------------------------------------------------------------
     # Doc 10 hand-off API (frozen)
     # ------------------------------------------------------------------

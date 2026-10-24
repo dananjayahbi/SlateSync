@@ -521,7 +521,8 @@ void main() {
       expect(opens, isNotEmpty, reason: 'local open must announce');
       final Map<String, dynamic> payload =
           Map<String, dynamic>.from(opens.first['payload'] as Map);
-      expect(payload.keys, <String>['canvas']);
+      // §8.2 keys intact; device identity is additive when storage exists.
+      expect(payload.keys, contains('canvas'));
       final Map<String, dynamic> canvas =
           Map<String, dynamic>.from(payload['canvas'] as Map);
       expect(canvas['title'], 'Announce Me');

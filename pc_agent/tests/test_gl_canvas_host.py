@@ -1,7 +1,7 @@
-"""Doc 06 acceptance tests — GLCanvasHost + ProgramRegistry (headless-safe).
+﻿"""Doc 06 acceptance tests — GLCanvasHost + ProgramRegistry (headless-safe).
 
 Always-run (no GL): latest-slot/seq stale-drop semantics, drain & redraw
-coalescing, the five event-matrix subscriptions, camera clamping +
+coalescing, the event-matrix subscriptions, camera clamping +
 ``visible_world_rect`` inverse, ProgramRegistry error contracts, event routing,
 laser clearing, shutdown teardown, and main-thread drain spying with background
 submitters. GL-guarded tests (skip after a one-time moderngl probe): mount
@@ -126,7 +126,7 @@ def _make_root() -> tk.Tk:
 # ---------------------------------------------------------------------------
 
 
-def test_subscribes_to_exactly_the_five_matrix_events() -> None:
+def test_subscribes_to_the_matrix_events_plus_canvas_cleared() -> None:
     _, bus, host = _make_host()
     names = [event for event, _ in bus.on_calls]
     assert names == [
@@ -135,8 +135,9 @@ def test_subscribes_to_exactly_the_five_matrix_events() -> None:
         "DOCUMENT_LOADED",
         "COMMITTED_NODE",
         "ARTBOARD_CHANGED",
+        "CANVAS_CLEARED",  # round 7 issue 06: mirror wipe
     ]
-    assert len(bus.on_calls) == 5
+    assert len(bus.on_calls) == 6
     assert all(callable(handler) for _, handler in bus.on_calls)
     assert host is not None
 
@@ -430,6 +431,7 @@ def test_shutdown_unsubscribes_cancels_after_ids_and_blocks_scheduling() -> None
         "DOCUMENT_LOADED",
         "COMMITTED_NODE",
         "ARTBOARD_CHANGED",
+        "CANVAS_CLEARED",
     ]
     cancelled = set(fake_tk.cancelled)
     scheduled_ids = {entry["id"] for entry in fake_tk.pending()}
@@ -440,7 +442,7 @@ def test_shutdown_unsubscribes_cancels_after_ids_and_blocks_scheduling() -> None
     host.request_redraw()
     assert len(fake_tk.scheduled) == scheduled_before, "shutdown blocks rescheduling"
     host.shutdown()  # idempotent
-    assert len(bus.off_calls) == 5
+    assert len(bus.off_calls) == 6
 
 
 def test_pyglet_config_requests_msaa4_and_core33() -> None:
@@ -874,3 +876,105 @@ def test_infinite_doc_renders_no_boundary_pixels() -> None:
         # Collect this test's Tk/GL/PIL garbage HERE: deferred collections were
         # landing inside later FFI tests (rtree) and crashing the native heap.
         gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Round 7 — empty workspace (issue 02) + live mirror registry (issue 06)
+# ---------------------------------------------------------------------------
+
+
+def test_no_document_clears_to_the_neutral_workspace_colour() -> None:
+    from pc_agent.viewport.gl_canvas_host import EMPTY_STATE_BG
+
+    _fake_tk, _bus, host = _make_host()
+    assert host._background_color() == EMPTY_STATE_BG
+    assert EMPTY_STATE_BG != "#FFFFFF", "a blank white canvas must not look like paper"
+
+
+def test_loaded_document_restores_the_artboard_paper_colour() -> None:
+    from pc_agent.viewport.gl_canvas_host import EMPTY_STATE_BG
+
+    _fake_tk, bus, host = _make_host()
+
+    class _Artboard:
+        background_color = "#F4F1EA"
+        width = 2480.0
+        height = 3508.0
+        is_infinite = False
+        preset = "A4"
+
+    class _Doc:
+        artboard = _Artboard()
+        content_bounds = {"min_x": 0.0, "min_y": 0.0, "max_x": 1.0, "max_y": 1.0}
+        elements: list = []
+
+    bus.emit("DOCUMENT_LOADED", doc=_Doc())
+    assert host._background_color() == "#F4F1EA"
+    assert host._background_color() != EMPTY_STATE_BG
+
+    bus.emit("DOCUMENT_LOADED", doc=None)
+    assert host._background_color() == EMPTY_STATE_BG
+
+
+def test_committed_nodes_feed_the_live_mirror_registry() -> None:
+    """Issue 06: SHAPE/GRAPH_AXES/IMAGE commits must reach the mirror."""
+    _fake_tk, bus, host = _make_host()
+
+    class _Node:
+        def __init__(self, node_id: str, kind: str, bbox) -> None:
+            self.node_id = node_id
+            self.kind = kind
+            self.layer = 0
+            self.bbox = bbox
+
+    shape = _Node("shape-1", "SHAPE", (10.0, 10.0, 60.0, 60.0))
+    graph = _Node("graph-1", "GRAPH_AXES", (0.0, 0.0, 120.0, 80.0))
+    bus.emit("COMMITTED_NODE", node=shape)
+    bus.emit("COMMITTED_NODE", node=graph)
+
+    # MirrorScene orders by (layer, node_id) — PrimitiveRenderer repaints in
+    # the same z-order, so the registry order is not significant here.
+    mirrored = [node.node_id for node in host._scene.nodes()]
+    assert mirrored == ["graph-1", "shape-1"]
+    assert host._content_bounds == {
+        "min_x": 0.0, "min_y": 0.0, "max_x": 120.0, "max_y": 80.0,
+    }
+
+    bus.emit("COMMITTED_NODE", node=None, deleted_node_id="shape-1")
+    assert [node.node_id for node in host._scene.nodes()] == ["graph-1"]
+
+
+def test_canvas_cleared_wipes_the_mirror_registry() -> None:
+    _fake_tk, bus, host = _make_host()
+
+    class _Node:
+        node_id = "n1"
+        kind = "SHAPE"
+        layer = 0
+        bbox = (0.0, 0.0, 5.0, 5.0)
+
+    bus.emit("COMMITTED_NODE", node=_Node())
+    assert len(host._scene) == 1
+    bus.emit("CANVAS_CLEARED", canvas_id="cv-1")
+    assert len(host._scene) == 0
+    assert host._content_bounds == {}
+    assert host._pending_nodes == []
+
+
+def test_document_load_reseeds_the_mirror_registry() -> None:
+    _fake_tk, bus, host = _make_host()
+
+    class _Node:
+        def __init__(self, node_id: str) -> None:
+            self.node_id = node_id
+            self.kind = "STROKE"
+            self.layer = 0
+            self.bbox = (0.0, 0.0, 1.0, 1.0)
+
+    class _Doc:
+        artboard = None
+        content_bounds: dict = {}
+        elements = [_Node("a"), _Node("b")]
+
+    bus.emit("DOCUMENT_LOADED", doc=_Doc())
+    assert [node.node_id for node in host._scene.nodes()] == ["a", "b"]

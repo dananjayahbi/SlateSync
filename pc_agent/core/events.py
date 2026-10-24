@@ -1,4 +1,4 @@
-"""Synchronous caller-thread ``EventBus`` + 13 event-name constants (Doc 04 §4, Doc 02 §10.1)."""
+"""Synchronous caller-thread ``EventBus`` + event-name constants (Doc 04 §4, Doc 02 §10.1)."""
 
 from __future__ import annotations
 
@@ -29,6 +29,21 @@ CANVAS_LIST_UPDATED = "CANVAS_LIST_UPDATED"
 #: target document id, echoed verbatim). Viewports repaint on this event;
 #: handlers must tolerate unknown keys (``**extra``).
 CANVAS_CLEARED = "CANVAS_CLEARED"
+#: Round 7 — live device roster for the PC Settings panel. Frozen payload:
+#: ``{devices: [{connection_id, device_id, name, peer, open_canvas_id,
+#: open_canvas_title, mirrored, last_seen}, ...], mirrored_canvas_id: str|None,
+#: count: int}``. Handlers must tolerate unknown keys (``**extra``).
+DEVICES_UPDATED = "DEVICES_UPDATED"
+#: Round 7 — the PC's mirrored canvas changed (device opened a canvas, or the
+#: user picked one in Settings). Frozen payload: ``{canvas_id: str|None,
+#: title: str, connection_id: str|None}``.
+MIRROR_CHANGED = "MIRROR_CHANGED"
+#: Round 7 — a wire envelope that arrived from a device, tagged with its
+#: originating connection. Payload: ``{msg: dict, connection_id: str|None}``.
+#: Emitted right AFTER ``RPC_MESSAGE`` for the same envelope (which stays
+#: untouched so payload-owning handlers are unaffected); the hub uses it to
+#: attribute canvas opens / mutations to a device in the Settings roster.
+RPC_ORIGIN = "RPC_ORIGIN"
 
 
 class EventBus:

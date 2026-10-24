@@ -467,7 +467,9 @@ def test_rpc_start_pdf_uses_loader_and_pushes_to_tablet(build) -> None:
     assets = h.push.envelopes("ASSET_UPLOAD")
     assert [e["action"] for e in assets] == ["ASSET_START", "ASSET_CHUNK", "ASSET_DONE"]
     transfer_id = assets[0]["payload"]["transfer_id"]
-    assert assets[0]["payload"]["filename"] == f"{job_id}.pdf"
+    # Round 7: files are named after the canvas (title → id), never a job uuid,
+    # so the user can find the export in their Downloads folder.
+    assert assets[0]["payload"]["filename"] == f"{CANVAS}.pdf"
     assert assets[0]["payload"]["total_chunks"] == 1
     assert assets[0]["payload"]["size_bytes"] == len(b"%PDF-1.4 fake")
     assert all(e["payload"]["transfer_id"] == transfer_id for e in assets)

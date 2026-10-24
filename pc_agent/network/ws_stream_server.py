@@ -18,6 +18,7 @@ import json
 import logging
 import threading
 import urllib.parse
+import uuid
 from collections.abc import Callable
 
 from websockets.asyncio.server import Server, ServerConnection, serve
@@ -29,6 +30,7 @@ from pc_agent.core.events import (
     CONNECTION_STATE,
     LIVE_FRAME,
     RPC_MESSAGE,
+    RPC_ORIGIN,
     EventBus,
 )
 from pc_agent.core.protocol import (
@@ -52,7 +54,6 @@ _REQUIRED_ENVELOPE_KEYS = ("id", "type", "action", "canvas_id")
 #: dispatch (mutation relay); every other type is PC-local and never relayed.
 _RELAY_TYPES = frozenset({"ELEMENT_COMMIT", "ARTBOARD_RESIZE"})
 
-
 class WsStreamServer:
     """Threaded ``/ws`` gateway (template §4 freeze — signatures frozen)."""
 
@@ -74,6 +75,13 @@ class WsStreamServer:
         self._ready = threading.Event()
         self._startup_error: BaseException | None = None
         self._clients: set[ServerConnection] = set()
+        #: Round 7: per-connection id used by the device roster / relay targeting.
+        self._connection_ids: dict[ServerConnection, str] = {}
+        #: Round 7 — optional ``(msg, connection_id) -> bool`` gate consulted
+        #: before a mutation envelope is fanned out to the other devices. The
+        #: hub installs it so only the PC's mirrored canvas is broadcast (the PC
+        #: is the orchestrator: it applies first, then relays the mirrored one).
+        self._relay_filter: Callable[[dict, str | None], bool] | None = None
         self._bound_port: int | None = None
 
     # -- lifecycle -----------------------------------------------------------
@@ -126,6 +134,7 @@ class WsStreamServer:
         self._server = None
         self._bound_port = None
         self._clients.clear()
+        self._connection_ids.clear()
 
     @property
     def port(self) -> int:
@@ -133,6 +142,19 @@ class WsStreamServer:
         if self._bound_port is not None:
             return self._bound_port
         return self._config.ws_port
+
+    def set_relay_filter(
+        self, predicate: Callable[[dict, str | None], bool] | None
+    ) -> None:
+        """Install the mutation-relay gate (round 7 — PC authority).
+
+        ``predicate(msg, connection_id) -> bool`` decides whether a device
+        mutation is fanned out to the *other* devices. The hub passes a filter
+        that only lets the mirrored canvas through, so the PC stays the single
+        source of truth and canvases nobody mirrors never leak between devices.
+        ``None`` restores the legacy "relay every mutation" behaviour.
+        """
+        self._relay_filter = predicate
 
     def broadcast_json(self, msg: dict, exclude: ServerConnection | None = None) -> None:
         """Thread-safe fan-out of a JSON envelope to every live connection.
@@ -216,8 +238,14 @@ class WsStreamServer:
             return
 
         peer = self._peer(websocket)
+        connection_id = uuid.uuid4().hex
         self._clients.add(websocket)
-        self._bus.emit(CONNECTION_STATE, connected=True, peer=peer)
+        self._connection_ids[websocket] = connection_id
+        # Round 7: the id lets the hub attribute mutations and canvas opens to a
+        # device (Settings roster / mirror switching) without trusting payloads.
+        self._bus.emit(
+            CONNECTION_STATE, connected=True, peer=peer, connection_id=connection_id
+        )
         last_seq: int | None = None  # reset per connection — never shared
         try:
             async for message in websocket:  # single reader preserves frame order
@@ -231,7 +259,12 @@ class WsStreamServer:
         except ConnectionClosed:  # abrupt drop (no close frame) lands here
             pass
         finally:
-            self._bus.emit(CONNECTION_STATE, connected=False, peer=None)
+            self._bus.emit(
+                CONNECTION_STATE,
+                connected=False,
+                peer=None,
+                connection_id=self._connection_ids.pop(websocket, None),
+            )
             self._clients.discard(websocket)
 
     @staticmethod
@@ -278,7 +311,14 @@ class WsStreamServer:
         # device — the sending connection is excluded, dead clients are skipped
         # in _send_all. Non-mutation types (CANVAS_LIFECYCLE, ASSET_UPLOAD,
         # EXPORT_JOB) are never relayed.
+        connection_id = self._connection_ids.get(sender) if sender is not None else None
+        if sender is not None:
+            # Round 7: let the hub attribute this envelope to a device. Emitted
+            # after RPC_MESSAGE so the scene/store already applied it.
+            self._bus.emit(RPC_ORIGIN, msg=msg, connection_id=connection_id)
         if sender is not None and msg["type"] in _RELAY_TYPES:
+            if self._relay_filter is not None and not self._relay_filter(msg, connection_id):
+                return  # PC authority: only the mirrored canvas is fanned out
             self.broadcast_json(msg, exclude=sender)
 
     @staticmethod

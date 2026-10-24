@@ -1,4 +1,4 @@
-"""Doc 11 tests — ``docs/micro/11_pc_websocket_stream_server.md`` §6.
+﻿"""Doc 11 tests — ``docs/micro/11_pc_websocket_stream_server.md`` §6.
 
 Hermetic by construction: loopback host, ephemeral port (``ws_port=0``),
 token stub, real ``EventBus`` wired to thread-safe recorders; the fixture
@@ -25,6 +25,7 @@ from pc_agent.core.events import (
     CONNECTION_STATE,
     LIVE_FRAME,
     RPC_MESSAGE,
+    RPC_ORIGIN,
     EventBus,
 )
 from pc_agent.core.protocol import (
@@ -710,3 +711,70 @@ def test_relay_end_to_end_between_two_real_connections(server_env: Any) -> None:
     asyncio.run(scenario())
     assert rec.wait_for(RPC_MESSAGE)
     assert rec.of(RPC_MESSAGE) == [{"msg": msg}]
+
+
+# -- Round 7: PC-authority relay gate ----------------------------------------
+
+
+def test_relay_filter_can_veto_a_mutation(server_env: Any) -> None:
+    """Issue 03: the hub decides which mutations reach the other devices."""
+    _, server, rec = server_env
+    sender, peer = _FakeConn("sender"), _FakeConn("peer")
+    server._clients.update({sender, peer})
+    server._dispatch_before_relay_cut = None  # noqa: F841 — documents intent only
+    server._relay_filter = lambda msg, connection_id: False
+
+    msg = _envelope(type="ELEMENT_COMMIT", action="ADD_SHAPE", payload={"node_id": "n"})
+    server._dispatch_text(json.dumps(msg), sender=sender)
+
+    # The PC still applied it locally (apply-then-relay ordering)…
+    assert rec.wait_for(RPC_MESSAGE)
+    assert rec.of(RPC_MESSAGE) == [{"msg": msg}]
+    time.sleep(0.2)
+    # …but nothing was fanned out to the peers.
+    assert peer.sent == []
+    assert sender.sent == []
+
+
+def test_relay_filter_receives_the_sender_connection_id(server_env: Any) -> None:
+    _, server, rec = server_env
+    sender, peer = _FakeConn("sender"), _FakeConn("peer")
+    server._clients.update({sender, peer})
+    server._connection_ids[sender] = "conn-42"
+    seen: list[tuple[dict, str | None]] = []
+    server.set_relay_filter(lambda msg, cid: seen.append((msg, cid)) or True)
+
+    msg = _envelope(type="ELEMENT_COMMIT", action="ADD_STROKE", payload={})
+    server._dispatch_text(json.dumps(msg), sender=sender)
+
+    assert rec.wait_for(RPC_MESSAGE)
+    assert _wait_until(lambda: len(peer.sent) == 1)
+    assert seen == [(msg, "conn-42")]
+
+
+def test_server_emits_rpc_origin_after_rpc_message(server_env: Any) -> None:
+    """Round 7: the hub needs the sender identity, but never before the apply."""
+    bus, server, rec = server_env
+    order: list[str] = []
+    bus.on(RPC_ORIGIN, lambda **kw: order.append("origin"))
+    sender = _FakeConn("sender")
+    server._clients.add(sender)
+    server._connection_ids[sender] = "conn-1"
+
+    msg = _envelope(type="CANVAS_LIFECYCLE", action="OPEN_CANVAS", payload={"canvas": {}})
+    server._dispatch_text(json.dumps(msg), sender=sender)
+
+    assert rec.wait_for(RPC_MESSAGE)
+    assert _wait_until(lambda: order == ["origin"])
+
+
+def test_set_relay_filter_none_restores_legacy_relay(server_env: Any) -> None:
+    _, server, _ = server_env
+    sender, peer = _FakeConn("sender"), _FakeConn("peer")
+    server._clients.update({sender, peer})
+    server.set_relay_filter(lambda msg, cid: False)
+    server.set_relay_filter(None)
+
+    msg = _envelope(type="ELEMENT_COMMIT", action="CLEAR_CANVAS", payload={})
+    server._dispatch_text(json.dumps(msg), sender=sender)
+    assert _wait_until(lambda: len(peer.sent) == 1)

@@ -50,6 +50,7 @@ class PairingScreen extends StatefulWidget {
     super.key,
     required this.client,
     this.scannerBuilder,
+    this.notice,
   });
 
   /// App-lifetime Doc 25 client (template §5 surface).
@@ -57,6 +58,11 @@ class PairingScreen extends StatefulWidget {
 
   /// Test seam — defaults to the Doc 25 [PairingScanner] widget.
   final PairingScannerBuilder? scannerBuilder;
+
+  /// Status shown above the pairing modes — e.g. why the silent reconnect
+  /// with the saved credentials did not work
+  /// ([kPairingAutoConnectFailedNotice]); `null` ⇒ nothing shown.
+  final String? notice;
 
   @override
   State<PairingScreen> createState() => _PairingScreenState();
@@ -176,6 +182,14 @@ class _PairingScreenState extends State<PairingScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: <Widget>[
+          if (widget.notice != null) ...<Widget>[
+            Text(
+              widget.notice!,
+              key: const Key('pairing-auto-connect-notice'),
+              style: const TextStyle(color: StudioTheme.danger),
+            ),
+            const SizedBox(height: 12),
+          ],
           _sectionCard(
             icon: Icons.wifi_find,
             title: 'Auto-discover',

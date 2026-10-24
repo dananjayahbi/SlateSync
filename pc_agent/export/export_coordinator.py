@@ -50,6 +50,16 @@ PROGRESS_MIN_INTERVAL_S = 0.1  # ≤10 Hz (template §3 "rate" row)
 _RASTER_FORMATS = frozenset({"PNG", "JPG"})
 _PUSH_TARGETS = frozenset({"TABLET", "BOTH"})
 _EXTENSIONS = {"PNG": "png", "JPG": "jpg", "PDF": "pdf"}
+_UNSAFE_NAME_CHARS = '<>:"/\\|?*'
+
+
+def _slug(value: str) -> str:
+    """Filesystem-safe export stem (keeps the user's canvas title readable)."""
+    cleaned = "".join(
+        "_" if (ch in _UNSAFE_NAME_CHARS or ord(ch) < 32) else ch for ch in value
+    ).strip(" .")
+    cleaned = " ".join(cleaned.split())
+    return (cleaned or "canvas")[:80]
 
 
 class ExportCancelled(Exception):
@@ -171,11 +181,34 @@ class ExportCoordinator:
         }
 
     def _out_path(self, job_id: str, payload: dict) -> Path:
+        """Destination inside ``config.export_dir`` (Settings-selectable folder).
+
+        Round 7: the file is named after the canvas + optional
+        ``payload["filename"]`` instead of an opaque job uuid, and it always
+        honours the CURRENT ``config.export_dir`` — so switching the folder in
+        Settings applies to the very next job without a restart.
+        """
         fmt = str(payload.get("format", "PNG")).upper()
         ext = _EXTENSIONS.get(fmt, "bin")
         out_dir = Path(self._config.export_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        return out_dir / f"{job_id}.{ext}"
+        requested = payload.get("filename")
+        if isinstance(requested, str) and requested.strip():
+            name = Path(requested.strip()).name  # never escape the export folder
+            if Path(name).suffix.lower() != f".{ext}":
+                name = f"{Path(name).stem or 'export'}.{ext}"
+        else:
+            title = payload.get("title") or payload.get("canvas_id") or "canvas"
+            name = f"{_slug(str(title))}.{ext}"
+        candidate = out_dir / name
+        if not candidate.exists():
+            return candidate
+        stem, suffix = candidate.stem, candidate.suffix
+        for index in range(2, 1000):  # never overwrite a previous export
+            candidate = out_dir / f"{stem} ({index}){suffix}"
+            if not candidate.exists():
+                return candidate
+        return out_dir / f"{stem}-{job_id[:8]}{suffix}"
 
     # -------------------------------------------------------------- job runner
 

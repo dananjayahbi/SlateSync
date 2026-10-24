@@ -25,7 +25,17 @@ def _default_appdata_dir() -> Path:
     return Path(os.environ.get("APPDATA", str(Path.home()))) / "SlateSync"
 
 
-@dataclass(frozen=True)
+def default_export_dir() -> Path:
+    """User-facing export destination: the OS Downloads folder.
+
+    Exports are deliverables the user shares/sends, so they land where every
+    browser and app already puts downloads instead of a hidden appdata
+    subfolder. Settings → Export folder overrides it per install.
+    """
+    return Path.home() / "Downloads"
+
+
+@dataclass
 class AppConfig:
     ws_port: int = 50606
     mdns_service_type: str = "_slatesync._tcp.local."
@@ -36,7 +46,9 @@ class AppConfig:
     # default_factories that reproduce the template's documented targets.
     shader_dir: Path = field(default_factory=_default_shader_dir)
     assets_dir: Path = field(default_factory=lambda: _default_appdata_dir() / "assets")
-    export_dir: Path = field(default_factory=lambda: _default_appdata_dir() / "exports")
+    #: Export destination. Defaults to the OS Downloads folder (Settings →
+    #: Export folder overrides it); see :func:`default_export_dir`.
+    export_dir: Path = field(default_factory=default_export_dir)
     appdata_dir: Path = field(default_factory=_default_appdata_dir)
     log_level: str = "INFO"
 
@@ -62,9 +74,39 @@ class ConfigManager:
     def _defaults(self) -> AppConfig:
         return AppConfig(
             assets_dir=self._root_dir / "assets",
-            export_dir=self._root_dir / "exports",
+            export_dir=default_export_dir(),
             appdata_dir=self._root_dir,
         )
+
+    # ------------------------------------------------------------------
+    # Runtime settings (round 7 — Settings panel)
+    # ------------------------------------------------------------------
+    def update(self, **changes: object) -> AppConfig:
+        """Apply + persist field overrides; returns the new config.
+
+        ``AppConfig`` is mutable on purpose: the Settings panel changes
+        ``export_dir`` while the coordinator holds the same instance, so the
+        next export job writes to the freshly picked folder without a restart.
+        Unknown keys or invalid values raise ``ValueError``/``TypeError``
+        before anything is persisted.
+        """
+        config = self._config
+        for key, value in changes.items():
+            if not hasattr(config, key):
+                raise ValueError(f"unknown config field: {key}")
+            coerced = self._coerce(key, value)
+            try:
+                setattr(config, key, coerced)
+            except (TypeError, ValueError) as exc:  # pragma: no cover - defensive
+                raise ValueError(f"cannot set {key}: {exc}") from exc
+        self._write()
+        return config
+
+    def set_export_dir(self, path: str | Path) -> Path:
+        """Persist the export folder; created on demand by the coordinator."""
+        target = Path(path).expanduser()
+        self.update(export_dir=target)
+        return target
 
     def load(self) -> None:
         """Read ``<root>/config.json``; missing/invalid falls back to defaults.
@@ -119,6 +161,10 @@ class ConfigManager:
     @staticmethod
     def _coerce(key: str, value: object) -> object:
         if key in _PATH_FIELDS:
+            # Round 7: runtime setters (Settings → export folder) pass ``Path``
+            # objects, while config.json only ever holds strings.
+            if isinstance(value, Path):
+                return value
             if not isinstance(value, str):
                 raise ValueError(f"{key} must be a path string")
             return Path(value)

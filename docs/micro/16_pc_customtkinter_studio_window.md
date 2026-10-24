@@ -175,3 +175,47 @@ Command: `pytest pc_agent/tests/test_studio_window.py pc_agent/tests/test_canvas
 ## 7. Parallel Execution Notes
 - **Wave 2.A** (Session 2 merged wave, Subagent 4 of 8). Zero overlap: Doc 16 exclusively creates `pc_agent/gui/__init__.py`, `pc_agent/gui/studio_window.py`, `pc_agent/gui/canvas_gallery_panel.py`, `pc_agent/tests/test_studio_window.py`, `pc_agent/tests/test_canvas_gallery_panel.py`; Doc 17 (same wave) creates only `tray_daemon.py` + its test and treats `gui/__init__.py` as read-only. Peers Docs 08/13/14/15/24/26/27 share no paths; all contact points (`GLCanvasHost.mount`, `export_submit`, event matrix) are frozen in §4 — no intra-wave ordering constraint.
 - **Never touches:** `pc_agent/gui/tray_daemon.py` + its test (Doc 17), `pc_agent/main.py` (Doc 04 / Wave 3.A), `pc_agent/installer/*` (Docs 18/19), `pc_agent/{core,viewport,engine,network,export}/*` (Docs 04–15), other docs' tests, `mobile_app/**`, `qa/**`, `docs/overview.md`, `docs/_micro_doc_template.md`.
+
+## 8. Round-7 Amendment — Settings Panel, Device Roster, Empty State (NORMATIVE)
+
+### 8.1 Empty viewport (issue 02)
+A freshly launched agent has no document, so `GLCanvasHost._background_color()` now
+returns `EMPTY_STATE_BG` (`#3A3D42`) instead of white, and `mount()` builds the frame
+and blit label with the same colour. `viewport/empty_state_overlay.py::EmptyStateOverlay`
+adds a centred "No canvas open — pair a device or press Ctrl+N" hint that is hidden the
+moment a document loads (`set_document` → `_update_empty_state`). The white page only
+appears once a real artboard exists.
+
+### 8.2 Mirror registry (issue 06)
+`viewport/mirror_scene.py::MirrorScene` holds the elements the mirror paints. It is
+seeded on `DOCUMENT_LOADED`, updated on every `COMMITTED_NODE` (upsert / delete),
+cleared on `CANVAS_CLEARED`, and re-derives `content_bounds`. `_render` therefore feeds
+`PrimitiveRenderer` current nodes — SHAPE / GRAPH_AXES / IMAGE commits from a tablet
+paint immediately. `MirrorArtboard` (infinite, white) is substituted when elements
+exist with no document/artboard, so primitives are never silently skipped.
+`GLCanvasHost` now subscribes six events (the five frozen rows + `CANVAS_CLEARED`).
+
+### 8.3 Settings panel (issues 03/04/05/07)
+`gui/settings_panel.py::SettingsPanel(root, *, set_export_dir, select_mirror,
+rotate_pairing, export_dir, on_close)`:
+* **Connected devices** — one row per `DEVICES_UPDATED` entry showing name, peer and
+  the canvas it has open, plus a *Mirror* / *Mirroring* button selecting which canvas
+  the PC shows. Empty state: "No devices connected yet - scan the pairing QR…".
+* **Export folder** — shows `config.export_dir`, *Change…* opens
+  `filedialog.askdirectory` and persists through `set_export_dir`.
+* **Reset pairing** — calls `rotate_pairing` (Doc 12 §8.3).
+Public API: `window`, `device_rows`, `mirrored_selection`, `exists()`,
+`refresh_devices(rows, mirrored_canvas_id)`, `select_mirror(canvas_id)`,
+`choose_export_dir()`, `set_export_dir(path)`, `reset_pairing()`, `close()`.
+
+`StudioWindow` gains `open_settings()` (HUD **Settings** button + Tools → Settings…),
+`_on_devices_updated` / `_on_mirror_changed` (two new subscriptions, matrix now ten
+rows) and three optional injected callbacks (`select_mirror`, `set_export_dir`,
+`rotate_pairing`) wired by `main.py` to `CanvasSyncManager.select_mirror`,
+`ConfigManager.set_export_dir` and `DiscoveryPairing.rotate_token`.
+
+### 8.4 Tests
+`tests/test_settings_panel.py` (rows, empty hint, mirror callback, folder picker,
+rotation, close), `tests/test_mirror_scene.py`, `tests/test_studio_window.py`
+(+6 round-7 cases) and `tests/test_gl_canvas_host.py` (six subscriptions, empty-state
+clear colour).

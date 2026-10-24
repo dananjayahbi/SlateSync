@@ -120,3 +120,42 @@ class DiscoveryPairing:                                 # Doc 12
 * Zero overlap confirmed: Creates (`network/discovery_pairing.py`, `tests/test_discovery_pairing.py`) are exclusive to Doc 12 — `network/__init__.py`, `ws_stream_server.py` and their tests belong to Doc 11; `engine/*` to Docs 09/10; `viewport/*` to Docs 06/07.
 * **Never touches:** Doc 11’s `ws_stream_server.py`/`network/__init__.py`/tests (coupling is only via the injected `token_provider` callable), `pc_agent/engine/*`, `pc_agent/core/*` (Doc 04), `pc_agent/viewport/*`, `shared_specs/*`, `pc_agent/main.py`, `mobile_app/*`.
 * Intra-batch contracts (all authored in this batch): Doc 12 mints the token Doc 11 enforces (`4001`); Doc 11 binds port `50606` announced by this TXT/port record; Docs 09/10 are transport-agnostic and never import `network/*`.
+
+## 8. Round-7 Amendment — Static, One-Time Pairing Code (NORMATIVE)
+
+Round 7 changes **only where the token comes from**. Registration, the QR payload,
+`PAIRING_INFO` and the `4001` enforcement in Doc 11 are unchanged.
+
+### 8.1 Persistent identity (`network/pairing_store.py`)
+* `PairingIdentity(token, device_id, device_name, created_at, qr_payload)` is stored in
+  `<appdata_dir>/pairing.json` as
+  `{version: 1, token, device_id, device_name, created_at, qr_payload}`.
+* `PairingStore(appdata_dir)` → `.load()` / `.load_or_create()` / `.save()` /
+  `.rotate()` / `.remember_qr_payload(payload)`; writes are atomic
+  (`pairing.json.tmp` → `os.replace`) and reads never raise (a corrupt file is
+  re-created).
+* Consequence: the token is minted **once per install**. Restarting the app keeps the
+  same `session_token`, the same TXT record and the same QR payload, so a tablet that
+  paired once keeps handshaking with the credentials it saved (Doc 25) — no re-scan.
+
+### 8.2 QR is written once
+`_render_qr(ipv4)` compares the derived payload with the persisted `qr_payload`; when
+they match and `pairing_qr.png` exists, nothing is re-encoded. A changed LAN address
+(new IP) or a rotated token is the only thing that rewrites the image.
+
+### 8.3 Rotation (Settings → Reset pairing)
+`DiscoveryPairing.rotate_token() -> str` stops mDNS (if running), mints a new token
+through `store.rotate()`, and returns it; the next `start()` advertises and renders the
+new code. Previously paired tablets then fail the Doc 11 handshake with `4001` and must
+scan again — the only way to invalidate a pairing.
+
+### 8.4 `PAIRING_INFO` (additive keys)
+`PAIRING_INFO` still emits `ipv4, port, token, qr_png_path`, plus the install identity
+`device_id` and `device_name` so the tablet can display/label the PC it paired with.
+Handlers must keep tolerating unknown keys.
+
+### 8.5 Tests (`tests/test_discovery_pairing.py`, `tests/test_pairing_store.py`)
+Persisted token reused across instances sharing `appdata_dir`; different profiles get
+different tokens; a restart reuses the PNG byte-for-byte (no `qrcode.make` call);
+`rotate_token()` changes the token and forces a rewrite; corrupt/missing files are
+re-created without raising.
