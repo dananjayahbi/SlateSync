@@ -25,6 +25,7 @@ from zeroconf import ServiceInfo, Zeroconf
 
 from pc_agent.core.config_manager import AppConfig
 from pc_agent.core.events import PAIRING_INFO, EventBus
+from pc_agent.network.lan_address import choose_lan_ipv4, probe_default_route_ipv4
 from pc_agent.network.pairing_store import PairingIdentity, PairingStore
 
 logger = logging.getLogger(__name__)
@@ -65,11 +66,15 @@ class DiscoveryPairing:
     def rotate_token(self) -> str:
         """Settings → "Reset pairing": new token, old scan codes stop working.
 
-        The running mDNS record is stopped so the next ``start()`` advertises
-        the freshly minted token; the QR is re-rendered on that start.
+        The running mDNS record is stopped, the token is re-minted, and the
+        service is started again straight away — otherwise the agent would end
+        up alive but unadvertised, with the dialog still showing the previous
+        (now dead) QR code. Restarting also re-emits ``PAIRING_INFO`` so the
+        open dialog re-renders the new code immediately.
         """
         previous = self._identity
-        if self._zc is not None:  # keep mDNS in step with the new token
+        was_running = self._zc is not None
+        if was_running:  # keep mDNS in step with the new token
             self.stop()
         self._identity = self._store.rotate()
         logger.info(
@@ -77,6 +82,8 @@ class DiscoveryPairing:
             previous.device_id,
             self._identity.device_id,
         )
+        if was_running:
+            self.start()
         return self._identity.token
 
     def start(self) -> None:
@@ -163,31 +170,31 @@ class DiscoveryPairing:
         return path
 
     def _lan_ipv4(self) -> str:
-        """Non-loopback LAN IPv4: UDP probe → hostname scan → 127.0.0.1.
+        """Address to advertise in the QR + mDNS ``A`` record (Doc 12 §9).
 
-        Each fallback is logged (Doc 12 §4).
+        ``lan_address.choose_lan_ipv4`` runs the documented probe → hostname
+        scan → loopback ladder but rejects a candidate that belongs to a VPN /
+        TUN / virtual adapter with no real route. Encoding such an address made
+        the QR unusable: the tablet scanned it, dialled an unroutable IP and
+        pairing silently timed out.
         """
-        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            probe.connect(("8.8.8.8", 80))  # sends no packet; picks route + local IP
-            ip: str | None = probe.getsockname()[0]
-        except OSError as exc:
-            logger.warning("UDP IPv4 probe failed (%s); trying hostname scan", exc)
-            ip = None
-        finally:
-            probe.close()
-        if ip is not None and not ip.startswith("127."):
-            logger.info("LAN IPv4 via UDP probe: %s", ip)
-            return ip
-        if ip is not None:
-            logger.warning("UDP probe returned loopback %s; trying hostname scan", ip)
+        ip = choose_lan_ipv4(probe_default_route_ipv4, self._scan_hostname_ipv4)
+        if ip.startswith("127."):
+            logger.warning(
+                "no non-loopback IPv4 found; pairing usable on this machine only"
+            )
+        else:
+            logger.info("pairing advertises LAN IPv4 %s", ip)
+        return ip
+
+    @staticmethod
+    def _scan_hostname_ipv4() -> str | None:
+        """First non-loopback address from the hostname resolver."""
         try:
             for entry in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
                 candidate = entry[4][0]
                 if not candidate.startswith("127."):
-                    logger.info("LAN IPv4 via hostname scan: %s", candidate)
                     return candidate
         except OSError as exc:
             logger.warning("hostname IPv4 scan failed (%s)", exc)
-        logger.warning("no non-loopback IPv4 found; pairing usable on this machine only")
-        return "127.0.0.1"
+        return None

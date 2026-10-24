@@ -182,3 +182,56 @@ against an injected path, corrupt/unwritable files, controller auto-connect
 success/timeout/throw/auth-failure, save-on-online, the `PairingScreen` notice, and
 three shell-level auto-connect widget tests. `test/sync_canvas_bridge_test.dart` asserts
 the additive identity keys.
+
+## 9. Round-7 Amendment — Visible Pairing Outcomes (NORMATIVE)
+
+Fixes the reported regression "when I scan the QR it doesn't catch the device. Also it
+says nothing." The shell told the user nothing because the scan path popped the screen
+before the handshake had any chance to fail.
+
+### 9.1 Root cause
+`_PairingScreenState._onPaired` called `client.connect(info)` fire-and-forget and
+popped immediately. A timeout, a closed socket or a `4001` rejection therefore looked
+exactly like success: back on the gallery with no message and no connection.
+
+### 9.2 `features/pairing/pairing_attempt_controller.dart` (new)
+`PairingAttemptController({client, timeout = 12 s})`:
+* `start(PairingInfo)` — subscribes to `client.events` **before** dialling (a fast
+  `online` is never missed), calls `connect`, and settles on the first terminal state.
+* `ValueNotifier<PairingAttemptStatus> status` — `idle | connecting | online |
+  authFailed | unreachable`.
+* `ValueNotifier<String?> message` — `kPairingConnectingNotice`, `kPairingRejectedNotice`
+  or `kPairingTimeoutNotice(info)` (names the `ip:port` that did not answer).
+* After the timeout it **keeps listening**: the Doc 25 backoff ladder may still reach
+  `online`, which clears the failure (`unreachable → online`). A late `authFailed`
+  replaces the timeout notice.
+* `cancel()` (user pressed Cancel) and `dispose()`; `start` is ignored while another
+  attempt is `connecting`.
+
+### 9.3 `features/pairing/pairing_progress_card.dart` (new)
+`PairingProgressCard(busy, message, onCancel, onRetry)` — key `pairing-progress`, a
+spinner (`pairing-progress-spinner`) while busy plus Cancel, otherwise an error icon
+plus "Try again" (`pairing-progress-retry`).
+
+### 9.4 `PairingScreen` behaviour
+* Scan: `_showScanner` turns off (the camera stops re-decoding the same code) and the
+  attempt starts; the screen **stays open** until the outcome is known.
+* `online` ⇒ the screen pops (key `pairing_screen` disappears).
+* `unreachable` / `authFailed` ⇒ stays open with the progress card and a retry.
+* Manual entry pops only its own route, so its result is reported on the same card;
+  `online` then unwinds the pairing screen too.
+* Auto-discover: when mDNS resolved an address but the socket is not up yet, the same
+  card reports the handshake instead of a silent pop.
+
+### 9.5 Android manifest
+`android/app/src/main/AndroidManifest.xml` now declares `INTERNET`,
+`ACCESS_NETWORK_STATE` and `CAMERA` explicitly and sets
+`android:usesCleartextTraffic="true"` — Doc 11/25 dial a plaintext `ws://` LAN URL, and
+the permission previously arrived only as a side effect of a plugin manifest merge.
+
+### 9.6 Tests
+`test/pairing_attempt_controller_test.dart` (online / rejected / timeout-with-address /
+throwing `connect` / late `online` after timeout / late `authFailed` / cancel /
+concurrent start), plus `test/pairing_flow_test.dart`
+(`unreachable PC keeps the screen and explains the failure`,
+`rejected token is reported instead of popping`).

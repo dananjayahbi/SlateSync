@@ -45,6 +45,7 @@ from pc_agent.core.events import (
     PAIRING_INFO,
     EventBus,
 )
+from pc_agent.gui import pairing_status
 from pc_agent.gui.canvas_gallery_panel import CanvasGalleryPanel
 from pc_agent.gui.settings_panel import SettingsPanel
 
@@ -228,6 +229,8 @@ class StudioWindow:
         self._qr_image_label: ctk.CTkLabel | None = None
         self._qr_ip_label: ctk.CTkLabel | None = None
         self._qr_token_label: ctk.CTkLabel | None = None
+        self._qr_hint_label: ctk.CTkLabel | None = None
+        self._qr_status_label: ctk.CTkLabel | None = None
         self._qr_image: ctk.CTkImage | None = None
 
         # Round 4 (Doc 02 §8): cached tablet canvas list + picker dialog state.
@@ -479,6 +482,16 @@ class StudioWindow:
             self._qr_image_label.pack(padx=20, pady=(20, 8))
             self._qr_ip_label = ctk.CTkLabel(dialog, text="")
             self._qr_ip_label.pack(pady=2)
+            # Doc 12 extension: the address the QR advertises, then live
+            # pairing progress — scanning used to give no feedback at all.
+            self._qr_hint_label = ctk.CTkLabel(
+                dialog, text=pairing_status.HINT_TEXT, wraplength=220, text_color="#8A8F98"
+            )
+            self._qr_hint_label.pack(pady=(0, 4))
+            self._qr_status_label = ctk.CTkLabel(
+                dialog, text=pairing_status.WAITING_TEXT, wraplength=220
+            )
+            self._qr_status_label.pack(pady=(0, 4))
             self._qr_token_label = ctk.CTkLabel(dialog, text="", wraplength=220)
             self._qr_token_label.pack(pady=(2, 12))
         self._render_qr()
@@ -736,6 +749,7 @@ class StudioWindow:
         if panel is not None and panel.exists():
             panel.refresh_devices(self._device_rows, self._mirrored_canvas_id)
         self._refresh_pairing_affordance()
+        self._refresh_pairing_status()  # QR dialog: "1 tablet connected."
 
     def _apply_mirror_changed(self, canvas_id) -> None:
         """Round 7: follow the hub's mirror choice (issue 07)."""
@@ -862,6 +876,7 @@ class StudioWindow:
             label.configure(image=None, text="Waiting for pairing info…")
             ip_label.configure(text="")
             token_label.configure(text="")
+            self._refresh_pairing_status()
             return
         path = pairing.get("qr_png_path")
         try:
@@ -879,6 +894,25 @@ class StudioWindow:
             label.configure(image=None, text="QR image unavailable")
         ip_label.configure(text=f"{pairing.get('ipv4')}:{pairing.get('port')}")
         token_label.configure(text=str(pairing.get("token") or ""))
+        self._refresh_pairing_status()
+
+    def _refresh_pairing_status(self) -> None:
+        """Doc 12 extension — say out loud what pairing is waiting for.
+
+        Scanning used to give no feedback ("it says nothing"), so the dialog
+        now explains the state: waiting for a scan, how many tablets paired, or
+        a warning when the advertised address is unreachable from another
+        device.
+        """
+        status = self._qr_status_label
+        if status is None:
+            return
+        ipv4 = (self._pairing or {}).get("ipv4")
+        warning = pairing_status.reachability_warning(ipv4)
+        hint = self._qr_hint_label
+        if hint is not None:
+            hint.configure(text=warning or pairing_status.HINT_TEXT)
+        status.configure(text=pairing_status.device_count_text(self._devices))
 
     def _close_qr_dialog(self) -> None:
         dialog = self._qr_dialog

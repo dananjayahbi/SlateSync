@@ -27,6 +27,7 @@ import 'package:mobile_app/core/models/canvas_models.dart';
 import 'package:mobile_app/core/storage/local_db.dart';
 import 'package:mobile_app/features/canvas/canvas_studio_page.dart';
 import 'package:mobile_app/features/home/home_canvas_dashboard.dart';
+import 'package:mobile_app/features/pairing/pairing_attempt_controller.dart';
 import 'package:mobile_app/features/pairing/pairing_screen.dart';
 import 'package:mobile_app/network/vector_sync_client.dart';
 
@@ -39,6 +40,15 @@ class _FakeSyncClient extends VectorSyncClient {
   int discoverCalls = 0;
   final List<PairingInfo> connects = <PairingInfo>[];
 
+  /// State the scripted handshake settles on; `null` ⇒ never settles (the
+  /// attempt controller's timeout must fire).
+  SyncState? handshake = SyncState.online;
+
+  final StreamController<SyncEvent> _events =
+      StreamController<SyncEvent>.broadcast();
+  SyncState _state = SyncState.idle;
+  PairingInfo? _pairing;
+
   @override
   Future<void> discover() async {
     discoverCalls += 1;
@@ -46,21 +56,45 @@ class _FakeSyncClient extends VectorSyncClient {
     if (error != null) {
       throw error;
     }
+    _pairing = const PairingInfo(
+      ipv4: '192.168.1.9',
+      port: kSyncWsPort,
+      token: 'mdns-token',
+    );
+    _settle(handshake ?? SyncState.idle);
   }
 
   @override
   Future<void> connect(PairingInfo info) async {
     connects.add(info);
+    _pairing = info;
+    final SyncState? next = handshake;
+    if (next != null) {
+      _settle(next);
+    }
+  }
+
+  void _settle(SyncState next) {
+    _state = next;
+    _events.add(SyncEvent(kind: SyncEventKind.stateChanged, state: next));
   }
 
   @override
-  bool get isConnected => false;
+  SyncState get state => _state;
 
   @override
-  Stream<SyncEvent> get events => const Stream<SyncEvent>.empty();
+  PairingInfo? get pairing => _pairing;
 
   @override
-  Future<void> dispose() async {}
+  bool get isConnected => _state == SyncState.online;
+
+  @override
+  Stream<SyncEvent> get events => _events.stream;
+
+  @override
+  Future<void> dispose() async {
+    await _events.close();
+  }
 }
 
 /// Fake camera: reports [code] post-frame exactly like a real
@@ -399,6 +433,66 @@ void main() {
         findsOneWidget,
       );
       expect(find.byKey(const Key('pairing-manual-fallback')), findsOneWidget);
+    });
+
+    testWidgets('unreachable PC keeps the screen and explains the failure', (
+      WidgetTester tester,
+    ) async {
+      // Regression: the screen used to pop on scan, so a PC that never
+      // answered looked like "nothing happened".
+      final _FakeSyncClient client = _FakeSyncClient()..handshake = null;
+      await openPairing(
+        tester,
+        client,
+        scannerBuilder: _scannerDetecting(
+          'slatesync://connect?ip=192.168.1.7&port=50606&token=abc123',
+        ),
+      );
+
+      await tester.tap(find.byKey(const Key('pairing-scan')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('fake-scan-emit')));
+      await tester.pump();
+
+      expect(find.byType(PairingScreen), findsOneWidget);
+      expect(find.byKey(const Key('pairing-progress')), findsOneWidget);
+      expect(find.byKey(const Key('pairing-progress-spinner')), findsOneWidget);
+      expect(find.text(kPairingConnectingNotice), findsOneWidget);
+
+      // Waiting out the attempt surfaces the reason plus a retry affordance.
+      await tester.pump(const Duration(seconds: 13));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PairingScreen), findsOneWidget);
+      expect(find.byKey(const Key('pairing-progress-retry')), findsOneWidget);
+      expect(
+        find.textContaining('No answer from 192.168.1.7:50606'),
+        findsOneWidget,
+      );
+      expect(client.connects, hasLength(1));
+    });
+
+    testWidgets('rejected token is reported instead of popping', (
+      WidgetTester tester,
+    ) async {
+      final _FakeSyncClient client = _FakeSyncClient()
+        ..handshake = SyncState.authFailed;
+      await openPairing(
+        tester,
+        client,
+        scannerBuilder: _scannerDetecting(
+          'slatesync://connect?ip=192.168.1.7&port=50606&token=stale',
+        ),
+      );
+
+      await tester.tap(find.byKey(const Key('pairing-scan')));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byKey(const Key('fake-scan-emit')));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PairingScreen), findsOneWidget);
+      expect(find.text(kPairingRejectedNotice), findsOneWidget);
+      expect(find.byKey(const Key('pairing-progress-retry')), findsOneWidget);
     });
   });
 

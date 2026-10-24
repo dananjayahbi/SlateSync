@@ -21,6 +21,8 @@ import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
 import 'package:mobile_app/core/theme/studio_theme.dart'; // Doc 05
+import 'package:mobile_app/features/pairing/pairing_attempt_controller.dart';
+import 'package:mobile_app/features/pairing/pairing_progress_card.dart';
 import 'package:mobile_app/network/vector_sync_client.dart'; // Doc 25
 
 /// Builds the QR scanner widget for [PairingScreen]. Mirrors
@@ -74,31 +76,75 @@ class _PairingScreenState extends State<PairingScreen> {
   String? _discoverHint;
   MobileScannerErrorCode? _cameraError;
 
-  // ----- Success paths -----------------------------------------------------
+  /// Waits for the handshake so a failed pairing is reported instead of the
+  /// screen silently popping back to the gallery.
+  late final PairingAttemptController _attempt;
 
-  /// Hands [info] to the Doc 25 state machine and returns to the opener, whose
-  /// banner follows `client.events` `StateChanged`.
-  void _onPaired(PairingInfo info) {
-    unawaited(widget.client.connect(info));
-    _popIfMounted();
+  @override
+  void initState() {
+    super.initState();
+    _attempt = PairingAttemptController(client: widget.client);
+    _attempt.status.addListener(_onAttemptChanged);
   }
 
-  /// Manual entry sits on top of this screen: two pops unwind both routes.
+  @override
+  void dispose() {
+    _attempt.status.removeListener(_onAttemptChanged);
+    _attempt.dispose();
+    super.dispose();
+  }
+
+  /// Pops back as soon as the PC accepts the pairing; otherwise the progress
+  /// card stays on screen with the reason.
+  void _onAttemptChanged() {
+    if (!mounted) {
+      return;
+    }
+    if (_attempt.status.value == PairingAttemptStatus.online) {
+      _settleRoutes();
+      return; // the screen is going away — no rebuild needed
+    }
+    setState(() {}); // re-render the progress card
+  }
+
+  // ----- Success paths -----------------------------------------------------
+
+  /// Hands [info] to the Doc 25 state machine and waits for the outcome.
+  void _onPaired(PairingInfo info) {
+    setState(() => _showScanner = false); // stop decoding the same code twice
+    unawaited(_attempt.start(info));
+  }
+
+  /// Manual entry sits on top of this screen: close it and continue here so
+  /// the handshake result is visible on the progress card.
   void _onManualPaired(PairingInfo info) {
-    unawaited(widget.client.connect(info));
+    final NavigatorState nav = Navigator.of(context);
+    if (nav.canPop()) {
+      nav.pop(); // manual entry screen
+    }
+    unawaited(_attempt.start(info));
+  }
+
+  /// Unwinds this screen (manual entry already popped itself).
+  void _settleRoutes() {
     if (!mounted) {
       return;
     }
     final NavigatorState nav = Navigator.of(context);
-    nav.pop(); // manual screen
-    nav.pop(); // pairing screen
+    if (nav.canPop()) {
+      nav.pop();
+    }
   }
 
-  void _popIfMounted() {
-    if (!mounted) {
+  void _retryAttempt() {
+    final PairingInfo? info = _attempt.attempt;
+    if (info == null) {
+      _attempt.cancel();
+      setState(() {});
       return;
     }
-    Navigator.of(context).pop();
+    _attempt.cancel();
+    unawaited(_attempt.start(info));
   }
 
   // ----- Auto-discover -----------------------------------------------------
@@ -119,7 +165,16 @@ class _PairingScreenState extends State<PairingScreen> {
         return;
       }
       setState(() => _discovering = false);
-      _popIfMounted();
+      final PairingInfo? info = widget.client.pairing;
+      if (widget.client.isConnected) {
+        _settleRoutes();
+      } else if (info != null) {
+        // mDNS found the PC but the socket is not up yet: keep the screen
+        // visible until the handshake settles (and report it if it fails).
+        unawaited(_attempt.start(info));
+      } else {
+        setState(() => _discoverHint = kDiscoverFailedHint);
+      }
     } catch (_) {
       // TimeoutException (3 s mDNS) or StateError (bad TXT/no A-record):
       // show the manual fallback hint instead (Doc 25 §5 step 10).
@@ -190,6 +245,7 @@ class _PairingScreenState extends State<PairingScreen> {
             ),
             const SizedBox(height: 12),
           ],
+          _buildProgress(),
           _sectionCard(
             icon: Icons.wifi_find,
             title: 'Auto-discover',
@@ -232,6 +288,25 @@ class _PairingScreenState extends State<PairingScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Attempt status card: spinner while connecting, reason + retry after a
+  /// failure. Renders nothing when no attempt is in flight.
+  Widget _buildProgress() {
+    final PairingAttemptStatus state = _attempt.status.value;
+    if (state == PairingAttemptStatus.idle) {
+      return const SizedBox.shrink();
+    }
+    final bool busy = state == PairingAttemptStatus.connecting;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: PairingProgressCard(
+        busy: busy,
+        message: _attempt.message.value ?? kPairingConnectingNotice,
+        onCancel: busy ? _attempt.cancel : null,
+        onRetry: busy ? null : _retryAttempt,
       ),
     );
   }

@@ -4,7 +4,7 @@
 ; ASCII-only content - no non-ASCII bytes, safe with or without a UTF-8 BOM.
 
 #define MyAppName "SlateSync"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppExeName "SlateSyncAgent.exe"
 #define WsPort "50606"
 #define FirewallRule "SlateSync WS"

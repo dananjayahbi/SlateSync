@@ -19,6 +19,7 @@ import pytest
 from pc_agent.core.config_manager import AppConfig
 from pc_agent.core.events import PAIRING_INFO, EventBus
 from pc_agent.network.discovery_pairing import DiscoveryPairing, _pairing_payload
+from pc_agent.network.lan_address import AdapterAddress
 
 _PNG_MAGIC = b"\x89PNG"
 
@@ -216,6 +217,29 @@ def test_rotate_token_mints_new_token_and_rewrites_qr(
     assert qr_path.read_bytes() != old_bytes  # rewritten for the new token
 
 
+def test_rotate_token_while_running_readvertises_immediately(
+    pairing_factory: Any, zc_cls: Any, lan_ip: Any
+) -> None:
+    """Reset pairing must not leave the agent alive but unadvertised.
+
+    Regression: the old implementation stopped mDNS and never restarted it, so
+    after "Reset pairing" no tablet could discover or scan the agent at all.
+    """
+    pairing, _, events = pairing_factory()
+    pairing.start()
+    zc = zc_cls.return_value
+    assert zc.register_service.call_count == 1
+
+    new_token = pairing.rotate_token()
+
+    assert zc.unregister_service.call_count == 1  # old record removed
+    assert zc.close.call_count == 1
+    assert zc.register_service.call_count == 2  # re-advertised straight away
+    assert events[-1]["token"] == new_token  # dialog re-renders the new QR
+    assert len(events) == 2
+    pairing.stop()
+
+
 def test_port_consistency_across_config_mdns_qr(
     pairing_factory: Any, zc_cls: Any, lan_ip: Any
 ) -> None:
@@ -253,10 +277,19 @@ def test_qr_failure_propagates_before_pairing_info(
 # -- IPv4 selection ----------------------------------------------------------
 
 
-def test_lan_ipv4_prefers_udp_probe(pairing_factory: Any) -> None:
+@pytest.fixture()
+def no_adapters() -> Any:
+    """Report no adapter metadata so the legacy probe→scan ladder is used."""
+    with patch(
+        "pc_agent.network.lan_address.enumerate_adapters", return_value=[]
+    ) as mocked:
+        yield mocked
+
+
+def test_lan_ipv4_prefers_udp_probe(pairing_factory: Any, no_adapters: Any) -> None:
     pairing, _, _ = pairing_factory()
     with (
-        patch("pc_agent.network.discovery_pairing.socket.socket") as sock_cls,
+        patch("pc_agent.network.lan_address.socket.socket") as sock_cls,
         patch("pc_agent.network.discovery_pairing.socket.getaddrinfo") as gai,
     ):
         sock_cls.return_value.getsockname.return_value = ("192.168.7.4", 55555)
@@ -265,10 +298,12 @@ def test_lan_ipv4_prefers_udp_probe(pairing_factory: Any) -> None:
         gai.assert_not_called()
 
 
-def test_lan_ipv4_rejects_loopback_then_scans_hostname(pairing_factory: Any) -> None:
+def test_lan_ipv4_rejects_loopback_then_scans_hostname(
+    pairing_factory: Any, no_adapters: Any
+) -> None:
     pairing, _, _ = pairing_factory()
     with (
-        patch("pc_agent.network.discovery_pairing.socket.socket") as sock_cls,
+        patch("pc_agent.network.lan_address.socket.socket") as sock_cls,
         patch("pc_agent.network.discovery_pairing.socket.getaddrinfo") as gai,
     ):
         sock_cls.return_value.getsockname.return_value = ("127.0.0.1", 0)
@@ -279,10 +314,12 @@ def test_lan_ipv4_rejects_loopback_then_scans_hostname(pairing_factory: Any) -> 
         assert pairing._lan_ipv4() == "10.20.30.40"
 
 
-def test_lan_ipv4_last_resort_is_loopback(pairing_factory: Any) -> None:
+def test_lan_ipv4_last_resort_is_loopback(
+    pairing_factory: Any, no_adapters: Any
+) -> None:
     pairing, _, _ = pairing_factory()
     with (
-        patch("pc_agent.network.discovery_pairing.socket.socket") as sock_cls,
+        patch("pc_agent.network.lan_address.socket.socket") as sock_cls,
         patch("pc_agent.network.discovery_pairing.socket.getaddrinfo") as gai,
     ):
         sock_cls.return_value.getsockname.side_effect = OSError("no route")
@@ -290,3 +327,32 @@ def test_lan_ipv4_last_resort_is_loopback(pairing_factory: Any) -> None:
         assert pairing._lan_ipv4() == "127.0.0.1"
         gai.side_effect = OSError("resolver down")  # scan failure lands here too
         assert pairing._lan_ipv4() == "127.0.0.1"
+
+
+def test_lan_ipv4_replaces_vpn_candidate_with_real_lan(
+    pairing_factory: Any,
+) -> None:
+    """Regression: a VPN/TUN default route must not reach the pairing QR.
+
+    The reported bug — "when I scan the QR it doesn't catch the device" — was
+    the code encoding a TUN address (172.19.0.1, no gateway) that no tablet can
+    route to.
+    """
+    pairing, _, _ = pairing_factory()
+    adapters = [
+        AdapterAddress("172.19.0.1", gateway=None, description="sing-tun Tunnel #2"),
+        AdapterAddress(
+            "192.168.56.1", gateway=None, description="VirtualBox Host-Only"
+        ),
+        AdapterAddress(
+            "192.168.1.244",
+            gateway="192.168.1.1",
+            description="Realtek PCIe GbE Family Controller",
+        ),
+    ]
+    with (
+        patch("pc_agent.network.lan_address.enumerate_adapters", return_value=adapters),
+        patch("pc_agent.network.lan_address.socket.socket") as sock_cls,
+    ):
+        sock_cls.return_value.getsockname.return_value = ("172.19.0.1", 5555)
+        assert pairing._lan_ipv4() == "192.168.1.244"

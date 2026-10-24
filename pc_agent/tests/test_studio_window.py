@@ -37,6 +37,7 @@ from pc_agent.core.events import (
     PAIRING_INFO,
     EventBus,
 )
+from pc_agent.gui import pairing_status
 from pc_agent.gui.studio_window import StudioWindow, _branding_asset
 
 _MATRIX_EVENTS = [
@@ -438,6 +439,14 @@ def test_qr_dialog_renders_pairing_info_and_refreshes_while_open() -> None:
             assert str(win._qr_token_label.cget("text")) == "tok-1"
             assert win._qr_image_label.cget("image") is not None
             assert win._qr_image is not None
+            # Doc 12 §9.5 — the dialog states what it is waiting for instead of
+            # "saying nothing".
+            assert _pump_until(
+                root,
+                lambda: str(win._qr_status_label.cget("text"))
+                == pairing_status.NO_DEVICE_TEXT,
+            )
+            assert str(win._qr_hint_label.cget("text")) == pairing_status.HINT_TEXT
 
             # Re-render while the dialog is open (§5.7)
             bus.emit(

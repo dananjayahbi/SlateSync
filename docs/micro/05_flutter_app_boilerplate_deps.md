@@ -147,6 +147,22 @@ their owners — Doc 05 writes only its Creates list, never `shared_specs/**`, `
 `lib/canvas_engine/**`, `lib/network/**`, `lib/features/**`, or sibling test files; the only later
 write to a Doc 05 file is the allowed Wave 3.A `main.dart` stub finalization.
 
+## 8. Release Signing (NORMATIVE)
+
+`android/app/build.gradle.kts` reads release credentials from `android/key.properties`
+(gitignored by `android/.gitignore`, template key names) and falls back to the debug keystore
+when that file is absent, so a fresh clone can still run `flutter build apk --release` for
+testing. `android/key.properties.example` documents the four required keys.
+
+- **storeFile** resolves relative to `mobile_app/android/`; the tracked config uses
+  `../slatesync-release.jks` ⇒ `mobile_app/android/slatesync-release.jks`.
+- **Identity is permanent.** The `.jks` and its passwords must be backed up offline together;
+  losing them means no future build can install over an existing installation. Rotation
+  requires a new `applicationId`.
+- **Never commit** the `.jks`, `.keystore`, or `key.properties`.
+- **Verification gate:** `apksigner verify --print-certs` must report
+  `CN=SlateSync, OU=Mobile, O=SlateSync, ...`, never `CN=Android Debug`.
+
 ---
 *Discrepancy note (reported, not fixed): overview §5 catalog item 5 lists Doc 05 deps without
 `archive` and `flutter_lints`; template §5 (and this doc) mandate all ten.*

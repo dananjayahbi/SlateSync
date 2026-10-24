@@ -159,3 +159,50 @@ Persisted token reused across instances sharing `appdata_dir`; different profile
 different tokens; a restart reuses the PNG byte-for-byte (no `qrcode.make` call);
 `rotate_token()` changes the token and forces a rewrite; corrupt/missing files are
 re-created without raising.
+
+## 9. Round-7 Amendment — Reachable LAN Address (NORMATIVE)
+
+Fixes the reported regression "when I scan the QR it doesn't catch the device and
+says nothing". The pairing record advertised an unreachable address.
+
+### 9.1 Root cause
+`_lan_ipv4()` used `connect(("8.8.8.8", 80))` and took whatever the **default route**
+produced. On a machine with a VPN / TUN / hypervisor adapter that is the virtual
+adapter (observed: `172.19.0.1` on `sing-tun Tunnel #2`, gateway `0.0.0.0`). The QR
+therefore encoded an address no tablet on the Wi-Fi LAN can route to, the WebSocket
+dial timed out, and nothing was reported.
+
+### 9.2 `network/lan_address.py` (new module)
+* `AdapterAddress(address, gateway, description)` with `has_gateway`,
+  `looks_virtual`, `is_private`, `awkward` (`looks_virtual or not has_gateway`).
+* `score()` / `rank()` — real adapters outrank virtual ones; loopback is always last.
+* `enumerate_adapters()` — Windows `GetAdaptersInfo` via `ctypes` (no new dependency);
+  returns `[]` off Windows or on any enumeration error, so startup never fails.
+* `choose_lan_ipv4(probe, scan, adapters=None)` — runs the documented probe → hostname
+  scan → loopback ladder, then **replaces** the candidate when it belongs to an
+  `awkward` adapter **and** a real adapter exists. Unknown addresses are kept verbatim,
+  so mocked single-interface environments are unaffected.
+
+### 9.3 Contract
+`DiscoveryPairing._lan_ipv4()` delegates to `choose_lan_ipv4`; `_scan_hostname_ipv4()`
+is the hostname fallback. The chosen address feeds the mDNS `A` record, the QR payload
+and `PAIRING_INFO.ipv4` unchanged in shape.
+
+### 9.4 Rotation also restarts mDNS
+`rotate_token()` used to `stop()` mDNS and never start again — after "Reset pairing" the
+agent was alive but unadvertised and the dialog kept showing the dead QR. When the
+service was running it is now stopped, re-minted **and started again**, which re-emits
+`PAIRING_INFO` so an open dialog re-renders the new code immediately.
+
+### 9.5 Dialog feedback (`gui/pairing_status.py`)
+Scanning used to "say nothing". The QR dialog now carries a hint line and a live status
+line: `WAITING_TEXT` before `PAIRING_INFO`, `NO_DEVICE_TEXT`, `"1 tablet connected."` /
+`"N tablets connected."` from `DEVICES_UPDATED`, and `reachability_warning(ipv4)` when
+the advertised address is loopback / link-local / wildcard.
+
+### 9.6 Tests
+`tests/test_lan_address.py` (scoring, ranking, replacement of a TUN candidate, unknown
+address preserved, loopback scan fallback, platform shims), `tests/test_pairing_status.py`
+(copy derivation) and `tests/test_discovery_pairing.py`
+(`test_lan_ipv4_replaces_vpn_candidate_with_real_lan`,
+`test_rotate_token_while_running_readvertises_immediately`).

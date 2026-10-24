@@ -1,0 +1,16 @@
+# Copy to key.properties and fill in your own values. key.properties is gitignored.
+#
+# storeFile is resolved relative to mobile_app/android/, so ../slatesync-release.jks
+# points at mobile_app/android/slatesync-release.jks.
+#
+# Generate a keystore with:
+#   keytool -genkeypair -v -keystore android/slatesync-release.jks -storetype PKCS12 \
+#     -keyalg RSA -keysize 2048 -validity 10000 -alias slatesync \
+#     -dname "CN=SlateSync, O=SlateSync, C=LK"
+#
+# Back up the .jks file and these passwords together, offline. Losing them means you
+# can never publish an update that installs over an existing installation.
+storePassword=CHANGE_ME
+keyPassword=CHANGE_ME
+keyAlias=slatesync
+storeFile=../slatesync-release.jks
