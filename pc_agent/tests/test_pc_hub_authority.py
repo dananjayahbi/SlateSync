@@ -230,3 +230,92 @@ def test_shutdown_unsubscribes_the_origin_handler() -> None:
     # Handlers are gone: a further RPC_ORIGIN must not touch the roster.
     bus.emit(RPC_ORIGIN, msg={"type": "CANVAS_LIFECYCLE"}, connection_id="c1")
     assert sync.roster.count == 0
+
+
+# ---------------------------------------------------------------------------
+# Round-9 issue 08 — artboard (background) propagation to the PC mirror
+# ---------------------------------------------------------------------------
+
+
+def _canvas_with_background(style: str, spacing: float = 32.0, updated_at: int = 1760760001):
+    body = _canvas()
+    body["updated_at"] = updated_at
+    body["artboard"]["background_style"] = style
+    body["artboard"]["background_spacing"] = spacing
+    return body
+
+
+def _put(style: str, spacing: float = 32.0, updated_at: int = 1760760001) -> dict:
+    return _envelope(
+        "CANVAS_LIFECYCLE",
+        "CANVAS_PUT",
+        {"canvas": _canvas_with_background(style, spacing, updated_at), "source": "device"},
+    )
+
+
+def test_canvas_put_updates_the_open_artboard(hub: Any) -> None:
+    """Issue 08: editing the background of the mirrored canvas repaints the PC."""
+    from pc_agent.core.events import ARTBOARD_CHANGED
+
+    bus, sync, _push, _rec, store = hub
+    changes: list[dict] = []
+    bus.on(ARTBOARD_CHANGED, lambda **kw: changes.append(kw))
+
+    bus.emit(RPC_MESSAGE, msg=_envelope("CANVAS_LIFECYCLE", "OPEN_CANVAS", {"canvas": _canvas()}))
+    assert store.snapshot_current().artboard.background_style == "BLANK"
+
+    bus.emit(RPC_MESSAGE, msg=_put("RULED", 48.0))
+    artboard = store.snapshot_current().artboard
+    assert artboard.background_style == "RULED"
+    assert artboard.background_spacing == 48.0
+    assert changes and changes[-1]["artboard"] is artboard
+
+    # Switching the tablet back to BLANK must clear the pattern too.
+    bus.emit(RPC_MESSAGE, msg=_put("BLANK", 48.0, updated_at=1760760002))
+    assert store.snapshot_current().artboard.background_style == "BLANK"
+
+
+def test_canvas_put_for_a_different_canvas_leaves_the_open_artboard(
+    hub: Any,
+) -> None:
+    bus, sync, _push, _rec, store = hub
+    bus.emit(RPC_MESSAGE, msg=_envelope("CANVAS_LIFECYCLE", "OPEN_CANVAS", {"canvas": _canvas()}))
+    other = _envelope(
+        "CANVAS_LIFECYCLE",
+        "CANVAS_PUT",
+        {"canvas": _canvas_with_background("SQUARE_GRID"), "source": "device"},
+        canvas_id="cv-other",
+    )
+    other["payload"]["canvas"]["canvas_id"] = "cv-other"
+    bus.emit(RPC_MESSAGE, msg=other)
+    assert store.snapshot_current().artboard.background_style == "BLANK"
+
+
+def test_canvas_put_with_an_equal_timestamp_still_propagates_the_artboard(
+    hub: Any,
+) -> None:
+    """An artboard edit inside the same second carries an EQUAL updated_at.
+
+    The document body legitimately loses LWW there, but the page look still
+    has to reach the mirror (round-9 issue 08).
+    """
+    bus, sync, _push, _rec, store = hub
+    bus.emit(RPC_MESSAGE, msg=_envelope("CANVAS_LIFECYCLE", "OPEN_CANVAS", {"canvas": _canvas()}))
+    bus.emit(RPC_MESSAGE, msg=_put("SQUARE_GRID", 64.0, updated_at=1760760000))
+    artboard = store.snapshot_current().artboard
+    assert artboard.background_style == "SQUARE_GRID"
+    assert artboard.background_spacing == 64.0
+
+
+def test_sync_artboard_ignores_older_updated_at(hub: Any) -> None:
+    bus, _sync, _push, _rec, store = hub
+    bus.emit(RPC_MESSAGE, msg=_envelope("CANVAS_LIFECYCLE", "OPEN_CANVAS", {"canvas": _canvas()}))
+    bus.emit(RPC_MESSAGE, msg=_put("RULED"))
+    assert store.snapshot_current().artboard.background_style == "RULED"
+    from pc_agent.engine.document_store import Artboard
+
+    applied = store.sync_artboard(
+        "cv-1", Artboard(preset="A4", background_style="SQUARE_GRID"), updated_at=1
+    )
+    assert applied is False
+    assert store.snapshot_current().artboard.background_style == "RULED"

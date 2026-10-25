@@ -1,12 +1,18 @@
 #version 330 core
 
-// Doc 08 procedural backgrounds (BLANK / RULED / DOT_GRID / ISO_GRID).
+// Round-9 procedural backgrounds: BLANK / RULED / SQUARE_GRID.
 // World coordinates are recovered via the inverse template §3 transform:
-//   screen = (world − camera_center) * scale + viewport/2
-//   world  = (screen − viewport/2) / scale + camera_center
-uniform vec3 u_camera;   // (scale, tx, ty) — live camera frame f1/f2/f3
+//   screen = (world - camera_center) * scale + viewport/2
+//   world  = (screen - viewport/2) / scale + camera_center
+//
+// The pattern is PARAMETERISED by u_spacing so the user can choose the gap
+// between rules (RULED) or the side of one cell (SQUARE_GRID). DOT_GRID and
+// ISO_GRID were removed in round 9; legacy documents are normalised to BLANK
+// on load, so they never reach this shader.
+uniform vec3 u_camera;   // (scale, tx, ty) - live camera frame f1/f2/f3
 uniform vec2 u_viewport; // framebuffer size in pixels
-uniform int u_pattern;   // 0 BLANK, 1 RULED, 2 DOT_GRID, 3 ISO_GRID
+uniform int u_pattern;   // 0 BLANK, 1 RULED, 2 SQUARE_GRID
+uniform float u_spacing; // world units: rule gap / square side (> 0)
 uniform vec3 u_bgColor;  // artboard background_color
 uniform vec3 u_lineColor; // pattern ink colour
 uniform vec4 u_scissor;  // bounded artboard world rect (min_x, min_y, max_x, max_y)
@@ -24,31 +30,27 @@ void main() {
         discard;
     }
     float px = 1.0 / u_camera.x; // one screen pixel expressed in world units
+    float spacing = max(u_spacing, 1.0);
+    // One-pixel hairline: the half-width never drops below a third of a world
+    // unit, so rules stay visible when zoomed far out.
+    float halfw = max(0.5 * px, 0.35);
     float alpha = 0.0;
     if (u_pattern == 1) {
-        // RULED — horizontal line wherever world_y ≡ 0 (mod 32).
-        float d = abs(world.y - 32.0 * floor(world.y / 32.0 + 0.5));
+        // RULED - horizontal line wherever world_y is a multiple of spacing.
+        float d = abs(world.y - spacing * floor(world.y / spacing + 0.5));
         float aa = fwidth(d);
-        alpha = 1.0 - smoothstep(0.5 * px - aa, 0.5 * px + aa, d);
+        alpha = 1.0 - smoothstep(halfw - aa, halfw + aa, d);
     } else if (u_pattern == 2) {
-        // DOT_GRID — dots on the (24i, 24j) lattice, radius 0.45·24 world units.
-        vec2 off = world - 24.0 * floor(world / 24.0 + 0.5);
-        float d = length(off);
+        // SQUARE_GRID - lattice of spacing-sided cells. The nearer of the
+        // horizontal and vertical families wins, so a pixel lights up on
+        // either set of rules (a real grid, not just tick marks).
+        float dx = abs(world.x - spacing * floor(world.x / spacing + 0.5));
+        float dy = abs(world.y - spacing * floor(world.y / spacing + 0.5));
+        float d = min(dx, dy);
         float aa = fwidth(d);
-        alpha = 1.0 - smoothstep(0.45 * 24.0 - aa, 0.45 * 24.0 + aa, d);
-    } else if (u_pattern == 3) {
-        // ISO_GRID — line families at ±60°, 24 u perpendicular spacing.
-        // s = ±√3·x − y is constant along each family; mod 48 wraps to ±24,
-        // halving yields the signed perpendicular distance (±12 u envelope).
-        float s1 = sqrt(3.0) * world.x - world.y;
-        float s2 = sqrt(3.0) * world.x + world.y;
-        float d1 = (mod(s1 + 24.0, 48.0) - 24.0) * 0.5;
-        float d2 = (mod(s2 + 24.0, 48.0) - 24.0) * 0.5;
-        float d = min(abs(d1), abs(d2));
-        float aa = fwidth(d);
-        alpha = 1.0 - smoothstep(0.5 * px - aa, 0.5 * px + aa, d);
+        alpha = 1.0 - smoothstep(halfw - aa, halfw + aa, d);
     }
-    // BLANK (u_pattern == 0) keeps alpha 0 ⇒ solid background colour only.
+    // BLANK (u_pattern == 0) keeps alpha 0 -> solid background colour only.
     vec3 color = mix(u_bgColor, u_lineColor, clamp(alpha, 0.0, 1.0));
     fragColor = vec4(color, 1.0);
 }

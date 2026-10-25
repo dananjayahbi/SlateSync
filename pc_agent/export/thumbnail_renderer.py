@@ -40,6 +40,7 @@ from pc_agent.engine.document_store import (
     artboard_is_infinite,
 )
 from pc_agent.engine.scene_graph import CanvasNode
+from pc_agent.export.cairo_shapes import apply_fill, trace_shape
 
 logger = logging.getLogger("slatesync.thumbnail")
 
@@ -334,42 +335,15 @@ def _draw_shape(ctx: cairo.Context, node: CanvasNode, scale: float) -> None:
         bx0, bx1 = bx1, bx0
     if by1 < by0:
         by0, by1 = by1, by0
+    box = (bx0, by0, bx1, by1)
+    # Round-9 issues 04/05/06 — shared with the raster/PDF exporters so the
+    # thumbnail cannot drift (fill, rotated PATH, TABLE grid).
+    apply_fill(ctx, style, shape, box, node.geometry.pts, node.geometry.graph_config)
     _set_color(ctx, style.color, style.opacity)
     ctx.set_line_width(_line_w(scale, style.stroke_width))
     ctx.set_line_join(cairo.LINE_JOIN_ROUND)
     ctx.new_path()
-    if shape == "CIRCLE":
-        cx, cy = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
-        rx, ry = max(1e-3, (bx1 - bx0) / 2.0), max(1e-3, (by1 - by0) / 2.0)
-        k = 0.5522847498  # circle ⇄ cubic κ
-        ctx.move_to(cx + rx, cy)
-        ctx.curve_to(cx + rx, cy + ry * k, cx + rx * k, cy + ry, cx, cy + ry)
-        ctx.curve_to(cx - rx * k, cy + ry, cx - rx, cy + ry * k, cx - rx, cy)
-        ctx.curve_to(cx - rx, cy - ry * k, cx - rx * k, cy - ry, cx, cy - ry)
-        ctx.curve_to(cx + rx * k, cy - ry, cx + rx, cy - ry * k, cx + rx, cy)
-    elif shape == "TRIANGLE":
-        ctx.move_to((bx0 + bx1) / 2.0, by0)
-        ctx.line_to(bx1, by1)
-        ctx.line_to(bx0, by1)
-        ctx.close_path()
-    elif shape == "ARROW":
-        coords = _finite_pts(node.geometry.pts or [])
-        if coords is not None and len(coords) >= 2:
-            ax, ay = coords[0]
-            bx, by = coords[-1]
-        else:
-            ax, ay = bx0, (by0 + by1) / 2.0
-            bx, by = bx1, (by0 + by1) / 2.0
-        ctx.move_to(ax, ay)
-        ctx.line_to(bx, by)
-        ang = math.atan2(by - ay, bx - ax)
-        head = max(12.0, float(style.stroke_width) * 4.0)
-        ctx.move_to(bx, by)
-        ctx.line_to(bx - head * math.cos(ang - 0.4), by - head * math.sin(ang - 0.4))
-        ctx.move_to(bx, by)
-        ctx.line_to(bx - head * math.cos(ang + 0.4), by - head * math.sin(ang + 0.4))
-    else:  # RECT and unknown types fall back to the bbox rectangle.
-        ctx.rectangle(bx0, by0, bx1 - bx0, by1 - by0)
+    trace_shape(ctx, node, box, shape)
     ctx.stroke()
 
 

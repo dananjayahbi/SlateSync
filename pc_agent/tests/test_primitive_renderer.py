@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import ast
 import inspect
-import math
 import re
 from pathlib import Path
 
@@ -21,15 +20,12 @@ from pc_agent.core.config_manager import AppConfig
 from pc_agent.viewport.gl_canvas_host import ProgramRegistry
 from pc_agent.viewport.primitive_renderer import (
     CIRCLE_SEGMENTS,
-    DOT_RADIUS,
     GLYPH_CELL_H,
     GLYPH_CELL_W,
     GLYPH_CHARS,
     GLYPH_COLS,
     GLYPH_ROWS,
     GLYPH_SHEET_SIZE,
-    GRID_SPACING,
-    ISO_SQRT3,
     MAX_GRAPH_TICKS,
     RULED_SPACING,
     ZOOM_MAX,
@@ -39,12 +35,9 @@ from pc_agent.viewport.primitive_renderer import (
     build_cartesian_graph,
     build_number_line_graph,
     circle_triangles,
-    dot_distance,
-    dot_intensity,
     format_graph_value,
     graph_geometry,
     is_visible,
-    iso_line_distance,
     line_quad,
     make_glyph_sheet,
     parse_color,
@@ -53,6 +46,8 @@ from pc_agent.viewport.primitive_renderer import (
     resolve_asset_path,
     ruled_intensity,
     ruled_line_distance,
+    square_intensity,
+    square_line_distance,
     triangle_points,
     visible_world_rect,
     world_to_screen,
@@ -136,7 +131,7 @@ def test_class_exposes_pure_math_as_staticmethods() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_rule_pattern_fires_on_32u_multiples_only() -> None:
+def test_rule_pattern_fires_on_multiples_of_the_configured_spacing() -> None:
     assert RULED_SPACING == 32.0
     for y in (-64.0, 0.0, 32.0, 64.0):
         assert ruled_line_distance(y) == pytest.approx(0.0, abs=1e-9)
@@ -148,27 +143,44 @@ def test_rule_pattern_fires_on_32u_multiples_only() -> None:
     assert ruled_intensity(0.5, line_half=0.5, aa=0.25) == pytest.approx(0.5)
 
 
-def test_dot_grid_lattice_peak_and_radius_half_intensity() -> None:
-    assert GRID_SPACING == 24.0
-    assert DOT_RADIUS == pytest.approx(0.45 * 24.0)
-    # peak at (48, 72) = (24·2, 24·3)
-    assert dot_distance(48.0, 72.0) == pytest.approx(0.0, abs=1e-9)
-    assert dot_intensity(48.0, 72.0, aa=0.25) == pytest.approx(1.0)
-    # half intensity exactly at distance == radius (point (r, 0) sits on the lattice normal)
-    assert dot_intensity(DOT_RADIUS, 0.0, aa=0.25) == pytest.approx(0.5)
-    # cell centre (12, 12): equidistant (12√2) from four lattice points → background gap
-    assert dot_distance(12.0, 12.0) == pytest.approx(12.0 * math.sqrt(2.0))
-    assert dot_intensity(12.0, 12.0, aa=0.25) == pytest.approx(0.0)
+def test_rule_spacing_is_configurable() -> None:
+    """Round-9: the user picks the gap between rules."""
+    for gap in (8.0, 16.0, 24.0, 48.0, 100.0):
+        for multiple in (0.0, 1.0, 3.0, -2.0):
+            y = gap * multiple
+            assert ruled_line_distance(y, gap) == pytest.approx(0.0, abs=1e-9)
+            assert ruled_intensity(y, spacing=gap) == pytest.approx(1.0, abs=1e-6)
+        # half-way between two rules is ink-free
+        assert ruled_intensity(gap * 0.5, spacing=gap) == pytest.approx(0.0)
 
 
-def test_iso_grid_zero_distance_on_60_degree_families() -> None:
-    for x in (0.0, 10.0, -37.5, 123.0):
-        assert iso_line_distance(x, ISO_SQRT3 * x) == pytest.approx(0.0, abs=1e-6)
-        assert iso_line_distance(x, -ISO_SQRT3 * x) == pytest.approx(0.0, abs=1e-6)
-    # perpendicular spacing envelope: never farther than half of 24 u
-    for point in ((3.0, 7.0), (100.0, -50.0), (5.5, 9.25), (-40.0, 12.0), (7.0, 1.0)):
-        assert iso_line_distance(*point) <= 12.0 + 1e-9
-    assert iso_line_distance(0.0, 6.0) == pytest.approx(3.0)
+def test_square_grid_fires_on_both_rule_families() -> None:
+    """SQUARE_GRID replaced DOT_GRID/ISO_GRID in round 9."""
+    for gap in (16.0, 32.0):
+        # a horizontal rule
+        assert square_line_distance(0.0, gap, gap) == pytest.approx(0.0, abs=1e-9)
+        # a vertical rule
+        assert square_line_distance(gap, 0.0, gap) == pytest.approx(0.0, abs=1e-9)
+        assert square_intensity(gap * 2, gap * 3, spacing=gap) == pytest.approx(
+            1.0, abs=1e-6
+        )
+        # cell centre is equidistant from both families → no ink
+        assert square_intensity(gap * 0.5, gap * 0.5, spacing=gap) == pytest.approx(
+            0.0
+        )
+    # A larger cell means fewer rules: a point that IS on the 16 u lattice is
+    # no longer on the 32 u one.
+    assert square_intensity(16.0, 8.0, spacing=16.0) == pytest.approx(1.0, abs=1e-6)
+    assert square_intensity(16.0, 8.0, spacing=32.0) == pytest.approx(0.0)
+
+
+def test_retired_patterns_are_gone() -> None:
+    """DOT_GRID / ISO_GRID were removed; importing them must fail now."""
+    import pc_agent.viewport.primitive_renderer as renderer
+
+    for retired in ("DOT_RADIUS", "ISO_SQRT3", "ISO_PERIOD", "dot_intensity"):
+        assert not hasattr(renderer, retired), retired
+    assert renderer._PATTERN_IDS == {"BLANK": 0, "RULED": 1, "SQUARE_GRID": 2}
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +255,7 @@ def test_grid_shader_uniform_contract() -> None:
         "u_camera",
         "u_viewport",
         "u_pattern",
+        "u_spacing",
         "u_bgColor",
         "u_lineColor",
         "u_scissor",
@@ -250,10 +263,17 @@ def test_grid_shader_uniform_contract() -> None:
     ):
         assert uniform in frag, uniform
     assert "fwidth" in frag and "smoothstep" in frag
-    # pattern constants: 32 u ruled, 0.45·24 dots, ±60° families via √3 + mod 48
-    assert "32.0 * floor" in frag
-    assert "0.45 * 24.0" in frag
-    assert "sqrt(3.0)" in frag and "48.0" in frag
+    # Round-9: only BLANK / RULED / SQUARE_GRID remain, and both patterned
+    # branches are parameterised by u_spacing (user-chosen gap / cell side).
+    assert "u_spacing" in frag
+    assert "spacing * floor" in frag
+    # both axes are sampled for SQUARE_GRID (a real lattice, not dots)
+    assert "world.x - spacing * floor" in frag
+    assert "world.y - spacing * floor" in frag
+    assert "min(dx, dy)" in frag
+    # the retired ISO_GRID math must be gone
+    assert "sqrt(3.0)" not in frag
+    assert "0.45 * 24.0" not in frag
 
 
 def test_primitive_shader_uniform_contract() -> None:
@@ -325,6 +345,17 @@ def test_module_imports_only_contract_models() -> None:
         # Round-8 issue 02: pure leaf helper (no GL, no engine deps) for the
         # fill-vs-outline decision the Doc 08 §5(7) contract always required.
         "pc_agent.viewport.shape_fill": {"shape_is_filled"},
+        # Round-9 issues 04/05/06: pure geometry (polygon fill, PATH, TABLE)
+        # shared by the viewport and all three exporters — leaf module, no GL
+        # and no engine imports, exactly like shape_fill.
+        "pc_agent.viewport.vector_geometry": {
+            "outline_segments",
+            "points_of",
+            "polyline_segments",
+            "rect_to_triangles",
+            "table_geometry",
+            "triangulate",
+        },
     }
     pc_modules = {module for module in imported if module.startswith("pc_agent")}
     assert pc_modules <= set(allowed), f"unexpected pc_agent imports: {pc_modules}"
@@ -644,7 +675,7 @@ def test_render_smoke_a4_ruled_number_line_image_single_frame() -> None:
             width=None,
             height=None,
             is_infinite=True,
-            background_style="DOT_GRID",
+            background_style="SQUARE_GRID",
             background_color="#FFFFFF",
         )
         renderer.render([], (0.5, 0.0, 0.0), infinite, {})
@@ -682,7 +713,9 @@ def test_missing_asset_logs_warning_once_and_caches_placeholder() -> None:
 
 
 def _assert_warning_once(renderer, node, artboard) -> None:
-    """Render twice; the second render must hit the texture cache (no repeat warning)."""
+    """Render twice; the second render must not re-warn (round-9: the miss is
+    remembered but the texture is intentionally NOT cached, so the bytes can
+    land later and be picked up without a restart)."""
     import logging
 
     class _Capture(logging.Handler):
@@ -704,3 +737,5 @@ def _assert_warning_once(renderer, node, artboard) -> None:
         logger.removeHandler(handler)
     warnings = [m for m in handler.messages if "magenta placeholder" in m]
     assert len(warnings) == 1, f"expected exactly one placeholder warning, got {warnings}"
+    # Nothing was cached under the asset key, so a later ASSET_DONE can win.
+    assert not any("nope.png" in key for key in renderer._image_cache)

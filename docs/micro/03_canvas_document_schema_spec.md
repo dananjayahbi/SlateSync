@@ -290,3 +290,70 @@ Negative bounds are legal only for INFINITE: `ALLOW(A5/A4/LETTER)=false` (min_x<
 **Never touches (write-conflict guard):** `.gitignore`, `pytest.ini`, `ruff.toml`, `shared_specs/validate_specs.py` (Doc 01); `shared_specs/binary_stream_frame.json`, `shared_specs/ws_rpc_schema.json` (Doc 02); `pc_agent/**` incl. `engine/scene_graph.py`, `engine/document_store.py`, `pc_agent/tests/*` (Docs 04+); `mobile_app/**` incl. `lib/core/models/canvas_models.dart`, `mobile_app/test/*` (Docs 05+); `qa/**` (Doc 28); `docs/overview.md`, `docs/_micro_doc_template.md`, `docs/micro/*` (Phase 0 orchestrator).
 
 **No-overlap confirmation:** the Creates path matches template §6 row 03 exactly and appears in no other Wave 1.A row; Docs 05/09/10/22/23/26 *consume* this schema (read-only from Doc 03's perspective — they may never edit this JSON); `validate_specs.py` (Doc 01) reads it only after the Wave 1.A barrier.
+
+---
+
+## 8. Round-9 Amendment — `fill`, `groups`, `PATH` and `TABLE` (NORMATIVE)
+
+Round 9 needed four things the frozen v1 schema could not express. All four are **additive**: every
+pre-round-9 document still validates, loads and re-saves byte-identically.
+
+### 8.1 `NodeStyle.fill` — OPTIONAL interior colour (issue 04)
+
+```json
+"fill": {"type": ["string", "null"], "pattern": "^#[0-9A-Fa-f]{6}$"}
+```
+
+The paint bucket keeps the outline and paints the interior, so the fill cannot ride on `color` or on
+`stroke_width`. The key is **omitted** (never `null`) when a node has no fill, which is what makes the
+round trip byte-identical. `stroke_width == 0` remains the legacy spelling of "solid in `color`" and is
+honoured identically by all four renderers (`pc_agent/viewport/shape_fill.py`).
+
+A malformed `fill` is DROPPED on load (the node keeps its outline) rather than rejecting the document.
+
+### 8.2 Document-level `groups` — OPTIONAL lock groups (issue 05)
+
+```json
+"groups": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}, "minItems": 1}}
+```
+
+`group_id → [node_id, ...]`. A locked group behaves as ONE object in the selector until unlocked.
+`NodeStyle` is frozen and a group is a document-level relation anyway (a node belongs to at most one
+group), so a per-node flag was never an option. Omitted when empty; a malformed map drops.
+
+### 8.3 `shape_type` gains `PATH` and `TABLE`
+
+```json
+"shape_type": {"enum": ["RECT","CIRCLE","TRIANGLE","ARROW","CARTESIAN_2D","NUMBER_LINE","PATH","TABLE", null]}
+```
+
+* **`PATH`** — a closed polygon in `pts`. Rotation output: a rotated RECT/CIRCLE/TRIANGLE cannot stay
+  that type because `bbox` is axis-aligned by contract. It also renders a pen loop that the fill tool
+  closed. Filled when `fill` (or `stroke_width == 0`) says so; stroked along its full outline.
+  A 2-point PATH renders as the open segment it is rather than being dropped.
+* **`TABLE`** — a grid described by `graph_config` (`rows`, `cols`, `header_row`, `header_col`).
+  `rows`/`cols` are TOTAL cell counts, header band included, clamped to 1..200 × 1..40. Header bands are
+  filled rectangles; every grid segment (borders included) is stroked.
+
+### 8.4 Why not new `kind` values
+
+`kind` (`STROKE|HIGHLIGHT|LINE|SHAPE|GRAPH_AXES|IMAGE`) selects how geometry is INTERPRETED; both round-9
+additions are shapes with a different geometry interpretation, which is exactly what `shape_type`
+already discriminates (CARTESIAN_2D / NUMBER_LINE prove the pattern). Adding kinds would have forced
+every `_addActionForKind` / `_DEFAULT_KINDS` / exporter branch to grow a case for no gain.
+
+### 8.5 PC mirror parity
+
+* `pc_agent/viewport/vector_geometry.py` — polygon/ellipse/triangle builders, closure test,
+  point-in-polygon, ear-clipping triangulation, table grid. Shared by the GL viewport and all three
+  exporters, so the four renderers cannot drift.
+* `pc_agent/export/cairo_shapes.py` — the cairo outline/fill builder the raster, PDF and thumbnail
+  exporters now share (they had already drifted once over arrow geometry).
+* `CanvasDocument.groups` round-trips through `_doc_to_json` / `_doc_from_json`.
+
+### 8.6 Acceptance
+
+* `shared_specs/validate_specs.py` pins the extended `shape_type` enum and asserts `fill` stays
+  OPTIONAL (`NodeStyle.required` must not list it).
+* `pc_agent/tests/test_document_store.py` — `fill`/`groups` optional, round-tripped, and a hostile
+  value never fails a load.

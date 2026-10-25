@@ -206,3 +206,55 @@ resolves. Swapping roots releases cached textures.
 * An `ARROW` produces only line triangles at every width, and its head stays inside the node bbox.
 * `pc_agent/tests/test_shape_fill.py` pins both tables; `test_primitive_renderer.py` and
   `test_mirror_line_node.py` assert the outline/fill split from the renderer's own API.
+---
+
+## 9. Round-9 Amendment — `fill`, `PATH`, `TABLE` (NORMATIVE)
+
+### 9.1 The fill decision now has two inputs
+
+Round 8 derived "filled" from `stroke_width == 0` alone. Round 9 adds an explicit
+`style.fill` (`#RRGGBB`), set by the tablet's paint bucket, which means *"keep the outline, paint the
+interior"*. `_tessellate_shape` therefore emits interior triangles when **either** holds:
+
+| `style.fill` | `stroke_width` | result |
+|---|---|---|
+| set | > 0 | **fill with `fill`**, stroke the outline in `color` (the paint bucket) |
+| set | == 0 | fill with `fill` (the explicit value wins) |
+| unset | == 0 | fill with `color` (the frozen legacy rule) |
+| unset | > 0 | outline only |
+
+ARROW is exempt from both routes — the tablet strokes its shaft and barbs, so a filled wedge would be
+a new bug rather than a feature. A malformed `fill` is ignored (never painted black).
+
+### 9.2 `PATH` — a closed polygon
+
+`_tessellate_path` fills via **ear clipping** (`vector_geometry.triangulate`) rather than a triangle
+fan. A pen-drawn loop is routinely concave and a fan paints OUTSIDE the outline, which is exactly the
+artefact the fill tool must not produce; `test_vector_geometry.py` asserts the triangle area equals the
+polygon area to prove it. The full outline is stroked, and a 2-point PATH degenerates to the open
+segment it actually is.
+
+### 9.3 `TABLE` — grid from `graph_config`
+
+`_tessellate_table` paints the header bands (filled) then every grid segment (stroked) from
+`vector_geometry.table_geometry`, which clamps `rows`/`cols` (1..200 × 1..40) so a corrupt document
+cannot emit a million gridlines. The corner cell belongs to the row band only, so the two bands never
+double-paint.
+
+### 9.4 The exporters share the cairo path
+
+`pc_agent/export/cairo_shapes.py` now owns `apply_fill` and `trace_shape` for the raster, PDF and
+thumbnail exporters. They had already drifted once (round-8 arrow geometry), and copying three more
+cases into three files is how four renderers stop agreeing with the tablet. Each exporter keeps only
+what legitimately differs — colour and line width (the thumbnail scales the width).
+
+### 9.5 Acceptance
+
+* `pc_agent/tests/test_round9_rendering.py` — fill vs outline colours, malformed fill ignored, ARROW
+  never filled, PATH polygon fill/stroke, 2-point PATH segment, TABLE bands/grid, degenerate bbox, and
+  `apply_fill`/`trace_shape` on a real cairo surface.
+* `pc_agent/tests/test_vector_geometry.py` — closure, concave point-in-polygon, ear-clipping area
+  equality, table clamps.
+* `test_primitive_renderer.py::test_module_imports_only_contract_models` now whitelists
+  `viewport.vector_geometry` — it is a leaf module (no GL, no engine imports), exactly like
+  `shape_fill`.

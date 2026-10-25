@@ -29,6 +29,7 @@ import cairo
 from pc_agent.core.config_manager import AppConfig
 from pc_agent.engine.document_store import Artboard, CanvasDocument, artboard_is_infinite
 from pc_agent.engine.scene_graph import CanvasNode
+from pc_agent.export.cairo_shapes import apply_fill, trace_shape
 
 #: Points = world_units × 72/300 (template §3).
 UNIT_TO_PT: float = 72 / 300
@@ -199,44 +200,43 @@ def _set_color(ctx: cairo.Context, color: str, alpha: float = 1.0) -> None:
     ctx.set_source_rgba(r, g, b, max(0.0, min(1.0, float(alpha))))
 
 
-def _paint_pattern(ctx: cairo.Context, style: str, rect: tuple[float, float, float, float]) -> None:
-    """RULED / DOT_GRID / ISO_GRID pattern helper (local Doc 08 grid math)."""
-    if style not in ("RULED", "DOT_GRID", "ISO_GRID"):
+def _paint_pattern(
+    ctx: cairo.Context,
+    style: str,
+    rect: tuple[float, float, float, float],
+    spacing: float = 32.0,
+) -> None:
+    """RULED / SQUARE_GRID helper, spacing-aware (round-9).
+
+    ``DOT_GRID`` / ``ISO_GRID`` were removed from the Doc 03 enum; documents
+    that still carry them are normalised to ``BLANK`` by ``DocumentStore`` on
+    load, so they never reach this function.
+    """
+    step = max(float(spacing), 1.0)
+    if style not in ("RULED", "SQUARE_GRID"):
         return
     x0, y0, x1, y1 = rect
     ctx.set_line_width(_GRID_LINE_W)
+    ctx.set_source_rgb(*_GRID_RGB)
+    ctx.new_path()
     if style == "RULED":
-        ctx.set_source_rgb(*_GRID_RGB)
-        ctx.new_path()
-        y = math.floor(y0 / _GRID_SPACING) * _GRID_SPACING
+        y = math.floor(y0 / step) * step
         while y <= y1:
             ctx.move_to(x0, y)
             ctx.line_to(x1, y)
-            y += _GRID_SPACING
-        ctx.stroke()
-    elif style == "DOT_GRID":
-        ctx.set_source_rgb(*_DOT_RGB)
-        ctx.new_path()
-        gx = math.floor(x0 / _GRID_SPACING) * _GRID_SPACING
-        while gx <= x1:
-            gy = math.floor(y0 / _GRID_SPACING) * _GRID_SPACING
-            while gy <= y1:
-                ctx.arc(gx, gy, _DOT_RADIUS, 0.0, math.tau)
-                gy += _GRID_SPACING
-            gx += _GRID_SPACING
-        ctx.fill()
-    else:  # ISO_GRID — three families at 0°, ±60° ⇒ equilateral triangles.
-        ctx.set_source_rgb(*_GRID_RGB)
-        ctx.new_path()
-        for slope in (0.0, math.sqrt(3.0), -math.sqrt(3.0)):
-            step = _GRID_SPACING * math.sqrt(1.0 + slope * slope)
-            corners = [y - slope * x for x in (x0, x1) for y in (y0, y1)]
-            b = math.floor(min(corners) / step) * step
-            while b <= max(corners):
-                ctx.move_to(x0, slope * x0 + b)
-                ctx.line_to(x1, slope * x1 + b)
-                b += step
-        ctx.stroke()
+            y += step
+    else:  # SQUARE_GRID — both families ⇒ closed cells.
+        y = math.floor(y0 / step) * step
+        while y <= y1:
+            ctx.move_to(x0, y)
+            ctx.line_to(x1, y)
+            y += step
+        x = math.floor(x0 / step) * step
+        while x <= x1:
+            ctx.move_to(x, y0)
+            ctx.line_to(x, y1)
+            x += step
+    ctx.stroke()
 
 
 def _draw_background(ctx: cairo.Context, artboard: Artboard, w: float, h: float) -> None:
@@ -244,7 +244,12 @@ def _draw_background(ctx: cairo.Context, artboard: Artboard, w: float, h: float)
     _set_color(ctx, artboard.background_color, 1.0)
     ctx.rectangle(0.0, 0.0, float(w), float(h))
     ctx.fill()
-    _paint_pattern(ctx, artboard.background_style, (0.0, 0.0, float(w), float(h)))
+    _paint_pattern(
+        ctx,
+        artboard.background_style,
+        (0.0, 0.0, float(w), float(h)),
+        getattr(artboard, "background_spacing", _GRID_SPACING),
+    )
 
 
 def _intersects(
@@ -296,42 +301,15 @@ def _draw_shape(ctx: cairo.Context, node: CanvasNode) -> None:
         bx0, bx1 = bx1, bx0
     if by1 < by0:
         by0, by1 = by1, by0
+    box = (bx0, by0, bx1, by1)
+    # Round-9 issues 04/05/06 — shared with the raster/thumbnail exporters so
+    # the vector output cannot drift (fill, rotated PATH, TABLE grid).
+    apply_fill(ctx, style, shape, box, node.geometry.pts, node.geometry.graph_config)
     _set_color(ctx, style.color, style.opacity)
     ctx.set_line_width(max(0.5, float(style.stroke_width)))
     ctx.set_line_join(cairo.LINE_JOIN_ROUND)
     ctx.new_path()
-    if shape == "CIRCLE":
-        cx, cy = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
-        rx, ry = max(1e-3, (bx1 - bx0) / 2.0), max(1e-3, (by1 - by0) / 2.0)
-        k = 0.5522847498  # circle ⇄ cubic κ
-        ctx.move_to(cx + rx, cy)
-        ctx.curve_to(cx + rx, cy + ry * k, cx + rx * k, cy + ry, cx, cy + ry)
-        ctx.curve_to(cx - rx * k, cy + ry, cx - rx, cy + ry * k, cx - rx, cy)
-        ctx.curve_to(cx - rx, cy - ry * k, cx - rx * k, cy - ry, cx, cy - ry)
-        ctx.curve_to(cx + rx * k, cy - ry, cx + rx, cy - ry * k, cx + rx, cy)
-    elif shape == "TRIANGLE":
-        ctx.move_to((bx0 + bx1) / 2.0, by0)
-        ctx.line_to(bx1, by1)
-        ctx.line_to(bx0, by1)
-        ctx.close_path()
-    elif shape == "ARROW":
-        pts = node.geometry.pts
-        if len(pts) >= 2:
-            ax, ay = float(pts[0][0]), float(pts[0][1])
-            bx, by = float(pts[-1][0]), float(pts[-1][1])
-        else:
-            ax, ay = bx0, (by0 + by1) / 2.0
-            bx, by = bx1, (by0 + by1) / 2.0
-        ctx.move_to(ax, ay)
-        ctx.line_to(bx, by)
-        ang = math.atan2(by - ay, bx - ax)
-        head = max(12.0, float(style.stroke_width) * 4.0)
-        ctx.move_to(bx, by)
-        ctx.line_to(bx - head * math.cos(ang - 0.4), by - head * math.sin(ang - 0.4))
-        ctx.move_to(bx, by)
-        ctx.line_to(bx - head * math.cos(ang + 0.4), by - head * math.sin(ang + 0.4))
-    else:  # RECT and unknown types fall back to the bbox rectangle.
-        ctx.rectangle(bx0, by0, bx1 - bx0, by1 - by0)
+    trace_shape(ctx, node, box, shape)
     ctx.stroke()
 
 

@@ -43,16 +43,24 @@ import 'package:mobile_app/features/tools/tool_palette_dock.dart';
 
 /// Node `kind` for [tool] under `ELEMENT_COMMIT/ADD_SHAPE` (Doc 03 kind
 /// enum: `LINE` for the line tool, `SHAPE` for every geometric shape).
+///
+/// Round-9 issue 06 — the table tool is a `SHAPE` too: `shape_type: "TABLE"`
+/// plus its grid in `graph_config` (see [shapeTypeForTool]).
 String shapeKindForTool(StudioTool tool) =>
     tool == StudioTool.line ? 'LINE' : 'SHAPE';
 
 /// `geometry.shape_type` for [tool]; `null` for the line tool (the Doc 03
 /// `shape_type` enum has no `LINE` value) and for non-shape tools.
+///
+/// The table's `pts` are only its two bbox corners (the grid is config-driven),
+/// which is the same layout RECT uses, so a table selection/resize behaves like
+/// a rectangle.
 String? shapeTypeForTool(StudioTool tool) => switch (tool) {
       StudioTool.rect => 'RECT',
       StudioTool.circle => 'CIRCLE',
       StudioTool.triangle => 'TRIANGLE',
       StudioTool.arrow => 'ARROW',
+      StudioTool.table => 'TABLE',
       _ => null,
     };
 
@@ -95,7 +103,9 @@ List<Offset> shapePreviewPoints(
 ) {
   final Rect rect = Rect.fromPoints(start, end);
   return switch (tool) {
-    StudioTool.rect => <Offset>[
+    // Round-9 issue 06 — a table drag previews its outer rectangle, exactly
+    // like a RECT (the grid appears once it is committed).
+    StudioTool.rect || StudioTool.table => <Offset>[
         rect.topLeft,
         rect.topRight,
         rect.bottomRight,

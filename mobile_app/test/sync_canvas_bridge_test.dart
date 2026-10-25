@@ -218,7 +218,7 @@ void main() {
     final CanvasDocumentModel doc = buildNewCanvasDocument(
       title: title,
       preset: 'LETTER',
-      background: 'DOT_GRID',
+      background: 'SQUARE_GRID',
       canvasId: id,
       now: now,
     );

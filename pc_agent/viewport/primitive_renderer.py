@@ -25,6 +25,14 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from pc_agent.viewport.shape_fill import shape_is_filled
+from pc_agent.viewport.vector_geometry import (
+    outline_segments,
+    points_of,
+    polyline_segments,
+    rect_to_triangles,
+    table_geometry,
+    triangulate,
+)
 
 if TYPE_CHECKING:  # Doc 09/10/06 contract types only — never imported at runtime
     from pc_agent.engine.document_store import Artboard
@@ -39,11 +47,7 @@ logger = logging.getLogger(__name__)
 
 ZOOM_MIN = 0.05
 ZOOM_MAX = 20.0
-RULED_SPACING = 32.0            # RULED: line every 32 world units
-GRID_SPACING = 24.0             # DOT_GRID / ISO_GRID lattice spacing
-DOT_RADIUS = 0.45 * GRID_SPACING  # ≈ 10.8 world units
-ISO_SQRT3 = math.sqrt(3.0)      # tan(60°) — line families at ±60°
-ISO_PERIOD = 2.0 * GRID_SPACING  # projection period ⇒ 24 u perpendicular spacing
+RULED_SPACING = 32.0            # default rule gap / square side (round-9)
 
 GLYPH_CHARS = "0123456789-+."
 GLYPH_CELL_W, GLYPH_CELL_H = 16, 32
@@ -64,7 +68,7 @@ TICK_FRACTION = 0.35            # tick length = 0.35·grid_step
 LABEL_HEIGHT_FRACTION = 0.30    # glyph label height = 0.3·grid_step (world units)
 MAX_GRAPH_TICKS = 4096          # degenerate-config guard for huge ranges
 
-_PATTERN_IDS = {"BLANK": 0, "RULED": 1, "DOT_GRID": 2, "ISO_GRID": 3}
+_PATTERN_IDS = {"BLANK": 0, "RULED": 1, "SQUARE_GRID": 2}
 _PAGE_BORDER_COLOR = (0.62, 0.63, 0.66, 1.0)
 _SHADOW_COLOR = (0.0, 0.0, 0.0, 0.35)
 _GL_SCISSOR_TEST = 0x0C11       # GL_SCISSOR_TEST — enable_direct takes raw enums
@@ -140,48 +144,53 @@ def _smoothstep(edge0: float, edge1: float, value: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
-def ruled_line_distance(world_y: float) -> float:
-    """Distance to the nearest RULED line (world_y ≡ 0 mod 32)."""
+def ruled_line_distance(world_y: float, spacing: float = RULED_SPACING) -> float:
+    """Distance to the nearest rule for ``spacing`` (round-9: configurable)."""
+    step = max(float(spacing), 1.0)
     y = float(world_y)
-    return abs(y - RULED_SPACING * math.floor(y / RULED_SPACING + 0.5))
+    return abs(y - step * math.floor(y / step + 0.5))
 
 
-def ruled_intensity(world_y: float, line_half: float = 0.5, aa: float = 0.25) -> float:
+def ruled_intensity(
+    world_y: float,
+    line_half: float = 0.5,
+    aa: float = 0.25,
+    spacing: float = RULED_SPACING,
+) -> float:
     """0…1 RULED ink coverage (1 ⇒ line fires at this y)."""
-    return 1.0 - _smoothstep(line_half - aa, line_half + aa, ruled_line_distance(world_y))
+    return 1.0 - _smoothstep(
+        line_half - aa, line_half + aa, ruled_line_distance(world_y, spacing)
+    )
 
 
-def dot_offset(world_x: float, world_y: float) -> tuple[float, float]:
-    """Signed offset to the nearest DOT_GRID lattice point (24i, 24j)."""
-    dx = float(world_x) - GRID_SPACING * math.floor(float(world_x) / GRID_SPACING + 0.5)
-    dy = float(world_y) - GRID_SPACING * math.floor(float(world_y) / GRID_SPACING + 0.5)
-    return (dx, dy)
+def square_line_distance(
+    world_x: float, world_y: float, spacing: float = RULED_SPACING
+) -> float:
+    """Distance to the nearer of the two SQUARE_GRID rule families.
+
+    Round-9 replaced DOT_GRID / ISO_GRID with SQUARE_GRID: an axis-aligned
+    lattice of `spacing`-sided cells, so a pixel is inked when it sits on
+    either the horizontal or the vertical rule.
+    """
+    return min(
+        ruled_line_distance(world_x, spacing),
+        ruled_line_distance(world_y, spacing),
+    )
 
 
-def dot_distance(world_x: float, world_y: float) -> float:
-    """Euclidean distance from (x, y) to the nearest (24i, 24j) lattice point."""
-    dx, dy = dot_offset(world_x, world_y)
-    return math.hypot(dx, dy)
-
-
-def dot_intensity(world_x: float, world_y: float, aa: float = 0.25) -> float:
-    """0…1 DOT_GRID ink coverage — 1 at lattice points, 0.5 at distance == DOT_RADIUS."""
-    distance = dot_distance(world_x, world_y)
-    return 1.0 - _smoothstep(DOT_RADIUS - aa, DOT_RADIUS + aa, distance)
-
-
-def iso_family_distance(projection: float) -> float:
-    """Signed perpendicular distance of a ±60° projection to the nearest family line."""
-    wrapped = (float(projection) + GRID_SPACING) % ISO_PERIOD - GRID_SPACING
-    return wrapped * 0.5
-
-
-def iso_line_distance(world_x: float, world_y: float) -> float:
-    """Distance to the nearest ISO_GRID line (either ±60° family, 24 u spacing)."""
-    x, y = float(world_x), float(world_y)
-    d1 = abs(iso_family_distance(ISO_SQRT3 * x - y))
-    d2 = abs(iso_family_distance(ISO_SQRT3 * x + y))
-    return d1 if d1 < d2 else d2
+def square_intensity(
+    world_x: float,
+    world_y: float,
+    line_half: float = 0.5,
+    aa: float = 0.25,
+    spacing: float = RULED_SPACING,
+) -> float:
+    """0…1 SQUARE_GRID ink coverage, mirroring ``grid.frag`` branch 2."""
+    return 1.0 - _smoothstep(
+        line_half - aa,
+        line_half + aa,
+        square_line_distance(world_x, world_y, spacing),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +730,9 @@ class PrimitiveRenderer:
         self._assets_root: Path | None = None
         self._content_bounds: dict[str, float] = {}
         self._image_cache: dict[str, moderngl.Texture] = {}
+        #: Round-9 issue 07b — asset keys already warned about, so the
+        #: deliberately uncached placeholder miss logs once, not once a frame.
+        self._missing_reported: set[str] = set()
         self._glyph_tex: moderngl.Texture | None = None
         self._placeholder_tex: moderngl.Texture | None = None
         self.applied_scissor: tuple[int, int, int, int] | None = None
@@ -811,6 +823,7 @@ class PrimitiveRenderer:
         pattern = _PATTERN_IDS.get(str(getattr(artboard, "background_style", "BLANK")), 0)
         bg = parse_color(getattr(artboard, "background_color", "#FFFFFF"), 1.0)
         line_color = (bg[0] * 0.55, bg[1] * 0.55, bg[2] * 0.55)
+        spacing = float(getattr(artboard, "background_spacing", 32.0) or 32.0)
         bounded = (
             not bool(getattr(artboard, "is_infinite", False))
             and (getattr(artboard, "width", None) or 0) > 0
@@ -820,6 +833,7 @@ class PrimitiveRenderer:
         self._set(program, "u_camera", camera)
         self._set(program, "u_viewport", (float(view_w), float(view_h)))
         self._set(program, "u_pattern", int(pattern))
+        self._set(program, "u_spacing", float(spacing))
         self._set(program, "u_bgColor", bg[:3])
         self._set(program, "u_lineColor", line_color)
         if bounded:
@@ -1015,19 +1029,27 @@ class PrimitiveRenderer:
         # interior must stay empty unless the style explicitly asks for a
         # fill (stroke_width == 0). See pc_agent/viewport/shape_fill.py.
         filled = shape_is_filled(stroke_width)
+        # Round-9 issue 04: an explicit `style.fill` paints the interior
+        # whatever the outline width is — that is the whole point of the
+        # paint bucket (keep the outline, add a colour inside).
+        fill_rgba = _fill_rgba(style)
         if shape_type == "RECT":
             corners = rect_corners(pts, bbox)
             if corners is None:
                 return
             if filled:
-                _push_tri(fills, rect_triangles(corners), rgba)
+                _push_tri(fills, rect_triangles(corners), fill_rgba or rgba)
+            elif fill_rgba:
+                _push_tri(fills, rect_triangles(corners), fill_rgba)
             _push_line_tris(lines, outline_quads(*corners, outline_hw), rgba)
         elif shape_type == "CIRCLE":
             cx, cy, rx, ry = _circle_frame(pts, bbox)
             if rx <= 0 or ry <= 0:
                 return
             if filled:
-                _push_tri(fills, circle_triangles(cx, cy, rx, ry), rgba)
+                _push_tri(fills, circle_triangles(cx, cy, rx, ry), fill_rgba or rgba)
+            elif fill_rgba:
+                _push_tri(fills, circle_triangles(cx, cy, rx, ry), fill_rgba)
             _push_line_tris(
                 lines,
                 polyline_quads(circle_rim_points(cx, cy, rx, ry), outline_hw),
@@ -1038,7 +1060,9 @@ class PrimitiveRenderer:
             if triangle is None:
                 return
             if filled:
-                _push_tri(fills, triangle, rgba)
+                _push_tri(fills, triangle, fill_rgba or rgba)
+            elif fill_rgba:
+                _push_tri(fills, triangle, fill_rgba)
             outline = polyline_quads(
                 [(triangle[0], triangle[1]), (triangle[2], triangle[3]),
                  (triangle[4], triangle[5])],
@@ -1055,7 +1079,71 @@ class PrimitiveRenderer:
                 return
             for ax, ay, bx, by in segments:
                 _push_line_tris(lines, quad_triangles(line_quad(ax, ay, bx, by, barb_hw)), rgba)
+        elif shape_type == "PATH":
+            # Round-9 issue 05/04 — a closed polygon: a rotated shape, or a
+            # pen loop that the fill tool closed.
+            self._tessellate_path(pts, bbox, style, fills, lines, outline_hw,
+                                  filled, fill_rgba, rgba)
+        elif shape_type == "TABLE":
+            # Round-9 issue 06 — grid + header bands from graph_config.
+            self._tessellate_table(
+                bbox,
+                getattr(geometry, "graph_config", None),
+                style,
+                fills,
+                lines,
+                outline_hw,
+                fill_rgba,
+                rgba,
+            )
         # Unknown shape_type (incl. graph types on SHAPE nodes) — skipped per Doc 08 §4.
+
+    def _tessellate_path(
+        self,
+        pts: Sequence[Sequence[float]],
+        bbox: Sequence[float],
+        style: object,
+        fills: list[float],
+        lines: list[float],
+        outline_hw: float,
+        filled: bool,
+        fill_rgba: tuple[float, ...] | None,
+        rgba: tuple[float, ...],
+    ) -> None:
+        """PATH — a closed polygon, filled with `fill` when the node has one."""
+        polygon = points_of(pts)
+        if len(polygon) < 3:
+            # A 2-point PATH is a degenerate polygon: render it as the open
+            # segment it actually is rather than dropping the node.
+            for ax, ay, bx, by in polyline_segments(points_of(pts)):
+                _push_line_tris(lines, quad_triangles(line_quad(ax, ay, bx, by, outline_hw)), rgba)
+            return
+        interior = fill_rgba or (rgba if filled else None)
+        if interior is not None:
+            _push_tri(fills, triangulate(polygon), interior)
+        for ax, ay, bx, by in outline_segments(polygon):
+            _push_line_tris(lines, quad_triangles(line_quad(ax, ay, bx, by, outline_hw)), rgba)
+
+    def _tessellate_table(
+        self,
+        bbox: Sequence[float],
+        config: object,
+        style: object,
+        fills: list[float],
+        lines: list[float],
+        outline_hw: float,
+        fill_rgba: tuple[float, ...] | None,
+        rgba: tuple[float, ...],
+    ) -> None:
+        """TABLE — header bands (filled) + every grid segment (stroked)."""
+        geo = table_geometry(bbox, config)
+        if not geo.is_valid:
+            return
+        if fill_rgba is not None:
+            for band in geo.header_rects:
+                _push_tri(fills, rect_to_triangles(band), fill_rgba)
+        for ax, ay, bx, by in geo.lines:
+            _push_line_tris(lines, quad_triangles(line_quad(ax, ay, bx, by, outline_hw)), rgba)
 
     # ------------------------------------------------------------------
     # Phase 5 — graph axes
@@ -1179,22 +1267,59 @@ class PrimitiveRenderer:
             if self._assets_root is not None and path.is_file():
                 with Image.open(path) as opened:
                     image = opened.convert("RGBA")
-            else:
+            elif key not in self._missing_reported:
+                # Warn once per asset: the texture is deliberately NOT cached
+                # (see below), so this would otherwise repeat every frame.
+                self._missing_reported.add(key)
                 logger.warning(
                     "missing image asset %r (resolved %s) — using 1×1 magenta placeholder",
                     asset_ref,
                     path,
                 )
         except Exception:
-            logger.warning(
-                "failed to decode image asset %s — using placeholder", path, exc_info=True
-            )
+            if key not in self._missing_reported:
+                self._missing_reported.add(key)
+                logger.warning(
+                    "failed to decode image asset %s — using placeholder", path, exc_info=True
+                )
         if image is None:
-            image = placeholder_image()
+            # Round-9 issue 07b — a placeholder must NEVER be cached under the
+            # asset key. An IMAGE node is usually committed (and therefore
+            # rendered) BEFORE its ASSET_CHUNK/DONE bytes land, so caching the
+            # miss pinned the magenta 1×1 texel over the whole quad for the rest
+            # of the session — the "filled block instead of the image" report.
+            return self._placeholder()
+        self._missing_reported.discard(key)
         texture = self._ctx.texture(image.size, 4, image.tobytes())
         texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
         self._image_cache[key] = texture
         return texture
+
+    def invalidate_image(self, asset_ref: object) -> bool:
+        """Drop a cached texture so the next frame re-reads the asset file.
+
+        Round-9 issue 07b: ASSET_DONE can arrive after the node was already
+        drawn (placeholder), and a re-used filename would otherwise keep the
+        old bitmap. Returns ``True`` when something was evicted.
+        """
+        if not asset_ref:
+            return False
+        path = resolve_asset_path(self._assets_root, str(asset_ref))
+        texture = self._image_cache.pop(str(path), None)
+        if texture is None:
+            return False
+        try:
+            texture.release()
+        except Exception:  # pragma: no cover - defensive
+            logger.debug("evicted image texture release failed", exc_info=True)
+        return True
+
+    def invalidate_images(self) -> bool:
+        """Evict every cached image texture (asset root swap / mass upload)."""
+        if not self._image_cache:
+            return False
+        self._release_textures()
+        return True
 
     def _placeholder(self) -> moderngl.Texture:
         if self._placeholder_tex is None:
@@ -1210,6 +1335,7 @@ class PrimitiveRenderer:
             except Exception:  # pragma: no cover - defensive
                 logger.debug("image texture release failed", exc_info=True)
         self._image_cache.clear()
+        self._missing_reported.clear()
         if self._placeholder_tex is not None:
             try:
                 self._placeholder_tex.release()
@@ -1262,6 +1388,25 @@ def _push_tri_data(
 ) -> None:
     for tri in tris:
         _push_tri(dest, tri, rgba)
+
+
+def _fill_rgba(style: object) -> tuple[float, ...] | None:
+    """Round-9 issue 04 — the interior colour, or ``None`` when unfilled.
+
+    Lives next to the tessellators because all four of them (viewport + three
+    exporters) must resolve the same two spellings identically: an explicit
+    ``style.fill``, and the legacy ``stroke_width == 0`` which means "no
+    outline, therefore solid in ``color``" (``shape_fill.shape_is_filled``).
+    A malformed ``fill`` is ignored rather than painted black.
+    """
+    colour = getattr(style, "fill", None)
+    if not isinstance(colour, str) or len(colour) != 7 or colour[0] != "#":
+        return None
+    try:
+        int(colour[1:], 16)
+    except ValueError:
+        return None
+    return parse_color(colour, float(getattr(style, "opacity", 1.0) or 1.0))
 
 
 def _circle_frame(

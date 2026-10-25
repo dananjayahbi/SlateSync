@@ -11,7 +11,6 @@ library;
 
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
@@ -114,6 +113,7 @@ CanvasDocumentModel buildNewCanvasDocument({
   required String title,
   required String preset,
   required String background,
+  double backgroundSpacing = kDefaultBackgroundSpacing,
   String? canvasId,
   int? now,
 }) {
@@ -129,7 +129,8 @@ CanvasDocumentModel buildNewCanvasDocument({
       width: dims.w,
       height: dims.h,
       isInfinite: dims.infinite,
-      backgroundStyle: background,
+      backgroundStyle: normalizeBackgroundStyle(background),
+      backgroundSpacing: normalizeBackgroundSpacing(backgroundSpacing),
       backgroundColor: '#FFFFFF',
     ),
     contentBounds: <String, double>{
@@ -146,19 +147,23 @@ CanvasDocumentModel buildNewCanvasDocument({
 // Mini background previews (Doc 26 §5.5)
 // ---------------------------------------------------------------------------
 
-/// Mini painter for the four background templates:
-/// `BLANK / RULED / DOT_GRID / ISO_GRID` (template §3).
+/// Mini painter for the three background templates (round-9):
+/// `BLANK / RULED / SQUARE_GRID`.
 class BackgroundPreviewPainter extends CustomPainter {
-  BackgroundPreviewPainter(this.style);
+  BackgroundPreviewPainter(this.style, {this.spacing = kDefaultBackgroundSpacing});
 
   final String style;
+
+  /// Preview gap; larger values draw fewer lines so the mini card stays legible.
+  final double spacing;
 
   static const Color _line = Color(0xFF8E8E8E);
 
   @override
   void paint(Canvas canvas, Size size) {
     canvas.drawRect(Offset.zero & size, Paint()..color = Colors.white);
-    if (style == 'BLANK') {
+    final String normalized = normalizeBackgroundStyle(style);
+    if (normalized == kBackgroundBlank) {
       return;
     }
     canvas.save();
@@ -166,49 +171,27 @@ class BackgroundPreviewPainter extends CustomPainter {
     final Paint line = Paint()
       ..color = _line
       ..strokeWidth = 1;
-    switch (style) {
-      case 'RULED':
-        final double step = size.height / 6;
-        for (double y = step; y < size.height; y += step) {
-          canvas.drawLine(Offset(0, y), Offset(size.width, y), line);
-        }
-      case 'DOT_GRID':
-        final Paint dot = Paint()..color = _line;
-        const double step = 9;
-        for (double x = step / 2; x < size.width; x += step) {
-          for (double y = step / 2; y < size.height; y += step) {
-            canvas.drawCircle(Offset(x, y), 1.2, dot);
-          }
-        }
-      case 'ISO_GRID':
-        final double cx = size.width / 2;
-        final double cy = size.height / 2;
-        final double diag = size.width + size.height;
-        for (final double angle in <double>[
-          -math.pi / 6,
-          math.pi / 6,
-          math.pi / 2,
-        ]) {
-          final double ux = math.cos(angle);
-          final double uy = math.sin(angle);
-          final double px = -uy;
-          final double py = ux;
-          for (double k = -diag; k <= diag; k += 10) {
-            final double ox = cx + px * k;
-            final double oy = cy + py * k;
-            canvas.drawLine(
-              Offset(ox - ux * diag, oy - uy * diag),
-              Offset(ox + ux * diag, oy + uy * diag),
-              line,
-            );
-          }
-        }
+    // Scale the world spacing down so the preview keeps roughly 4-12 cells.
+    final double step = (size.height * spacing.clamp(1, 2000) / 192)
+        .clamp(size.height / 12, size.height / 4);
+    if (normalized == kBackgroundRuled) {
+      for (double y = step; y < size.height; y += step) {
+        canvas.drawLine(Offset(0, y), Offset(size.width, y), line);
+      }
+    } else if (normalized == kBackgroundSquareGrid) {
+      for (double y = step; y < size.height; y += step) {
+        canvas.drawLine(Offset(0, y), Offset(size.width, y), line);
+      }
+      for (double x = step; x < size.width; x += step) {
+        canvas.drawLine(Offset(x, 0), Offset(x, size.height), line);
+      }
     }
     canvas.restore();
   }
 
   @override
-  bool shouldRepaint(BackgroundPreviewPainter old) => old.style != style;
+  bool shouldRepaint(BackgroundPreviewPainter old) =>
+      old.style != style || old.spacing != spacing;
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,15 +1058,11 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
     'LETTER',
     'INFINITE',
   ];
-  static const List<String> _backgrounds = <String>[
-    'BLANK',
-    'RULED',
-    'DOT_GRID',
-    'ISO_GRID',
-  ];
+  static const List<String> _backgrounds = kBackgroundStyles;
 
   String _preset = 'A4';
-  String _background = 'BLANK';
+  String _background = kBackgroundBlank;
+  double _spacing = kDefaultBackgroundSpacing;
   final TextEditingController _title = TextEditingController(text: 'Untitled');
   bool _busy = false;
   String? _error;
@@ -1100,6 +1079,7 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
       title: title.isEmpty ? 'Untitled' : title,
       preset: _preset,
       background: _background,
+      backgroundSpacing: _spacing,
     );
     setState(() {
       _busy = true;
@@ -1171,6 +1151,28 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
                   for (final String bg in _backgrounds) _backgroundCard(bg),
                 ],
               ),
+              if (_background != kBackgroundBlank) ...<Widget>[
+                const SizedBox(height: 16),
+                Text(
+                  _background == kBackgroundRuled
+                      ? 'Rule spacing'
+                      : 'Square size',
+                  style: const TextStyle(
+                    color: StudioTheme.text,
+                    fontSize: StudioTheme.captionSize,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: <Widget>[
+                    for (final double preset in kBackgroundSpacingPresets)
+                      _spacingChip(preset),
+                  ],
+                ),
+              ],
               if (_error != null)
                 Padding(
                   key: const Key('new_canvas_error'),
@@ -1270,11 +1272,16 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
             SizedBox(
               width: 78,
               height: 56,
-              child: CustomPaint(painter: BackgroundPreviewPainter(background)),
+              child: CustomPaint(
+                painter: BackgroundPreviewPainter(
+                  background,
+                  spacing: _spacing,
+                ),
+              ),
             ),
             const SizedBox(height: 4),
             Text(
-              background,
+              backgroundLabel(background),
               style: TextStyle(
                 fontSize: 10,
                 fontWeight: selected ? FontWeight.w700 : FontWeight.w400,
@@ -1284,6 +1291,38 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  Widget _spacingChip(double preset) {
+    final bool selected = preset == _spacing;
+    return InkWell(
+      key: Key('new_spacing_${preset.toInt()}'),
+      borderRadius: BorderRadius.circular(StudioTheme.radiusSmall),
+      onTap: () => setState(() => _spacing = preset),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: selected ? StudioTheme.accent.withValues(alpha: 0.18) : null,
+          borderRadius: BorderRadius.circular(StudioTheme.radiusSmall),
+          border: Border.all(
+            color: selected
+                ? StudioTheme.accent
+                : StudioTheme.text.withValues(alpha: 0.2),
+            width: selected ? 2 : 1,
+          ),
+        ),
+        child: Text(
+          '${preset.toInt()} px',
+          style: TextStyle(
+            fontSize: StudioTheme.bodySize,
+            fontWeight: selected ? FontWeight.w700 : FontWeight.w400,
+            color: selected
+                ? StudioTheme.accent
+                : StudioTheme.text.withValues(alpha: 0.8),
+          ),
         ),
       ),
     );

@@ -12,20 +12,25 @@
     "updated_at": {"type": "integer", "description": "unix seconds"},
     "artboard": {"$ref": "#/$defs/Artboard"},
     "content_bounds": {"$ref": "#/$defs/ContentBounds"},
-    "elements": {"type": "array", "items": {"$ref": "#/$defs/Element"}}
+    "elements": {"type": "array", "items": {"$ref": "#/$defs/Element"}},
+    "groups": {"type": "object",
+      "description": "Round-9 issue 05: OPTIONAL lock-group map, group_id -> [node_id, ...]. A locked group behaves as ONE object in the selector until unlocked. Omitted when empty so pre-round-9 documents round-trip byte-identically. NodeStyle is frozen, so a per-node flag cannot express this and the relation is document-level anyway (a node belongs to at most one group).",
+      "additionalProperties": {"type": "array", "items": {"type": "string"}, "minItems": 1}}
   },
   "$defs": {
     "Artboard": {
       "description": "Page frame in 300-DPI world units; top-left origin (0,0) -> (w,h); INFINITE keeps width/height null.",
       "type": "object",
-      "required": ["preset", "width", "height", "is_infinite", "background_style", "background_color"],
+      "required": ["preset", "width", "height", "is_infinite", "background_style", "background_color", "background_spacing"],
       "properties": {
         "preset": {"enum": ["A5", "A4", "LETTER", "INFINITE"]},
         "width": {"type": ["number", "null"], "description": "A5 1748.0 | A4 2480.0 | LETTER 2550.0 | null if INFINITE"},
         "height": {"type": ["number", "null"], "description": "A5 2480.0 | A4 3508.0 | LETTER 3300.0 | null if INFINITE"},
         "is_infinite": {"type": "boolean"},
-        "background_style": {"enum": ["BLANK", "RULED", "DOT_GRID", "ISO_GRID"]},
-        "background_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"}
+        "background_style": {"enum": ["BLANK", "RULED", "SQUARE_GRID"]},
+        "background_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
+        "background_spacing": {"type": "number", "minimum": 1,
+          "description": "World-unit gap between rules (RULED) or side length of one cell (SQUARE_GRID); ignored for BLANK. Default 32.0 (round-9: replaces DOT_GRID/ISO_GRID, which load as BLANK)"}
       }
     },
     "ContentBounds": {
@@ -43,7 +48,9 @@
         "color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
         "stroke_width": {"type": "number", "minimum": 0},
         "opacity": {"type": "number", "minimum": 0, "maximum": 1},
-        "blend_mode": {"enum": ["SRC_OVER", "MULTIPLY"]}
+        "blend_mode": {"enum": ["SRC_OVER", "MULTIPLY"]},
+        "fill": {"type": ["string", "null"], "pattern": "^#[0-9A-Fa-f]{6}$",
+          "description": "Round-9 issue 04: OPTIONAL interior colour set by the fill tool. Omitted (never null) when the node has no fill, so pre-round-9 documents round-trip byte-identically. stroke_width == 0 remains the legacy spelling of 'solid in color'."}
       }
     },
     "NodeGeometry": {
@@ -53,13 +60,17 @@
       "properties": {
         "pts": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
                 "description": "world-space points/Bézier controls; empty for IMAGE elements"},
-        "shape_type": {"enum": ["RECT", "CIRCLE", "TRIANGLE", "ARROW", "CARTESIAN_2D", "NUMBER_LINE", null],
-                       "description": "set for SHAPE/GRAPH_AXES, else null"},
+        "shape_type": {"enum": ["RECT", "CIRCLE", "TRIANGLE", "ARROW", "CARTESIAN_2D", "NUMBER_LINE", "PATH", "TABLE", null],
+                       "description": "set for SHAPE/GRAPH_AXES, else null; PATH = closed polygon filled when stroke_width == 0 (round-9 region fill / rotated shapes), TABLE = grid described by graph_config (round-9)"},
         "graph_config": {"type": ["object", "null"],
           "properties": {"origin": {"type": "array", "items": {"type": "number"}},
                          "x_range": {"type": "array", "items": {"type": "number"}},
                          "y_range": {"type": "array", "items": {"type": "number"}},
-                         "grid_step": {"type": "number"}, "show_labels": {"type": "boolean"}}},
+                         "grid_step": {"type": "number"}, "show_labels": {"type": "boolean"},
+                         "rows": {"type": "integer", "minimum": 1, "description": "TABLE body rows, excluding the header row"},
+                         "cols": {"type": "integer", "minimum": 1, "description": "TABLE columns"},
+                         "header_row": {"type": "boolean", "description": "TABLE: first row is a header band"},
+                         "header_col": {"type": "boolean", "description": "TABLE: first column is a header band"}}},
         "asset_ref": {"type": ["string", "null"], "pattern": "^assets/",
                       "description": "ZIP entry path of the attached file, e.g. assets/img_9921.png"}
       }

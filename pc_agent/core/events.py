@@ -44,6 +44,11 @@ MIRROR_CHANGED = "MIRROR_CHANGED"
 #: untouched so payload-owning handlers are unaffected); the hub uses it to
 #: attribute canvas opens / mutations to a device in the Settings roster.
 RPC_ORIGIN = "RPC_ORIGIN"
+#: Round 9 (issue 07) — an ``ASSET_DONE`` upload was committed to disk.
+#: Payload: ``{canvas_id: str, filename: str}``. Viewports drop their cached
+#: IMAGE textures and repaint so a node drawn BEFORE its bytes landed stops
+#: showing the placeholder. Handlers must tolerate unknown keys (``**extra``).
+ASSET_UPLOADED = "ASSET_UPLOADED"
 
 
 class EventBus:

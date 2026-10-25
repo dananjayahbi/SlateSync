@@ -92,6 +92,7 @@ void main() {
           'is_infinite',
           'background_style',
           'background_color',
+          'background_spacing',
         ]),
       );
       expect(json.containsKey('isInfinite'), isFalse);
@@ -105,8 +106,29 @@ void main() {
       expect(back.isInfinite, isFalse);
     });
 
+    test('retired DOT_GRID / ISO_GRID load as BLANK (round-9 narrowing)', () {
+      final Map<String, dynamic> base = <String, dynamic>{
+        'preset': 'A4',
+        'width': 2480.0,
+        'height': 3508.0,
+        'is_infinite': false,
+        'background_color': '#FFFFFF',
+        'background_spacing': 32.0,
+      };
+      for (final String retired in <String>['DOT_GRID', 'ISO_GRID', 'nonsense']) {
+        final Artboard back =
+            Artboard.fromJson(<String, dynamic>{...base, 'background_style': retired});
+        expect(back.backgroundStyle, kBackgroundBlank, reason: retired);
+      }
+      final Artboard noSpacing = Artboard.fromJson(<String, dynamic>{
+        ...base,
+        'background_style': 'SQUARE_GRID',
+      }..remove('background_spacing'));
+      expect(noSpacing.backgroundSpacing, kDefaultBackgroundSpacing);
+    });
+
     test('INFINITE roundtrips with null width/height and isInfinite true', () {
-      final infinite = Artboard.infinite(backgroundStyle: 'DOT_GRID');
+      final infinite = Artboard.infinite(backgroundStyle: kBackgroundSquareGrid);
       final json = infinite.toJson();
 
       expect(json['preset'], 'INFINITE');
@@ -281,6 +303,7 @@ void main() {
         'is_infinite': true,
         'background_style': 'BLANK',
         'background_color': '#FFFFFF',
+        'background_spacing': 32.0,
       });
 
       final back = CanvasDocumentModel.fromJson(json);

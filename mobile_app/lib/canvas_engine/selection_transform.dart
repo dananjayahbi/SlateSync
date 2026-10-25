@@ -160,6 +160,31 @@ Offset handlePosition(ResizeHandle handle, Rect bounds) => switch (handle) {
       ResizeHandle.bottomRight => bounds.bottomRight,
     };
 
+/// Rotates every point of [pts] by [angle] radians around [center].
+///
+/// Round-9 issue 05 — the selector rotates shapes in 15° steps. Rotating a
+/// point list (rather than keeping an angle field) matches how a rotated shape
+/// is stored: as a `PATH` polygon, because the Doc 03 bbox contract is
+/// axis-aligned and has nowhere to put a rotation.
+List<List<double>> rotatePointsAround(
+  List<List<double>> pts,
+  Offset center,
+  double angle,
+) {
+  final double cos = math.cos(angle);
+  final double sin = math.sin(angle);
+  return pts
+      .map(
+        (List<double> p) => p.length >= 2
+            ? <double>[
+                center.dx + (p[0] - center.dx) * cos - (p[1] - center.dy) * sin,
+                center.dy + (p[0] - center.dx) * sin + (p[1] - center.dy) * cos,
+              ]
+            : List<double>.of(p),
+      )
+      .toList(growable: false);
+}
+
 /// The rect produced by dragging [handle] to [to], with the opposite
 /// edge/corner pinned.
 Rect resizeRect(Rect bounds, ResizeHandle handle, Offset to) {

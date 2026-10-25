@@ -105,6 +105,12 @@ Future<Uint8List> renderDocThumbnail(
           );
         }
         break;
+      case 'TABLE':
+        // Round-9 issue 06 — a table's `pts` are just its two bbox corners, so
+        // the generic path would draw a diagonal. Approximate the grid instead
+        // (Doc 10/§10.3 allows thumbnails to approximate).
+        _drawTableThumb(canvas, node, map, paint);
+        break;
       default:
         _drawPath(canvas, pts, map, paint, node.geometry.shapeType);
     }
@@ -163,6 +169,67 @@ Color _hex(String hex, double opacity) {
       .clamp(0, (255 * opacity.clamp(0.0, 1.0)).round())
       .toInt();
   return Color(a << 24 | (argb & 0xFFFFFF));
+}
+
+/// Round-9 issue 06 — approximate a TABLE's grid in a thumbnail.
+///
+/// The generic path would draw a diagonal across the table (its `pts` are only
+/// the two bbox corners). Thumbnails may approximate (Doc 10 §10.3), so this
+/// draws the actual grid from `graph_config` with a light header tint.
+void _drawTableThumb(
+  ui.Canvas canvas,
+  CanvasNodeModel node,
+  ui.Offset Function(dynamic, dynamic) map,
+  ui.Paint paint,
+) {
+  final List<double> b = node.bbox;
+  if (b.length < 4) {
+    return;
+  }
+  final ui.Rect box = ui.Rect.fromPoints(
+    map(b[0], b[1]),
+    map(b[2], b[3]),
+  );
+  if (box.width <= 0 || box.height <= 0) {
+    return;
+  }
+  final Map<String, dynamic> cfg = node.geometry.graphConfig ?? const {};
+  final int rows = _thumbCount(cfg['rows'], 3, 1, 200);
+  final int cols = _thumbCount(cfg['cols'], 3, 1, 40);
+  if (cfg['header_row'] != false && rows >= 2) {
+    canvas.drawRect(
+      ui.Rect.fromLTRB(
+        box.left,
+        box.top,
+        box.right,
+        box.top + box.height / rows,
+      ),
+      ui.Paint()
+        ..color = paint.color.withValues(alpha: 0.14)
+        ..style = ui.PaintingStyle.fill,
+    );
+  }
+  for (int i = 0; i <= rows; i++) {
+    final double y = box.top + box.height * i / rows;
+    canvas.drawLine(ui.Offset(box.left, y), ui.Offset(box.right, y), paint);
+  }
+  for (int i = 0; i <= cols; i++) {
+    final double x = box.left + box.width * i / cols;
+    canvas.drawLine(ui.Offset(x, box.top), ui.Offset(x, box.bottom), paint);
+  }
+}
+
+int _thumbCount(Object? value, int fallback, int low, int high) {
+  if (value is num) {
+    return value.toInt().clamp(low, high).toInt();
+  }
+  if (value is String) {
+    final int? parsed = int.tryParse(value.trim());
+    if (parsed != null) {
+      return parsed.clamp(low, high).toInt();
+    }
+  }
+  return fallback;
 }
 
 void _drawPath(

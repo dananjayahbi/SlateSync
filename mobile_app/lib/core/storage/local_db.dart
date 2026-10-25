@@ -52,7 +52,7 @@ class CanvasRecord {
   /// Artboard preset key: `A5 | A4 | LETTER | INFINITE` (template §3).
   final String preset;
 
-  /// Background template: `BLANK | RULED | DOT_GRID | ISO_GRID`.
+  /// Background template: `BLANK | RULED | SQUARE_GRID`.
   final String background;
   final String thumbPath;
   final String filePath;

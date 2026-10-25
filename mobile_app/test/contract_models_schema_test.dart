@@ -52,8 +52,13 @@ final RegExp _snakeCase = RegExp(r'^[a-z][a-z0-9_]*$');
 final RegExp _hexColor = RegExp(r'^#[0-9A-Fa-f]{6}$');
 final RegExp _assetRef = RegExp(r'^assets/');
 
-/// Deep key-set equality: [actual] must emit exactly the keys declared in
-/// the schema node's `properties`, and every `required` key must be present.
+/// Key-set equality with OPTIONAL properties allowed to be omitted.
+///
+/// [actual] may only use keys declared in the schema node's `properties` (so a
+/// stray key is still a failure) and must carry every `required` key. Keys that
+/// are declared but NOT required are genuinely optional: round 9 added
+/// `fill` (NodeStyle) and `groups` (document root), and both are omitted when
+/// unset precisely so pre-round-9 documents round-trip byte-identically.
 void expectKeySet(
   Map<String, dynamic> actual,
   Map<String, dynamic> schemaNode,
@@ -61,10 +66,10 @@ void expectKeySet(
 ) {
   final Map<String, dynamic> props =
       Map<String, dynamic>.from(schemaNode['properties'] as Map? ?? const {});
-  expect(actual.keys.toSet(), props.keys.toSet(),
-      reason: '$label key set must equal schema properties '
+  expect(actual.keys.toSet().difference(props.keys.toSet()), isEmpty,
+      reason: '$label uses keys the schema does not declare '
           '(actual=${actual.keys.toList()..sort()} '
-          'expected=${props.keys.toList()..sort()})');
+          'declared=${props.keys.toList()..sort()})');
   final List<String> required =
       ((schemaNode['required'] as List?) ?? const []).cast<String>();
   for (final String key in required) {
@@ -204,7 +209,7 @@ void main() {
     expect(body['created_at'], isA<int>());
     expect(body['updated_at'], isA<int>());
     expect(body['elements'], isA<List<dynamic>>());
-    expect(rootProps.keys.toSet(), body.keys.toSet(),
+    expect(body.keys.toSet().difference(rootProps.keys.toSet()), isEmpty,
         reason: '$label root keys');
 
     // --- artboard ----------------------------------------------------------

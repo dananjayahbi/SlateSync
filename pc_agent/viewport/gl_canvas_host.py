@@ -29,8 +29,10 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import threading
 import time
 import tkinter as tk
+from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping
 
@@ -40,6 +42,7 @@ from PIL import Image, ImageTk
 from pc_agent.core.config_manager import AppConfig
 from pc_agent.core.events import (
     ARTBOARD_CHANGED,
+    ASSET_UPLOADED,
     CAMERA_DELTA,
     CANVAS_CLEARED,
     COMMITTED_NODE,
@@ -109,6 +112,13 @@ FALLBACK_MAX_W, FALLBACK_MAX_H = 1600, 900  # blit FBO ROI cap — Doc 06's FALL
 DEFAULT_COLOR = "#1E1E1E"  # NodeStyle.stroke default (template §4)
 DEFAULT_MOUNT_W, DEFAULT_MOUNT_H = 640, 480  # size used before <Configure> realizes
 _COMMIT_BUDGET = 64  # committed meshes tessellated per render (rest via redraw)
+#: Round-9 issue 09 — LIVE_POINT frames are stroke SAMPLES, not state: the
+#: latest-slot rule that is correct for CAMERA/LASER silently discarded every
+#: point but the last one whenever two frames arrived between pumps, so the
+#: mirror only got a dot until the pen lifted (when ADD_STROKE delivered the
+#: finished stroke). Points are queued instead, with a cap so a stalled main
+#: thread cannot grow the queue without bound.
+LIVE_POINT_QUEUE_CAP = 4096
 
 # Embedding strategy (issue 03/04 round 3): DEFAULT "blit" = pure-Tk offscreen
 # FBO → ImageTk blit (no foreign child windows); "setparent" = the legacy Doc 06
@@ -339,6 +349,11 @@ class GLCanvasHost:
 
         # Lock-free latest-frame slot: GIL-atomic attribute replace (Doc 06 §4).
         self._slot: LiveFrame | None = None
+        #: Round-9 issue 09 — ordered LIVE_POINT backlog (samples, never
+        #: coalesced). Appended under a short lock because the WS reader thread
+        #: and the Tk pump both touch it.
+        self._live_queue: deque[LiveFrame] = deque()
+        self._live_queue_lock = threading.Lock()
         self._drain_pending = False
         self._drain_after_id: str | None = None
         self._tick_pending = False
@@ -397,6 +412,7 @@ class GLCanvasHost:
             (COMMITTED_NODE, self._on_committed_node),
             (ARTBOARD_CHANGED, self._on_artboard_changed),
             (CANVAS_CLEARED, self._on_canvas_cleared),
+            (ASSET_UPLOADED, self._on_asset_uploaded),
         ]
         for event, handler in self._subscriptions:
             bus.on(event, handler)
@@ -480,10 +496,26 @@ class GLCanvasHost:
         logger.info("GLCanvasHost mounted (mode=%s, viewport=%dx%d)", mode, self._vp_w, self._vp_h)
 
     def submit_live_frame(self, frame: LiveFrame) -> None:
-        """THREAD-SAFE: replace the latest-frame slot and marshal one ``after(0)`` drain."""
+        """THREAD-SAFE: marshal one ``after(0)`` drain and hand the frame over.
+
+        Round-9 issue 09: LIVE_POINT frames are stroke SAMPLES, so they must be
+        queued in order — a latest-slot replace (correct for CAMERA/LASER, which
+        carry state) threw away every point but the newest whenever two arrived
+        between pumps, which is why a mirrored pen stroke only appeared as the
+        tip until the pen lifted and the committed ADD_STROKE arrived.
+        """
         if self._shutdown:
             return
-        self._slot = frame  # GIL-atomic attribute replace (lock-free by design)
+        if frame.frame_type == FRAME_LIVE_POINT:
+            with self._live_queue_lock:
+                if len(self._live_queue) < LIVE_POINT_QUEUE_CAP:
+                    self._live_queue.append(frame)
+                else:
+                    logger.warning(
+                        "LIVE_POINT backlog full (%d) — dropping sample", LIVE_POINT_QUEUE_CAP
+                    )
+        else:
+            self._slot = frame  # GIL-atomic attribute replace (lock-free)
         self._schedule_drain()
 
     def set_document(self, doc: CanvasDocument) -> None:
@@ -518,6 +550,23 @@ class GLCanvasHost:
             self._content_bounds = {}
         self._update_empty_state()
         self.request_redraw()
+
+    def invalidate_images(self) -> None:
+        """Round-9 issue 07b — drop cached IMAGE textures and repaint.
+
+        ``ASSET_DONE`` writes the bytes AFTER the IMAGE node was already
+        committed and drawn (placeholder), so the renderer must be told to
+        forget its cache or the mirror keeps showing a filled block. Called
+        from ``main.py`` on the asset-completion event.
+        """
+        invalidator = getattr(self._primitive, "invalidate_images", None)
+        if invalidator is None:
+            return
+        try:
+            if invalidator():
+                self.request_redraw()
+        except Exception:
+            logger.exception("PrimitiveRenderer.invalidate_images failed (Doc 08)")
 
     def set_assets_root(self, root: object) -> None:
         """Round-8 issue 05 — point image assets at the open canvas's folder.
@@ -648,6 +697,9 @@ class GLCanvasHost:
                     logger.debug("after_cancel(%s) failed", after_id, exc_info=True)
         self._tick_after_id = None
         self._drain_after_id = None
+        with self._live_queue_lock:
+            self._live_queue.clear()
+        self._slot = None
         for event, handler in self._subscriptions:
             self._bus.off(event, handler)
         if self._empty_state is not None:
@@ -692,10 +744,21 @@ class GLCanvasHost:
             logger.exception("viewport tick failed (pump continues)")
 
     def _drain(self) -> None:
-        """Main thread: pop the slot, drop unless ``is_newer_seq`` (wrap 65535→0 ok)."""
+        """Main thread: apply queued LIVE_POINT samples, then the latest slot.
+
+        The slot keeps ``is_newer_seq`` semantics (CAMERA/LASER are state, so
+        only the newest matters); the queue preserves stroke order (round-9
+        issue 09) and is drained under the lock to keep the reader thread's
+        appends coherent.
+        """
         self._drain_pending = False
         self._drain_after_id = None
         while True:
+            with self._live_queue_lock:
+                batch = list(self._live_queue)
+                self._live_queue.clear()
+            for frame in batch:
+                self._apply_frame(frame)
             frame = self._slot
             if frame is None:
                 return
@@ -771,6 +834,27 @@ class GLCanvasHost:
         self._pending_nodes = []
         self._content_bounds = {}
         self.request_redraw()
+
+    def _on_asset_uploaded(self, canvas_id=None, filename=None, **_extra) -> None:
+        """Round-9 issue 07b: an uploaded image landed — repaint with real bytes.
+
+        The IMAGE node reaches the mirror (and is tessellated into a quad) long
+        before ``ASSET_DONE`` finishes streaming the file, so the first frames
+        legitimately use the placeholder. This drops the renderer's texture
+        cache when the bytes finally exist.
+        """
+        current = self._canvas_id()
+        if canvas_id and current and str(canvas_id) != str(current):
+            return  # another canvas's asset; this viewport is unaffected
+        invalidate = getattr(self, "invalidate_images", None)
+        if callable(invalidate):
+            invalidate()
+
+    def _canvas_id(self) -> str | None:
+        """Id of the canvas this viewport mirrors (``None`` before an open)."""
+        doc = self._doc
+        canvas_id = getattr(doc, "canvas_id", None) if doc is not None else None
+        return str(canvas_id) if canvas_id else None
 
     def _on_artboard_changed(self, artboard=None, content_bounds=None, **_extra) -> None:
         if artboard is not None:

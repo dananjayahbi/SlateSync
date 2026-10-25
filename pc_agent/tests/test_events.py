@@ -1,10 +1,11 @@
-"""Tests for EventBus + the 12 event-name constants (Doc 04 §6)."""
+"""Tests for EventBus + the event-name constants (Doc 04 §6)."""
 
 import logging
 import threading
 
 from pc_agent.core.events import (
     ARTBOARD_CHANGED,
+    ASSET_UPLOADED,
     CAMERA_DELTA,
     CANVAS_LIST_UPDATED,
     COMMITTED_NODE,
@@ -100,9 +101,10 @@ def test_event_name_constants_unique_and_match_template() -> None:
         EXPORT_FINISHED,
         PAIRING_INFO,
         CANVAS_LIST_UPDATED,
+        ASSET_UPLOADED,
     ]
-    assert len(names) == 12
-    assert len(set(names)) == 12
+    assert len(names) == 13
+    assert len(set(names)) == 13
     assert names == [
         "LIVE_FRAME",
         "CAMERA_DELTA",
@@ -116,4 +118,5 @@ def test_event_name_constants_unique_and_match_template() -> None:
         "EXPORT_FINISHED",
         "PAIRING_INFO",
         "CANVAS_LIST_UPDATED",
+        "ASSET_UPLOADED",
     ]

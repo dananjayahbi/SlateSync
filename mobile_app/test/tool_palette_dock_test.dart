@@ -299,11 +299,16 @@ void main() {
       StudioTool.arrow: 0x04,
       StudioTool.cartesianGraph: 0x04,
       StudioTool.numberLine: 0x04,
+      // Round-9 issues 04/06 — the fill and table tools both stream
+      // `shapePreview`: a bucket tap sends no drag preview and a table drag
+      // previews its rectangle exactly like a shape.
+      StudioTool.fill: 0x04,
+      StudioTool.table: 0x04,
       StudioTool.image: 0x04,
     };
 
-    test('all 12 StudioTool values map to the expected byte', () {
-      expect(StudioTool.values.length, 12);
+    test('all 14 StudioTool values map to the expected byte', () {
+      expect(StudioTool.values.length, 14);
       expect(expected.keys, containsAll(StudioTool.values));
       expected.forEach((StudioTool tool, int byte) {
         expect(toolIdFor(tool), byte, reason: 'toolIdFor($tool)');

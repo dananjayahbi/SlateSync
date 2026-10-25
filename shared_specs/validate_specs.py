@@ -106,9 +106,26 @@ PRESETS = {
     "INFINITE": (None, None),
 }
 PRESET_ORIGIN = "top_left_0_0"
-BACKGROUND_STYLES = ["BLANK", "RULED", "DOT_GRID", "ISO_GRID"]
+BACKGROUND_STYLES = ["BLANK", "RULED", "SQUARE_GRID"]
+#: Round-9: legacy styles removed from the enum but still accepted on LOAD
+#: (mapped to BLANK by every normaliser) so pre-round-9 documents open.
+LEGACY_BACKGROUND_STYLES = ["DOT_GRID", "ISO_GRID"]
+#: Default world-unit gap between rules / square side (Artboard.background_spacing).
+DEFAULT_BACKGROUND_SPACING = 32.0
 BLEND_MODES = ["SRC_OVER", "MULTIPLY"]
 ELEMENT_KINDS = ["STROKE", "HIGHLIGHT", "LINE", "SHAPE", "GRAPH_AXES", "IMAGE"]
+#: Round-9: PATH (closed polygon — rotation output and pen-loop fills) and
+#: TABLE (grid described by graph_config) joined the shape_type enum.
+SHAPE_TYPES = [
+    "RECT",
+    "CIRCLE",
+    "TRIANGLE",
+    "ARROW",
+    "CARTESIAN_2D",
+    "NUMBER_LINE",
+    "PATH",
+    "TABLE",
+]
 
 SPEC_CHECKS = (
     ("binary_stream_frame.json", "validate_binary_frame"),
@@ -338,6 +355,28 @@ def validate_canvas_document(spec: dict) -> list[str]:
         "background_style",
         "enum",
     )
+    # Round-9: background_spacing is REQUIRED and must be a positive number.
+    spacing = _dig(
+        spec, "$defs", "Artboard", "properties", "background_spacing"
+    )
+    if spacing is _MISSING:
+        errors.append("$defs.Artboard.properties.background_spacing: missing")
+    elif not isinstance(spacing, dict):
+        errors.append(
+            f"$defs.Artboard.properties.background_spacing: expected object got {spacing!r}"
+        )
+    else:
+        _eq(
+            errors,
+            "$defs.Artboard.properties.background_spacing.minimum",
+            1,
+            spacing.get("minimum", _MISSING),
+        )
+        required = _dig(spec, "$defs", "Artboard", "required")
+        if not isinstance(required, list) or "background_spacing" not in required:
+            errors.append(
+                "$defs.Artboard.required: 'background_spacing' must be listed"
+            )
     _enum(
         errors,
         "$defs.NodeStyle.properties.blend_mode.enum",
@@ -360,6 +399,28 @@ def validate_canvas_document(spec: dict) -> list[str]:
         "kind",
         "enum",
     )
+    # Round-9: PATH and TABLE joined the shape_type enum. The enum also carries
+    # a null member (shape_type is null for stroke/image/line nodes), so the
+    # comparison drops it on both sides.
+    shape_enum = _dig(
+        spec, "$defs", "NodeGeometry", "properties", "shape_type", "enum"
+    )
+    if shape_enum is _MISSING:
+        errors.append("$defs.NodeGeometry.properties.shape_type.enum: missing")
+    elif not isinstance(shape_enum, list):
+        errors.append(
+            f"$defs.NodeGeometry.properties.shape_type.enum: expected list got {shape_enum!r}"
+        )
+    else:
+        non_null = [value for value in shape_enum if value is not None]
+        _eq(errors, "$defs.NodeGeometry.properties.shape_type.enum", SHAPE_TYPES, non_null)
+    # Round-9: `fill` is OPTIONAL (a node without a fill omits the key so every
+    # pre-round-9 document round-trips byte-identically).
+    style_required = _dig(spec, "$defs", "NodeStyle", "required")
+    if not isinstance(style_required, list):
+        errors.append("$defs.NodeStyle.required: expected list")
+    elif "fill" in style_required:
+        errors.append("$defs.NodeStyle.required: 'fill' must stay OPTIONAL")
 
     rule = spec.get("x_upgrade_rule", _MISSING)
     if rule is _MISSING:

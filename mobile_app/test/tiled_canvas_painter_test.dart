@@ -580,44 +580,61 @@ void main() {
       expect(line.strokeWidth, 0.5); // 1.0 / scale ⇒ 1 device px
     });
 
-    test('DOT_GRID: light-gray dots on the 24 u world lattice', () {
+    test('SQUARE_GRID: closed cells from both rule families', () {
       final CanvasBackgroundPainter painter = CanvasBackgroundPainter(
         viewMatrix: Matrix4.identity(),
         scale: 1.0,
         boundary: const Rect.fromLTWH(0, 0, 96, 96),
-        style: 'DOT_GRID',
+        style: kBackgroundSquareGrid,
+        spacing: 32,
       );
       final RecordingCanvas spy = RecordingCanvas();
       painter.paint(spy, const Size(200, 200));
 
-      // 5 × 5 lattice points (0, 24, 48, 72, 96 on both axes).
-      expect(spy.paintsOf('drawCircle'), hasLength(25));
-      expect(
-        spy.paintsOf('drawCircle').first.color.toARGB32(),
-        kPagePatternColor.toARGB32(),
-      );
-    });
-
-    test('ISO_GRID: three Doc 26 families (-30°, +30°, vertical) at 24 u', () {
-      final CanvasBackgroundPainter painter = CanvasBackgroundPainter(
-        viewMatrix: Matrix4.identity(),
-        scale: 1.0,
-        boundary: const Rect.fromLTWH(0, 0, 480, 480),
-        style: 'ISO_GRID',
-      );
-      final RecordingCanvas spy = RecordingCanvas();
-      painter.paint(spy, const Size(300, 300));
-
       expect(spy.didCall('drawLine'), isTrue);
-      // 28 (−30°) + 28 (+30°) + 21 (vertical) world-anchored lines.
-      expect(spy.paintsOf('drawLine'), hasLength(77));
+      // 4 horizontal (0, 32, 64, 96) + 4 vertical over the page.
+      expect(spy.paintsOf('drawLine'), hasLength(8));
       expect(
         spy.paintsOf('drawLine').every(
-              (Paint p) =>
-                  p.color.toARGB32() == kPagePatternColor.toARGB32(),
+              (Paint p) => p.color.toARGB32() == kPagePatternColor.toARGB32(),
             ),
         isTrue,
       );
+    });
+
+    test('spacing changes the number of drawn rules', () {
+      int rulesFor(double spacing) {
+        final CanvasBackgroundPainter painter = CanvasBackgroundPainter(
+          viewMatrix: Matrix4.identity(),
+          scale: 1.0,
+          boundary: const Rect.fromLTWH(0, 0, 128, 128),
+          style: kBackgroundRuled,
+          spacing: spacing,
+        );
+        final RecordingCanvas spy = RecordingCanvas();
+        painter.paint(spy, const Size(200, 200));
+        return spy.paintsOf('drawLine').length;
+      }
+
+      // Denser spacing ⇒ more lines.
+      expect(rulesFor(16), greaterThan(rulesFor(64)));
+      // A 128 u tall page with 128 u spacing still draws the two edges.
+      expect(rulesFor(128), 2);
+    });
+
+    test('retired DOT_GRID / ISO_GRID render nothing (round-9 narrowing)', () {
+      for (final String retired in <String>['DOT_GRID', 'ISO_GRID']) {
+        final CanvasBackgroundPainter painter = CanvasBackgroundPainter(
+          viewMatrix: Matrix4.identity(),
+          scale: 1.0,
+          boundary: const Rect.fromLTWH(0, 0, 96, 96),
+          style: retired,
+        );
+        final RecordingCanvas spy = RecordingCanvas();
+        painter.paint(spy, const Size(200, 200));
+        expect(spy.didCall('drawLine'), isFalse, reason: retired);
+        expect(spy.didCall('drawCircle'), isFalse, reason: retired);
+      }
     });
 
     test('shouldRepaint reacts to camera, page, style and color changes', () {
@@ -660,6 +677,15 @@ void main() {
         style: 'BLANK',
       );
       expect(resized.shouldRepaint(base), isTrue);
+
+      final CanvasBackgroundPainter spaced = CanvasBackgroundPainter(
+        viewMatrix: Matrix4.identity(),
+        scale: 1.0,
+        boundary: const Rect.fromLTWH(0, 0, 2480, 3508),
+        style: 'BLANK',
+        spacing: 64,
+      );
+      expect(spaced.shouldRepaint(base), isTrue);
     });
   });
 }

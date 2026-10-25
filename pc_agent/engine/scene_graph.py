@@ -52,7 +52,7 @@ _DEFAULT_KINDS: dict[str, str] = {
     "ADD_SHAPE": "SHAPE",
     "ADD_IMAGE": "IMAGE",
 }
-_STYLE_FIELDS = ("color", "stroke_width", "opacity", "blend_mode")
+_STYLE_FIELDS = ("color", "stroke_width", "opacity", "blend_mode", "fill")
 _GEOM_FIELDS = ("pts", "shape_type", "graph_config", "asset_ref")
 
 
@@ -62,12 +62,19 @@ class NodeStyle:
     stroke_width: float = 2.5
     opacity: float = 1.0
     blend_mode: str = "SRC_OVER"
+    #: Round-9 issue 04 — interior colour set by the fill tool, ``None`` when
+    #: the node has no fill. Kept optional so pre-round-9 documents and every
+    #: existing ``to_json`` round-trip stay byte-identical.
+    fill: str | None = None
 
 
 @dataclass
 class NodeGeometry:
     pts: list[list[float]] = field(default_factory=list)
-    shape_type: str | None = None  # RECT|CIRCLE|TRIANGLE|ARROW|CARTESIAN_2D|NUMBER_LINE
+    #: RECT|CIRCLE|TRIANGLE|ARROW|CARTESIAN_2D|NUMBER_LINE plus the round-9
+    #: PATH (closed polygon: rotation output and pen-loop fills) and TABLE
+    #: (grid described by ``graph_config``).
+    shape_type: str | None = None
     graph_config: dict | None = None
     asset_ref: str | None = None
 

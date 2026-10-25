@@ -215,14 +215,14 @@ void main() {
       expect((await db.get('c'))?.title, 'Gamma');
 
       await db.update(
-        record('c', 'Gamma v2', 400, preset: 'LETTER', background: 'ISO_GRID'),
+        record('c', 'Gamma v2', 400, preset: 'LETTER', background: 'SQUARE_GRID'),
       );
       final CanvasRecord? updated = await db.get('c');
       expect(updated, isNotNull);
       expect(updated!.title, 'Gamma v2');
       expect(updated.updatedAt, 400);
       expect(updated.preset, 'LETTER');
-      expect(updated.background, 'ISO_GRID');
+      expect(updated.background, 'SQUARE_GRID');
 
       // conflictAlgorithm: replace on same primary key
       await db.insertCanvas(record('a', 'Alpha 2', 500));
@@ -380,7 +380,7 @@ void main() {
       final CanvasDocumentModel a4 = buildNewCanvasDocument(
         title: 't',
         preset: 'A4',
-        background: 'DOT_GRID',
+        background: 'SQUARE_GRID',
         canvasId: 'c-a4',
         now: 100,
       );
@@ -391,7 +391,7 @@ void main() {
       final CanvasDocumentModel letter = buildNewCanvasDocument(
         title: 't',
         preset: 'LETTER',
-        background: 'ISO_GRID',
+        background: 'RULED',
         canvasId: 'c-ltr',
         now: 100,
       );
@@ -585,7 +585,7 @@ void main() {
       expect(find.byKey(const Key('empty_gallery')), findsOneWidget);
     });
 
-    testWidgets('New Canvas modal: A4 + DOT_GRID creates row + file',
+    testWidgets('New Canvas modal: A4 + SQUARE_GRID creates row + file',
         (WidgetTester tester) async {
       final LocalDb db = await openDbInTester(tester, 'new_canvas');
       await pumpDashboard(tester, db: db);
@@ -604,7 +604,7 @@ void main() {
           (Widget w) =>
               w is CustomPaint && w.painter is BackgroundPreviewPainter,
         ),
-        findsNWidgets(4),
+        findsNWidgets(3),
       );
 
       await tester.enterText(
@@ -613,7 +613,7 @@ void main() {
       );
       await tester.tap(find.byKey(const Key('new_preset_A4')));
       await tester.pump();
-      await tester.tap(find.byKey(const Key('new_background_DOT_GRID')));
+      await tester.tap(find.byKey(const Key('new_background_SQUARE_GRID')));
       await tester.pump();
       await tester.tap(find.byKey(const Key('create_canvas')));
       // The create chain now includes the Doc 02 §10.6 PNG rasterization —
@@ -636,7 +636,7 @@ void main() {
       expect(rows, hasLength(1));
       expect(rows!.single.title, 'Control Systems');
       expect(rows.single.preset, 'A4');
-      expect(rows.single.background, 'DOT_GRID');
+      expect(rows.single.background, 'SQUARE_GRID');
       expect(File(rows.single.filePath).existsSync(), isTrue);
       expect(
         File('$cacheDir/${rows.single.id}.slatesync').existsSync(),
@@ -655,7 +655,7 @@ void main() {
       final CanvasDocumentModel seed = buildNewCanvasDocument(
         title: 'Ünicode — 研究ノート',
         preset: 'LETTER',
-        background: 'DOT_GRID',
+        background: 'SQUARE_GRID',
         canvasId: 'open-1',
         now: unixNowSeconds(),
       );

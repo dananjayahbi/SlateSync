@@ -209,3 +209,110 @@ nothing rather than a misleading block.
   the absence of `dock-toggle`, the `brush`/`element` segmented control.
 * `mobile_app/test/engine_add_node_test.dart` — an unresolvable IMAGE paints no ink; decoded bytes
   paint inside the bbox.
+---
+
+## 9. Round-9 Amendment — Undo/Redo, Fill, Lock/Rotate, Tables (NORMATIVE)
+
+### 9.1 `StudioTool` grows to 14 values
+
+`StudioTool` is now:
+
+```
+enum StudioTool {
+  select, pen, highlighter, eraser, fill, line, rect, circle, triangle, arrow,
+  cartesianGraph, numberLine, table, image,
+}
+```
+
+`fill` (issue 04) sits after `eraser` — a paint bucket belongs with the paint tools. `table` (issue 06)
+sits after `numberLine` — the grid/governed-geometry family. Both stream `ToolId.shapePreview` (0x04):
+`fill` sends no drag previews at all, and a `table` drag previews its rectangle exactly like a shape.
+
+The rail is 14 × 36 dp + divider + the clear button, wrapped in a `SingleChildScrollView` so a 600 dp
+viewport can never overflow it.
+
+### 9.2 Undo / redo (issue 03)
+
+Top-bar `studio-undo` / `studio-redo` drive `CanvasHistoryController`
+(`features/canvas/canvas_history_controller.dart`) over `EditHistory`
+(`canvas_engine/edit_history.dart`).
+
+**Snapshots, not a command log.** Several gestures emit more than one RPC: a transform is
+`DELETE_NODE` + `ADD_*`, and a brush erase is `DELETE_NODE` + N × `ADD_STROKE`. Each mutation helper
+brackets itself with `_beginEdit()` / `_endEdit()`, and `EditHistory.commit` drops a gesture whose
+before/after snapshots are equal — so a stray tap never adds an invisible step. The stack is bounded
+(60 states) because undo is a convenience, not an audit log. Undo/redo reindex the engine through
+`setDocument` and rebuild `doc.groups`.
+
+### 9.3 Fill tool (issue 04)
+
+The user's rule is exact: *"the object needs to be closed"*. There is **no raster flood fill** — it
+leaks through antialiased gaps and cannot distinguish "this shape's interior" from "the gap between
+two shapes". Instead `canvas_engine/region_fill.dart` resolves the tap against NODES:
+
+* `closedPolygonFor(node)` returns the closed loop a node encloses: RECT/TRIANGLE/PATH from `pts`,
+  CIRCLE from its bbox ellipse, a free-hand STROKE only when `polylineCloses` says its own first and
+  last samples meet (tolerance = the larger of 6 world units and 12 % of the path diagonal).
+  ARROW / LINE / IMAGE / GRAPH_AXES never enclose a region.
+* `findFillTarget` picks the SMALLEST-area polygon containing the tap, so a small shape nested inside
+  a big one wins.
+* The fill is a **style change**, not new geometry: `NodeStyleModel.fill` (`#RRGGBB`, omitted when
+  unset). Tapping a filled shape clears it.
+
+`style.fill` is an OPTIONAL addition to the frozen Doc 03 `NodeStyle`; every earlier document
+round-trips byte-identically because the key is omitted rather than nulled. The legacy spelling
+`stroke_width == 0` ⇒ solid in `color` still holds (PC `shape_fill.shape_is_filled`), and the two
+routes are honoured identically by the mobile painter, the GL viewport and all three exporters.
+
+The mirror receives the change as `DELETE_NODE` + `ADD_*` — the same pair the selector's transform
+uses, because the schema has no `UPDATE_NODE`.
+
+### 9.4 Lock groups and rotation (issue 05)
+
+`NodeStyle` is frozen, so a per-node `locked` flag is impossible. A group is document-level anyway (a
+node belongs to at most one group), so `CanvasDocumentModel.groups` (`group_id → [node_id, ...]`,
+OPTIONAL and omitted when empty) carries it. `canvas_engine/selection_groups.dart` is the whole
+policy:
+
+* `expandSelection` — selecting ANY member selects the entire locked group, which is what makes the
+  group "act as a single object".
+* `lockSelection` / `unlockGroup` — one group per node is an invariant: re-locking a node detaches it
+  from its previous group (and drops that group when it empties).
+* `forgetNode` — every delete path drops the id from its group, so a later selection can never expand
+  to a node that no longer exists.
+
+Chrome is anchored to the OBJECT, as the user asked: `SelectionActionBar` floats just above the
+selection box (lock / unlock · rotate · fill · delete) and `LockBadge` marks a locked group.
+
+Rotation is **shapes only** — never a free-hand stroke (that would shear the ink, exactly like scaling
+it would), and never graph axes or images, whose meaning is bound to their config/pixels. A rotated
+RECT/CIRCLE/TRIANGLE cannot stay that type (`bbox` is axis-aligned by contract), so it is re-emitted as
+`shape_type: "PATH"` with its four rotated corners. `PATH` is simply "a closed polygon".
+
+### 9.5 Table tool (issue 06)
+
+A table is ONE `SHAPE` node with `shape_type: "TABLE"` and its grid in `graph_config`
+(`rows`, `cols`, `header_row`, `header_col`) — the same "config object on a shape" shape the graph
+tools already use, so no new node kind and every renderer gains tables by reading one more
+`shape_type`. `rows`/`cols` are TOTAL cell counts (header band included) and are clamped
+(1..200 × 1..40) so a corrupt document cannot emit a million gridlines.
+
+The config popup (`features/canvas/table_config_popup.dart`) opens WITH the tool, so rows/columns and
+the header flags are chosen before anything is drawn. After placement, `TableGrowHandles` shows the
+add-row handle BELOW the table's bottom edge and the add-column handle to its RIGHT, exactly as the
+user specified; growing one cell also grows the bbox along that axis so the cells do not silently get
+thinner.
+
+### 9.6 Acceptance
+
+* `mobile_app/test/round9_tools_test.dart` — closure tolerance, point-in-polygon (concave),
+  nested-shape precedence, rotation, group invariants, table grid, bounded undo stack.
+* `mobile_app/test/round9_studio_test.dart` — undo/redo enable/disable and rewind, the fill tap
+  producing `DELETE_NODE` + `ADD_SHAPE` with `style.fill`, the action bar appearing on selection, and
+  the table popup + `TABLE` commit.
+* `pc_agent/tests/test_vector_geometry.py` — ear-clipping area equality (a fan OVER-counts on a
+  concave loop), closure, table clamps.
+* `pc_agent/tests/test_round9_rendering.py` — fill vs outline colours, PATH polygon, TABLE grid and
+  filled header bands, cairo `apply_fill`/`trace_shape`.
+* `pc_agent/tests/test_document_store.py` — `fill`/`groups` are optional, survive a round trip, and a
+  malformed value drops rather than failing the load.

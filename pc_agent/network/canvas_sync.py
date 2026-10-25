@@ -502,15 +502,45 @@ class CanvasSyncManager:
                 return
             if stored is None:
                 logger.debug("CANVAS_PUT for %s kept the local copy (LWW)", canvas_id)
+                # The document body lost LWW, but an artboard-only edit made
+                # within the same second carries an EQUAL updated_at and would
+                # otherwise never reach the mirror (round-9 issue 08).
+                self._push_artboard_to_mirror(doc)
                 return  # keep (equal) / reject (older): no churn, no emit
         else:
             local = self._local_rows.get(canvas_id)
             if local is not None and _updated(local) >= int(doc.updated_at):
+                self._push_artboard_to_mirror(doc)
                 return  # no index: same LWW rule against the in-memory row
             self._local_rows[canvas_id] = _row_of(canvas)
 
         self._emit_list()
         self.broadcast_hub_list()  # §9.2: the hub store changed
+        self._push_artboard_to_mirror(doc)
+
+    def _push_artboard_to_mirror(self, doc) -> None:
+        """Round-9 issue 08 — mirror a background/size edit of the OPEN canvas.
+
+        ``CANVAS_PUT`` is the only carrier a tablet artboard change has, and
+        before round 9 the PC only re-read an artboard on an OPEN_CANVAS
+        switch. When the PUT belongs to the canvas the PC is currently showing
+        the live store copy is updated in place so the viewport repaints with
+        the new ``background_style`` / ``background_spacing`` (and the paper
+        colour) instead of keeping the previous pattern forever.
+        """
+        sync = getattr(self._store, "sync_artboard", None)
+        if not callable(sync):
+            return
+        try:
+            sync(
+                str(getattr(doc, "canvas_id", "")),
+                doc.artboard,
+                getattr(doc, "updated_at", None),
+            )
+        except TypeError:
+            sync(str(getattr(doc, "canvas_id", "")), doc.artboard)
+        except Exception:
+            logger.exception("artboard propagation to the PC mirror failed")
 
     def _on_canvas_pull(self, payload: dict) -> None:
         """CANVAS_PULL → serve a CANVAS_PUT only when strictly newer (§9.1)."""

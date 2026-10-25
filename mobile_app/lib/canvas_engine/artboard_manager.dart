@@ -112,6 +112,7 @@ class ArtboardManager {
         isInfinite: true,
         backgroundStyle: _current.backgroundStyle,
         backgroundColor: _current.backgroundColor,
+        backgroundSpacing: _current.backgroundSpacing,
       );
     } else {
       final (w: double tw, h: double th) = _dimsFor(targetPreset)!;
@@ -122,6 +123,7 @@ class ArtboardManager {
         isInfinite: false,
         backgroundStyle: _current.backgroundStyle,
         backgroundColor: _current.backgroundColor,
+        backgroundSpacing: _current.backgroundSpacing,
       );
     }
     return const UpgradeResult(true, null);

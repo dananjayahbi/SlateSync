@@ -26,18 +26,25 @@ import 'package:flutter/material.dart';
 
 import 'package:mobile_app/canvas_engine/artboard_manager.dart'; // Doc 23
 import 'package:mobile_app/canvas_engine/camera_controller.dart'; // Doc 20
+import 'package:mobile_app/canvas_engine/region_fill.dart'; // round-9 issue 04
+import 'package:mobile_app/canvas_engine/selection_groups.dart'; // round-9 issue 05
 import 'package:mobile_app/canvas_engine/selection_transform.dart'; // round-8 issue 07
 import 'package:mobile_app/canvas_engine/stroke_eraser.dart'; // round-8 issue 03
 import 'package:mobile_app/canvas_engine/stroke_eraser_controller.dart';
 import 'package:mobile_app/canvas_engine/stroke_processor.dart'; // Doc 21
+import 'package:mobile_app/canvas_engine/table_geometry.dart'; // round-9 issue 06
 import 'package:mobile_app/canvas_engine/tiled_canvas_painter.dart'; // Doc 22
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 import 'package:mobile_app/core/storage/local_db.dart'; // Doc 26
 import 'package:mobile_app/core/theme/studio_theme.dart'; // Doc 05
+import 'package:mobile_app/features/canvas/canvas_history_controller.dart'; // round-9 issue 03
+import 'package:mobile_app/features/canvas/canvas_publish.dart'; // round-9 issue 08
 import 'package:mobile_app/features/canvas/canvas_shape_conventions.dart';
 import 'package:mobile_app/features/canvas/image_source_popup.dart';
 import 'package:mobile_app/features/canvas/remote_mutation_applier.dart';
+import 'package:mobile_app/features/canvas/selection_actions.dart'; // round-9 05/06
 import 'package:mobile_app/features/canvas/selection_overlay.dart'; // round-8 issue 07
+import 'package:mobile_app/features/canvas/table_config_popup.dart'; // round-9 issue 06
 import 'package:mobile_app/features/export/export_modal_sheet.dart'; // Doc 27
 import 'package:mobile_app/features/home/home_canvas_dashboard.dart'; // Doc 26
 import 'package:mobile_app/features/pairing/pairing_screen.dart'; // Issue 03
@@ -137,6 +144,17 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   /// Issue 05 — one Gallery/Camera popup at a time per image-tool tap.
   bool _imageFlowActive = false;
 
+  // -- Round-9 issue 03: undo/redo -----------------------------------------
+  late final CanvasHistoryController _history;
+
+  // -- Round-9 issue 06: pending table shape -------------------------------
+  /// Rows/columns/headers chosen in the popup, applied to the next drag.
+  TableConfig? _tableConfig;
+
+  // -- Round-9: transient hint line ---------------------------------------
+  String? _hint;
+  Timer? _hintTimer;
+
   // -- Repaint plumbing ----------------------------------------------------
   final ValueNotifier<int> _canvasTick = ValueNotifier<int>(0);
   final List<Offset> _liveView = <Offset>[];
@@ -167,10 +185,15 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     // pattern (the manager seeds BLANK/#FFFFFF on construction).
     _artboard.current
       ..backgroundStyle = _doc.artboard.backgroundStyle
-      ..backgroundColor = _doc.artboard.backgroundColor;
+      ..backgroundColor = _doc.artboard.backgroundColor
+      ..backgroundSpacing = _doc.artboard.backgroundSpacing;
+    // Issue 08: the mirror was just told about this artboard by the OPEN_CANVAS
+    // broadcast, so the first autosave must not re-publish the same page.
+    _publishedArtboard = ArtboardFingerprint.of(_doc.artboard);
     _toolConfig = ValueNotifier<ToolConfig>(ToolConfig());
     _tool = ValueNotifier<StudioTool>(StudioTool.pen);
     _snap = ValueNotifier<bool>(true);
+    _history = CanvasHistoryController();
 
     // Seed Doc 23 content tracking from whatever the document already holds
     // so the §4.4 upgrade rule sees pre-session strokes too.
@@ -180,6 +203,15 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     }
 
     _engine.setDocument(_doc);
+    // Round-9 issue 07a — an IMAGE asset decodes asynchronously; the tiles
+    // holding it are invalidated by the engine, and this is what actually
+    // schedules the repaint (before, the image only appeared after some other
+    // edit forced a frame).
+    _engine.onTilesRebaked = () {
+      if (mounted) {
+        _canvasTick.value++;
+      }
+    };
     unawaited(_primeArchivedAssets());
     _remote = RemoteMutationApplier(
       doc: _doc,
@@ -210,6 +242,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     _toolConfig.dispose();
     _snap.dispose();
     _canvasTick.dispose();
+    _history.dispose();
+    _hintTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -219,8 +253,54 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   // -------------------------------------------------------------------------
 
   void _onToolStateChanged() {
+    // Round-9 issue 06 — the table's config popup opens WITH the tool, so the
+    // user configures rows/columns before drawing anything.
+    if (_tool.value == StudioTool.table && _tableConfig == null) {
+      unawaited(_openTableConfig());
+    }
     if (mounted) {
       setState(() {});
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Round-9 issue 03 — undo / redo
+  //
+  // Snapshots, not a command log: several gestures emit MORE than one RPC (a
+  // transform is DELETE_NODE + ADD_*, a brush erase is DELETE_NODE + N×
+  // ADD_STROKE), so an undo step has to cover the whole gesture. Each mutation
+  // helper brackets itself with [_beginEdit] / [_endEdit].
+  // -------------------------------------------------------------------------
+
+  void _beginEdit() => _history.begin(_doc);
+
+  void _endEdit() {
+    if (_history.end(_doc)) {
+      _canvasTick.value++;
+    }
+  }
+
+  /// Reindexes the engine after a history step rewrote `doc.elements`.
+  void _reloadFromDoc() {
+    _engine.setDocument(_doc);
+    final Rect? seeded = _boundsRectOrNull();
+    if (seeded != null) {
+      _artboard.noteContent(seeded);
+    }
+    setState(() => _selected.clear());
+    _canvasTick.value++;
+    _dirty = true;
+  }
+
+  void _undo() {
+    if (_history.undo(_doc)) {
+      _reloadFromDoc();
+    }
+  }
+
+  void _redo() {
+    if (_history.redo(_doc)) {
+      _reloadFromDoc();
     }
   }
 
@@ -430,9 +510,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     final _SelectHit hit = _hitTopmost(world);
     if (hit.node != null) {
       setState(() {
+        // Round-9 issue 05 — a locked group always selects as a whole, so the
+        // group behaves as a single object until it is unlocked.
         _selected
           ..clear()
-          ..add(hit.node!.nodeId);
+          ..addAll(expandSelection(_doc, <String>[hit.node!.nodeId]));
         _marquee = null;
       });
       _canvasTick.value++;
@@ -477,9 +559,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
             if (intersectsMarquee(_rectOf(n), box)) n.nodeId,
         };
         setState(() {
+          // Round-9 issue 05 — a marquee that catches one member of a locked
+          // group selects the whole group.
           _selected
             ..clear()
-            ..addAll(picked);
+            ..addAll(expandSelection(_doc, picked));
         });
       }
       _marquee = null;
@@ -544,6 +628,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     required Rect to,
     required bool scale,
   }) {
+    _beginEdit(); // round-9 issue 03 — the whole transform is ONE undo step
     for (final String id in List<String>.of(_selected)) {
       final CanvasNodeModel? node = _nodeById(id);
       if (node == null) {
@@ -595,6 +680,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
         widget.client.sendRpc(_commitEnvelope(action, updated.toJson())),
       );
     }
+    _endEdit();
   }
 
   /// Frozen Doc 02 action that re-creates a node of [kind] on the PC.
@@ -611,10 +697,287 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     if (_selected.isEmpty) {
       return;
     }
+    _beginEdit(); // round-9 issue 03 — the whole selection is one undo step
     for (final String id in List<String>.of(_selected)) {
       _deleteNode(id);
     }
     setState(() => _selected.clear());
+    _endEdit();
+  }
+
+  // -------------------------------------------------------------------------
+  // Round-9 issue 04 — paint bucket
+  //
+  // "The rule is just the object needs to be closed." The tap is resolved to a
+  // NODE, not to pixels (see region_fill.dart): a raster flood would leak
+  // through antialiased edges and could not tell one shape's interior from the
+  // gap beside it.
+  // -------------------------------------------------------------------------
+
+  void _fillAt(Offset screen) {
+    final Offset world = _camera.screenToWorld(screen, _viewport);
+    final double reach = 2.0 / math.max(_camera.scale, 1e-6);
+    final FillTarget? target = findFillTarget(
+      world,
+      _engine.queryVisible(Rect.fromCircle(center: world, radius: reach)),
+    );
+    if (target == null) {
+      _showHint('Tap inside a closed shape to fill it.');
+      return;
+    }
+    final ToolConfig cfg = _toolConfig.value;
+    final bool clearing = target.node.style.fill != null;
+    _setNodeFill(
+      target.node,
+      clearing ? null : cfg.color,
+    );
+  }
+
+  /// Replaces [node] with a copy carrying [fill] (or none) and mirrors it.
+  ///
+  /// The frozen schema has no UPDATE_NODE action, so the same
+  /// `DELETE_NODE` + `ADD_*` pair the selector's transform uses re-creates the
+  /// node on the PC — one code path, one wire dialect.
+  void _setNodeFill(CanvasNodeModel node, String? fill) {
+    _beginEdit(); // round-9 issue 03
+    final CanvasNodeModel updated = CanvasNodeModel(
+      nodeId: node.nodeId,
+      kind: node.kind,
+      layer: node.layer,
+      bbox: List<double>.of(node.bbox),
+      style: NodeStyleModel(
+        color: node.style.color,
+        strokeWidth: node.style.strokeWidth,
+        opacity: node.style.opacity,
+        blendMode: node.style.blendMode,
+        fill: fill,
+      ),
+      geometry: NodeGeometryModel(
+        pts: List<List<double>>.of(node.geometry.pts),
+        shapeType: node.geometry.shapeType,
+        graphConfig: node.geometry.graphConfig,
+        assetRef: node.geometry.assetRef,
+      ),
+    );
+    _replaceNode(node, updated);
+    _endEdit();
+  }
+
+  /// Swaps [previous] for [updated] in the document + engine and mirrors it.
+  void _replaceNode(CanvasNodeModel previous, CanvasNodeModel updated) {
+    _doc.elements.removeWhere(
+      (CanvasNodeModel n) => n.nodeId == previous.nodeId,
+    );
+    _doc.elements.add(updated);
+    _engine.addNode(updated);
+    _artboard.noteContent(_rectOf(updated));
+    _dirty = true;
+    unawaited(
+      widget.client.sendRpc(
+        _commitEnvelope('DELETE_NODE', <String, dynamic>{
+          'node_id': previous.nodeId,
+        }),
+      ),
+    );
+    unawaited(
+      widget.client.sendRpc(
+        _commitEnvelope(_addActionForKind(updated.kind), updated.toJson()),
+      ),
+    );
+    // The mirror receives the replacement through the ADD_* commit above. A
+    // full `CANVAS_PUT` is only needed when the DOCUMENT-level state changed
+    // (artboard or lock groups), which `_publishArtboardIfChanged` decides.
+    _publishArtboardIfChanged();
+    _canvasTick.value++;
+  }
+
+  // -------------------------------------------------------------------------
+  // Round-9 issue 05 — lock groups and rotation
+  // -------------------------------------------------------------------------
+
+  /// True when the selection is entirely one locked group.
+  bool get _selectionLocked =>
+      _selected.isNotEmpty && selectionIsFullyLocked(_doc, _selected);
+
+  /// Rotation is for SHAPES only — never a free-hand stroke (the user's own
+  /// rule: strokes are move-only, and rotating a drawn path would shear the
+  /// ink exactly like scaling it would).
+  bool get _selectionCanRotate {
+    if (_selected.isEmpty) {
+      return false;
+    }
+    for (final String id in _selected) {
+      final CanvasNodeModel? n = _nodeById(id);
+      if (n == null || n.kind != 'SHAPE') {
+        return false;
+      }
+      // Graph axes are line work anchored to their config, and an image is
+      // pixel content — rotating either would change what the node MEANS,
+      // not just how it looks.
+      const Set<String> blocked = <String>{'CARTESIAN_2D', 'NUMBER_LINE'};
+      if (blocked.contains(n.geometry.shapeType)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /// True when at least one selected node encloses a fillable region.
+  bool get _selectionCanFill =>
+      _selected.any((String id) {
+        final CanvasNodeModel? n = _nodeById(id);
+        return n != null && canFill(n);
+      });
+
+  void _lockSelection() {
+    if (_selected.isEmpty) {
+      return;
+    }
+    _beginEdit(); // round-9 issue 03
+    lockSelection(_doc, _selected);
+    setState(() {});
+    _dirty = true;
+    // Groups are document-level state with no RPC action of their own, so they
+    // travel with the open document via `CANVAS_PUT`.
+    _publishArtboardIfChanged();
+    _endEdit();
+  }
+
+  void _unlockSelection() {
+    final String? groupId = _selected.isEmpty ? null : _doc.groupOf(_selected.first);
+    if (groupId == null) {
+      return;
+    }
+    _beginEdit(); // round-9 issue 03
+    unlockGroup(_doc, groupId);
+    setState(() {});
+    _dirty = true;
+    _publishArtboardIfChanged();
+    _endEdit();
+  }
+
+  /// Rotates the selection by 15° around its centre.
+  ///
+  /// A rotated RECT/CIRCLE/TRIANGLE cannot remain that shape type: `bbox` is
+  /// axis-aligned by contract, so the rotated object is re-emitted as a
+  /// `PATH` polygon (see [rotatedRectPoints]). A PATH is simply rotated again.
+  void _rotateSelection() {
+    if (!_selectionCanRotate) {
+      return;
+    }
+    const double step = math.pi / 12; // 15°
+    _beginEdit(); // round-9 issue 03
+    for (final String id in List<String>.of(_selected)) {
+      final CanvasNodeModel? node = _nodeById(id);
+      if (node == null || node.kind != 'SHAPE') {
+        continue;
+      }
+      final Rect box = _rectOf(node);
+      final List<List<double>> polygon;
+      if (node.geometry.shapeType == 'PATH') {
+        polygon = rotatePointsAround(node.geometry.pts, box.center, step);
+      } else {
+        polygon = rotatedRectPoints(box, step);
+      }
+      final List<double> bbox = pointsBounds(polygon);
+      final CanvasNodeModel updated = CanvasNodeModel(
+        nodeId: node.nodeId,
+        kind: 'SHAPE',
+        layer: node.layer,
+        bbox: bbox,
+        style: NodeStyleModel(
+          color: node.style.color,
+          strokeWidth: node.style.strokeWidth,
+          opacity: node.style.opacity,
+          blendMode: node.style.blendMode,
+          fill: node.style.fill,
+        ),
+        geometry: NodeGeometryModel(
+          pts: polygon,
+          shapeType: 'PATH',
+          graphConfig: node.geometry.graphConfig,
+          assetRef: null,
+        ),
+      );
+      _replaceNode(node, updated);
+    }
+    _endEdit();
+  }
+
+  /// Fills every selected node that encloses a region (the lock badge's action).
+  void _fillSelection() {
+    if (!_selectionCanFill) {
+      return;
+    }
+    final String colour = _toolConfig.value.color;
+    _beginEdit(); // round-9 issue 03
+    for (final String id in List<String>.of(_selected)) {
+      final CanvasNodeModel? node = _nodeById(id);
+      if (node == null || !canFill(node)) {
+        continue;
+      }
+      final bool clearing = node.style.fill != null;
+      _setNodeFill(node, clearing ? null : colour);
+    }
+    _endEdit();
+  }
+
+  // -------------------------------------------------------------------------
+  // Round-9 issue 06 — table add-row / add-column
+  // -------------------------------------------------------------------------
+
+  /// The selected node when it is a TABLE (the grow handles key off this).
+  CanvasNodeModel? get _selectedTable {
+    if (_selected.length != 1) {
+      return null;
+    }
+    final CanvasNodeModel? n = _nodeById(_selected.first);
+    if (n == null || n.geometry.shapeType != 'TABLE') {
+      return null;
+    }
+    return n;
+  }
+
+  void _growTable({required bool row}) {
+    final CanvasNodeModel? table = _selectedTable;
+    if (table == null) {
+      return;
+    }
+    final Rect box = _rectOf(table);
+    final TableGrid grid = tableGridOf(box, table.geometry.graphConfig);
+    // A new row/column needs physical space, so the table's bbox grows by one
+    // cell along that axis; otherwise the cells would just get thinner and the
+    // handle would feel like it did nothing.
+    final double cellH = grid.box.height / grid.rows;
+    final double cellW = grid.box.width / grid.cols;
+    final Rect grown = row
+        ? Rect.fromLTRB(box.left, box.top, box.right, box.bottom + cellH)
+        : Rect.fromLTRB(box.left, box.top, box.right + cellW, box.bottom);
+    final Map<String, dynamic> config = row
+        ? withExtraRow(table.geometry.graphConfig)
+        : withExtraColumn(table.geometry.graphConfig);
+    _beginEdit(); // round-9 issue 03
+    final CanvasNodeModel updated = CanvasNodeModel(
+      nodeId: table.nodeId,
+      kind: table.kind,
+      layer: table.layer,
+      bbox: <double>[grown.left, grown.top, grown.right, grown.bottom],
+      style: NodeStyleModel(
+        color: table.style.color,
+        strokeWidth: table.style.strokeWidth,
+        opacity: table.style.opacity,
+        blendMode: table.style.blendMode,
+        fill: table.style.fill,
+      ),
+      geometry: NodeGeometryModel(
+        pts: List<List<double>>.of(table.geometry.pts),
+        shapeType: 'TABLE',
+        graphConfig: config,
+        assetRef: null,
+      ),
+    );
+    _replaceNode(table, updated);
+    _endEdit();
   }
 
   void _onPointerDown(PointerDownEvent e) {
@@ -633,6 +996,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       _eraseAt(e.localPosition);
       return;
     }
+    if (tool == StudioTool.fill) {
+      // Round-9 issue 04 — a paint bucket is a tap, never a drag.
+      _fillAt(e.localPosition);
+      return;
+    }
     if (tool == StudioTool.image) {
       if (_pointers.length == 1) {
         unawaited(_beginImageFlow(e.localPosition));
@@ -641,6 +1009,12 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     }
     if (tool == StudioTool.cartesianGraph || tool == StudioTool.numberLine) {
       return; // dock graph-builder dialogs — no direct canvas input
+    }
+    if (tool == StudioTool.table && _tableConfig == null) {
+      // Round-9 issue 06 — the config popup opens WITH the tool; a tap before
+      // it is answered just re-opens it rather than drawing a default table.
+      unawaited(_openTableConfig());
+      return;
     }
     if (_palm.shouldReject(e)) {
       return;
@@ -854,6 +1228,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   void _commitStroke(ProcessedStroke stroke) {
+    _beginEdit(); // round-9 issue 03 — one undo step per pen stroke
     _engine.addCommitted(stroke); // Doc 22: index + dirty-tile rebake
     final Map<String, dynamic> payload = stroke.toRpcPayload();
     final CanvasNodeModel node = CanvasNodeModel.fromJson(payload);
@@ -870,6 +1245,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     // Doc 25: queued when offline, sent immediately when online.
     unawaited(widget.client.sendRpc(_commitEnvelope('ADD_STROKE', payload)));
     _canvasTick.value++;
+    _endEdit();
   }
 
   Map<String, dynamic> _commitEnvelope(
@@ -980,6 +1356,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     CanvasNodeModel original,
     List<List<List<double>>> fragments,
   ) {
+    _beginEdit(); // round-9 issue 03
+    forgetNode(_doc, original.nodeId); // round-9 issue 05
     _doc.elements.removeWhere((CanvasNodeModel n) => n.nodeId == original.nodeId);
     _engine.removeCommitted(original.nodeId);
     unawaited(
@@ -1024,9 +1402,14 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
         ),
       );
     }
+    _endEdit(); // round-9 issue 03 — the whole swap is one undo step
   }
 
   void _deleteNode(String nodeId) {
+    _beginEdit(); // round-9 issue 03
+    // Round-9 issue 05 — a locked group must never keep a dangling member, so
+    // every delete path drops the id from its group as well.
+    forgetNode(_doc, nodeId);
     _doc.elements.removeWhere((CanvasNodeModel n) => n.nodeId == nodeId);
     // Issue 05 §2: incremental single-node removal — dirty only the tiles
     // the node occupied instead of a full `setDocument` reindex.
@@ -1038,6 +1421,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       ),
     );
     _canvasTick.value++;
+    _endEdit();
   }
 
   // -------------------------------------------------------------------------
@@ -1075,6 +1459,44 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     // Doc 02 §10.3 — kind / shape_type / pts follow the PC conventions
     // (canvas_shape_conventions.dart); then index locally + RPC in one step.
     _streamEnd();
+    if (tool == StudioTool.table) {
+      // Round-9 issue 06 — a table is a SHAPE with `shape_type: TABLE` and its
+      // grid in `graph_config`, so every renderer gains tables by reading one
+      // more shape_type instead of learning a new node kind.
+      final TableConfig config = _tableConfig ??
+          const TableConfig(
+            rows: kDefaultTableRows,
+            cols: kDefaultTableCols,
+            headerRow: true,
+            headerCol: false,
+          );
+      final Rect planned = planTableRect(
+        start,
+        end,
+        TableGridSizeHint(rows: config.rows, cols: config.cols),
+      );
+      _commitElement(
+        _buildNode(
+          kind: 'SHAPE',
+          shapeType: 'TABLE',
+          pts: <List<double>>[
+            <double>[planned.left, planned.top],
+            <double>[planned.right, planned.bottom],
+          ],
+          rect: planned,
+          graphConfig: buildTableConfig(
+            rows: config.rows,
+            cols: config.cols,
+            headerRow: config.headerRow,
+            headerCol: config.headerCol,
+          ),
+        ),
+        planned,
+        'ADD_SHAPE',
+      );
+      _canvasTick.value++;
+      return;
+    }
     _commitElement(
       _buildNode(
         kind: shapeKindForTool(tool),
@@ -1128,6 +1550,40 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       rect,
       'ADD_GRAPH',
     );
+  }
+
+  /// Round-9 issue 06 — the table's initial-config popup.
+  Future<void> _openTableConfig() async {
+    if (_imageFlowActive) {
+      return;
+    }
+    _imageFlowActive = true;
+    try {
+      final TableConfig? config = await showTableConfigPopup(context);
+      if (config == null || !mounted) {
+        return;
+      }
+      setState(() => _tableConfig = config);
+      _showHint(
+        'Drag on the canvas to place a ${config.rows}×${config.cols} table.',
+      );
+    } finally {
+      _imageFlowActive = false;
+    }
+  }
+
+  /// Transient one-line hint under the top bar (also the fill tool's feedback).
+  void _showHint(String message) {
+    if (!mounted) {
+      return;
+    }
+    setState(() => _hint = message);
+    _hintTimer?.cancel();
+    _hintTimer = Timer(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() => _hint = null);
+      }
+    });
   }
 
   /// Issue 05 — image tool: a canvas TAP opens the page-owned Gallery /
@@ -1312,6 +1768,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   void _commitElement(CanvasNodeModel node, Rect content, String action) {
+    _beginEdit(); // round-9 issue 03
     // document + RPC — never in the engine index — so their ink vanished on
     // mobile at pen-lift (live preview cleared, nothing rebaked) while the
     // PC, applying the same RPC, kept rendering it. Every element commit
@@ -1323,6 +1780,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     _dirty = true;
     unawaited(widget.client.sendRpc(_commitEnvelope(action, node.toJson())));
     _canvasTick.value++;
+    _endEdit();
   }
 
   /// Doc 02 §10.1 (Doc 24 §10.7 dock callback): wipe ALL elements locally,
@@ -1330,7 +1788,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   /// envelope's `canvas_id` identifies the target). `updated_at` bumps on
   /// the next persist, same as every other mutation here.
   void _onClearCanvas() {
+    _beginEdit(); // round-9 issue 03
     wipeDocumentElements(doc: _doc, engine: _engine, artboard: _artboard);
+    _doc.groups.clear(); // a cleared canvas has no locked objects left
     _dirty = true;
     _canvasTick.value++;
     if (mounted) {
@@ -1341,6 +1801,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
         _commitEnvelope('CLEAR_CANVAS', <String, dynamic>{}),
       ),
     );
+    _endEdit();
   }
 
   // -------------------------------------------------------------------------
@@ -1355,11 +1816,41 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     return _activeDb ??= await LocalDb.open();
   }
 
+  /// Round-9 issue 08 — the artboard the mirror was last told about.
+  ArtboardFingerprint? _publishedArtboard;
+
+  /// Round-9 issue 05 — the lock groups the mirror was last told about.
+  String _publishedGroups = '';
+
+  /// Sends the open canvas whenever the page look changed (background style,
+  /// spacing, paper colour, preset/size) — or the lock groups changed, which
+  /// have to travel so a `CANVAS_PULL` round-trip does not lose them. Uses
+  /// `CANVAS_PUT`, the only action the frozen schema offers that carries a full
+  /// document without navigating.
+  void _publishArtboardIfChanged() {
+    final ArtboardFingerprint next = ArtboardFingerprint.of(_doc.artboard);
+    final String groups = _groupsSignature();
+    if (next == _publishedArtboard && groups == _publishedGroups) {
+      return;
+    }
+    _publishedArtboard = next;
+    _publishedGroups = groups;
+    unawaited(publishCanvasDocument(widget.client, _doc));
+  }
+
+  String _groupsSignature() {
+    final List<String> keys = _doc.groups.keys.toList()..sort();
+    return keys
+        .map((String k) => '$k:${(_doc.groups[k] ?? const <String>[]).join(',')}')
+        .join('|');
+  }
+
   Future<void> _save() async {
     final bool wasDirty = _dirty;
     _dirty = false;
     _doc.updatedAt = unixNowSeconds();
     _doc.artboard = _artboard.current;
+    _publishArtboardIfChanged();
     try {
       final String path = await saveDocument(
         _doc,
@@ -1517,6 +2008,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
         body: Column(
           children: <Widget>[
             if (banner != null) _buildBanner(banner),
+            if (_hint != null) _buildHint(_hint!),
             Expanded(child: _buildCanvasLayer()),
           ],
         ),
@@ -1537,6 +2029,29 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       title: Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
+          // Round-9 issue 03 — undo/redo live at the TOP, as asked.
+          ValueListenableBuilder<int>(
+            valueListenable: _history.revision,
+            builder: (BuildContext context, int _, Widget? child) {
+              return Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  IconButton(
+                    key: const ValueKey<String>('studio-undo'),
+                    tooltip: 'Undo',
+                    onPressed: _history.canUndo ? _undo : null,
+                    icon: const Icon(Icons.undo),
+                  ),
+                  IconButton(
+                    key: const ValueKey<String>('studio-redo'),
+                    tooltip: 'Redo',
+                    onPressed: _history.canRedo ? _redo : null,
+                    icon: const Icon(Icons.redo),
+                  ),
+                ],
+              );
+            },
+          ),
           IconButton(
             key: const ValueKey<String>('studio-zoom-out'),
             tooltip: 'Zoom out',
@@ -1625,6 +2140,31 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     );
   }
 
+  /// Round-9 — transient one-line hint (fill-tool feedback, table placement).
+  Widget _buildHint(String message) {
+    return Container(
+      key: const ValueKey<String>('studio-hint'),
+      width: double.infinity,
+      color: StudioTheme.accent.withValues(alpha: 0.14),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      child: Row(
+        children: <Widget>[
+          const Icon(Icons.info_outline, size: 16, color: StudioTheme.accent),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: const TextStyle(
+                fontSize: StudioTheme.captionSize,
+                color: StudioTheme.text,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildCanvasLayer() {
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
@@ -1647,6 +2187,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                     scale: _camera.scale,
                     boundary: _artboard.boundaryRect(),
                     style: _artboard.current.backgroundStyle,
+                    spacing: _artboard.current.backgroundSpacing,
                     pageColor: _pageColor,
                   ),
                 ),
@@ -1719,21 +2260,60 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                 ),
               ),
             ),
-            // Round-8 issue 07 — deleting a selection (free strokes included)
-            // needs a target that is not a drag, so it gets a floating action
-            // that only appears while something is selected.
+            // Round-9 issues 05/06 — the selector's per-object chrome:
+            // lock/unlock, rotate and fill float just above the selection box;
+            // a locked group also gets a lock badge. All anchored to the
+            // object, as asked, not to a global toolbar.
             if (_tool.value == StudioTool.select && _selected.isNotEmpty)
-              Positioned(
-                right: 16,
-                bottom: 16,
-                child: FloatingActionButton.small(
-                  key: const ValueKey<String>('delete-selection'),
-                  heroTag: 'delete-selection',
-                  tooltip: 'Delete selection',
-                  backgroundColor: StudioTheme.danger,
-                  onPressed: _deleteSelection,
-                  child: const Icon(Icons.delete_outline, color: Colors.white),
-                ),
+              ValueListenableBuilder<int>(
+                valueListenable: _canvasTick,
+                builder: (BuildContext context, int tick, Widget? child) {
+                  final Rect box = _selectionRect;
+                  if (box == Rect.zero) {
+                    return const SizedBox.shrink();
+                  }
+                  final Offset screenTopLeft = _camera.worldToScreen(
+                    box.topLeft,
+                    _viewport,
+                  );
+                  return Stack(
+                    children: <Widget>[
+                      if (_selectionLocked)
+                        LockBadge(anchor: screenTopLeft),
+                      SelectionActionBar(
+                        anchor: screenTopLeft,
+                        locked: _selectionLocked,
+                        canLock: _selected.isNotEmpty,
+                        canRotate: _selectionCanRotate,
+                        canFill: _selectionCanFill,
+                        filled: _selected.any((String id) {
+                          final CanvasNodeModel? n = _nodeById(id);
+                          return n != null && n.style.fill != null;
+                        }),
+                        onLock: _lockSelection,
+                        onUnlock: _unlockSelection,
+                        onRotate: _rotateSelection,
+                        onFill: _fillSelection,
+                        onDelete: _deleteSelection,
+                      ),
+                      // Round-9 issue 06 — rows are added BELOW the table and
+                      // columns to its RIGHT, where a spreadsheet puts them.
+                      if (_selectedTable != null)
+                        TableGrowHandles(
+                          rowAnchor: _camera.worldToScreen(
+                            Offset(box.center.dx, box.bottom),
+                            _viewport,
+                          ),
+                          colAnchor: _camera.worldToScreen(
+                            Offset(box.right, box.center.dy),
+                            _viewport,
+                          ),
+                          onAddRow: () => _growTable(row: true),
+                          onAddColumn: () => _growTable(row: false),
+                        ),
+                    ],
+                  );
+                },
               ),
           ],
         );

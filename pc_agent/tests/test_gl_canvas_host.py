@@ -1,4 +1,4 @@
-﻿"""Doc 06 acceptance tests — GLCanvasHost + ProgramRegistry (headless-safe).
+"""Doc 06 acceptance tests — GLCanvasHost + ProgramRegistry (headless-safe).
 
 Always-run (no GL): latest-slot/seq stale-drop semantics, drain & redraw
 coalescing, the event-matrix subscriptions, camera clamping +
@@ -136,8 +136,9 @@ def test_subscribes_to_the_matrix_events_plus_canvas_cleared() -> None:
         "COMMITTED_NODE",
         "ARTBOARD_CHANGED",
         "CANVAS_CLEARED",  # round 7 issue 06: mirror wipe
+        "ASSET_UPLOADED",  # round-9 issue 07b: image bytes landed → repaint
     ]
-    assert len(bus.on_calls) == 6
+    assert len(bus.on_calls) == 7
     assert all(callable(handler) for _, handler in bus.on_calls)
     assert host is not None
 
@@ -168,6 +169,61 @@ def test_hundred_worker_submits_schedule_one_drain_and_apply_only_newest() -> No
     assert applied[0].seq == 100
     assert host._camera == (1.0, 100.0, 200.0)
     assert host._slot is None
+
+
+def test_live_points_are_queued_not_coalesced() -> None:
+    """Round-9 issue 09: a pen stroke must reach the mirror sample-by-sample.
+
+    The latest-slot rule is right for CAMERA/LASER (state) but wrong for
+    LIVE_POINT (samples): with it, two points arriving between pumps collapsed
+    to one and the mirrored stroke only appeared once the pen lifted and the
+    committed ADD_STROKE landed.
+    """
+    _, _, host = _make_host()
+    for seq in range(1, 6):
+        host.submit_live_frame(
+            LiveFrame(FRAME_LIVE_POINT, 0x01, seq, float(seq), float(seq * 2), 1.0)
+        )
+
+    applied: list[int] = []
+    original = host._apply_frame
+
+    def spy(frame: LiveFrame) -> None:
+        applied.append(frame.seq)
+        original(frame)
+
+    host._apply_frame = spy
+    host._drain()
+
+    assert applied == [1, 2, 3, 4, 5], "every queued sample must be applied in order"
+    assert not host._live_queue
+    assert host._live_active is True
+    assert host._camera == (1.0, 0.0, 0.0)
+
+
+def test_live_end_still_uses_the_latest_slot() -> None:
+    """LIVE_END is state: the newest wins even when several are pending."""
+    _, _, host = _make_host()
+    host.submit_live_frame(LiveFrame(FRAME_LIVE_POINT, 0x01, 1, 10.0, 10.0, 1.0))
+    host.submit_live_frame(LiveFrame(FRAME_LIVE_POINT, 0x01, 2, 20.0, 20.0, 1.0))
+    host.submit_live_frame(LiveFrame(FRAME_LIVE_END, 0x01, 3, 0.0, 0.0, 0.0))
+    assert host._slot is not None and host._slot.frame_type == 2
+
+    host._drain()
+    assert not host._live_queue
+    assert host._live_active is False
+
+
+def test_live_point_queue_is_bounded() -> None:
+    """A stalled main thread must not grow the backlog without bound."""
+    from pc_agent.viewport.gl_canvas_host import LIVE_POINT_QUEUE_CAP
+
+    _, _, host = _make_host()
+    for seq in range(LIVE_POINT_QUEUE_CAP + 50):
+        host.submit_live_frame(
+            LiveFrame(FRAME_LIVE_POINT, 0x01, seq & 0xFFFF, 0.0, 0.0, 1.0)
+        )
+    assert len(host._live_queue) == LIVE_POINT_QUEUE_CAP
 
 
 def test_stale_seq_dropped_and_u16_wrap_accepted() -> None:
@@ -359,7 +415,8 @@ def test_event_routing_feeds_slot_camera_document_artboard_and_deletes() -> None
 
     live = LiveFrame(FRAME_LIVE_POINT, 0x01, 1, 10.0, 20.0, 0.5)
     bus.emit("LIVE_FRAME", frame=live)
-    assert host._slot is live, "LIVE_FRAME must land in the latest-frame slot"
+    # Round-9 issue 09: LIVE_POINTs are queued samples, not slot state.
+    assert list(host._live_queue) == [live], "LIVE_POINT must be queued in order"
 
     bus.emit("CAMERA_DELTA", frame=_camera_frame(2, scale=99.0, tx=4.0, ty=5.0))
     assert host._camera == (20.0, 4.0, 5.0), "CAMERA_DELTA clamps immediately"
@@ -432,6 +489,7 @@ def test_shutdown_unsubscribes_cancels_after_ids_and_blocks_scheduling() -> None
         "COMMITTED_NODE",
         "ARTBOARD_CHANGED",
         "CANVAS_CLEARED",
+        "ASSET_UPLOADED",
     ]
     cancelled = set(fake_tk.cancelled)
     scheduled_ids = {entry["id"] for entry in fake_tk.pending()}
@@ -442,7 +500,7 @@ def test_shutdown_unsubscribes_cancels_after_ids_and_blocks_scheduling() -> None
     host.request_redraw()
     assert len(fake_tk.scheduled) == scheduled_before, "shutdown blocks rescheduling"
     host.shutdown()  # idempotent
-    assert len(bus.off_calls) == 6
+    assert len(bus.off_calls) == 7
 
 
 def test_pyglet_config_requests_msaa4_and_core33() -> None:
@@ -713,7 +771,7 @@ def _boundary_doc(preset: str):
     if preset == "A4":
         width, height, style = 2480.0, 3508.0, "RULED"
     else:
-        width, height, style = None, None, "DOT_GRID"
+        width, height, style = None, None, "SQUARE_GRID"
     return CanvasDocument(
         canvas_id=f"doc-{preset.lower()}",
         title="Boundary probe",
@@ -863,7 +921,7 @@ def test_infinite_doc_renders_no_boundary_pixels() -> None:
 
         samples = [pixel(x, y) for y in range(0, height, 2) for x in range(0, width, 2)]
         assert any(_is_pattern_ink(rgb) for rgb in samples), (
-            "INFINITE doc must still render its DOT_GRID pattern (render ran)"
+            "INFINITE doc must still render its SQUARE_GRID pattern (render ran)"
         )
         border = [rgb for rgb in samples if _is_border_pixel(rgb)]
         assert border == [], f"INFINITE must paint no page boundary, got {border[:5]}"

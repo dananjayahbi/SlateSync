@@ -20,6 +20,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:mobile_app/canvas_engine/asset_image_cache.dart'; // round-8 issue 05
+import 'package:mobile_app/canvas_engine/shape_render_extras.dart'; // round-9 04/05/06
 import 'package:mobile_app/canvas_engine/tile_chunks.dart'; // Issue 05
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 
@@ -783,6 +784,14 @@ class TiledCanvasEngine {
   /// and re-bakes the affected tiles whenever a decode completes.
   final AssetImageCache assets = AssetImageCache();
 
+  /// Round-9 issue 07a — invoked after an asset decode invalidated tiles.
+  ///
+  /// Dropping the cached pictures is necessary but not sufficient: unless the
+  /// widget is told to repaint, the stale frame stays on screen and the image
+  /// only appeared once some unrelated edit (using the selector) forced a
+  /// frame. The canvas page points this at `setState`.
+  VoidCallback? onTilesRebaked;
+
   /// Round-8 issue 05 — after an asset finishes decoding, the tiles holding
   /// its IMAGE node must be re-baked (their cached pictures predate the
   /// bitmap). Set by the constructor-adjacent `wireAssetInvalidation()` so the
@@ -807,10 +816,19 @@ class TiledCanvasEngine {
       }
       for (final TileKey k in tilesCovering(_rectOfNode(node))) {
         cache.invalidate(k);
+        // Round-9 issue 07a — dropping ONLY the picture is not enough:
+        // `_ensureBaked` short-circuits while `_bakedBucket[k] == bucket`, so
+        // the pre-decode bake kept being served and the image stayed invisible
+        // until an unrelated structural edit (the selector) forced a rebake.
+        _bakedBucket.remove(k);
         _dirty.add(k);
       }
     }
     _rebakeCount++;
+    final VoidCallback? notify = onTilesRebaked;
+    if (notify != null) {
+      notify();
+    }
   }
 
   /// Structural camera (Doc 20): only `scale` is read.
@@ -1252,6 +1270,9 @@ Color _colorFrom(String hex, double opacity) {
 void _drawNode(Canvas canvas, CanvasNodeModel n, [AssetImageCache? assets]) {
   final Paint paint = _paintFor(n);
   final List<List<double>> pts = n.geometry.pts;
+  // Round-9 issue 04 — the interior goes UNDER the outline so the stroke keeps
+  // a crisp edge. No-op for a node without a fill.
+  paintNodeFill(canvas, n);
   switch (n.kind) {
     case 'SHAPE':
       _drawShape(canvas, n, pts, paint);
@@ -1313,6 +1334,13 @@ void _drawShape(
       _drawTriangle(canvas, pts, r, paint);
     case 'ARROW':
       _drawArrow(canvas, pts, r, paint);
+    case 'PATH':
+      // Round-9 issue 05 — a rotated RECT/CIRCLE/TRIANGLE is stored as its
+      // rotated corner polygon (the bbox contract is axis-aligned).
+      paintPath(canvas, n, paint);
+    case 'TABLE':
+      // Round-9 issue 06 — rows/columns come from `graph_config`.
+      paintTable(canvas, n, paint);
     default:
       if (pts.length < 2) {
         canvas.drawRect(r, paint);
@@ -1896,15 +1924,16 @@ const Color kPageBorderColor = Color(0xFFC6CDD8);
 /// * the white paper fill ([pageColor], `background_color` — #FFFFFF),
 /// * Doc 08 §4.2's feathered drop shadow + 1 px screen-scaled light-gray
 ///   boundary for bounded presets only (INFINITE renders neither),
-/// * Doc 08 §4.1's `RULED` (32 u), `DOT_GRID` (24 u lattice) and `ISO_GRID`
-///   (24 u, ±30° + vertical families) in light gray, clipped to the page
-///   for bounded presets and to the visible world for INFINITE.
+/// * round-9's `RULED` (horizontal rules) and `SQUARE_GRID` (closed cells),
+///   both parameterised by `background_spacing`, in light gray, clipped to
+///   the page for bounded presets and to the visible world for INFINITE.
 class CanvasBackgroundPainter extends CustomPainter {
   CanvasBackgroundPainter({
     required this.viewMatrix,
     required this.scale,
     this.boundary,
-    this.style = 'BLANK',
+    this.style = kBackgroundBlank,
+    this.spacing = kDefaultBackgroundSpacing,
     this.pageColor = const Color(0xFFFFFFFF),
     super.repaint,
   });
@@ -1915,8 +1944,11 @@ class CanvasBackgroundPainter extends CustomPainter {
   /// Bounded page rect in world units — `null` ⇒ INFINITE.
   final Rect? boundary;
 
-  /// `BLANK | RULED | DOT_GRID | ISO_GRID` (template §3).
+  /// `BLANK | RULED | SQUARE_GRID` (Doc 03, round-9).
   final String style;
+
+  /// Gap between rules / side of one square cell, world units.
+  final double spacing;
 
   /// Artboard `background_color` — the paper itself.
   final Color pageColor;
@@ -1963,75 +1995,29 @@ class CanvasBackgroundPainter extends CustomPainter {
   }
 
   void _drawPattern(Canvas canvas, Rect area, double safeScale) {
-    if (style == 'BLANK' || area.isEmpty) {
+    if (style == kBackgroundBlank || area.isEmpty) {
       return;
     }
+    final double step = spacing <= 0 ? kDefaultBackgroundSpacing : spacing;
     canvas.save();
     canvas.clipRect(area);
     final Paint line = Paint()
       ..color = kPagePatternColor
       ..strokeWidth = 1.0 / safeScale; // ≈1 screen px at any zoom (fwidth)
+    final double x0 = (area.left / step).floorToDouble() * step;
+    final double y0 = (area.top / step).floorToDouble() * step;
     switch (style) {
-      case 'RULED':
-        {
-          const double step = 32;
-          final double y0 = (area.top / step).floorToDouble() * step;
-          for (double y = y0; y <= area.bottom; y += step) {
-            canvas.drawLine(Offset(area.left, y), Offset(area.right, y), line);
-          }
+      case kBackgroundRuled:
+        for (double y = y0; y <= area.bottom; y += step) {
+          canvas.drawLine(Offset(area.left, y), Offset(area.right, y), line);
         }
-      case 'DOT_GRID':
-        {
-          const double step = 24;
-          final double r = step * 0.125;
-          final Paint dot = Paint()..color = kPagePatternColor;
-          final double x0 = (area.left / step).floorToDouble() * step;
-          final double y0 = (area.top / step).floorToDouble() * step;
-          for (double x = x0; x <= area.right; x += step) {
-            for (double y = y0; y <= area.bottom; y += step) {
-              canvas.drawCircle(Offset(x, y), r, dot);
-            }
-          }
+      case kBackgroundSquareGrid:
+        // Round-9: both families ⇒ closed cells of `spacing` world units.
+        for (double y = y0; y <= area.bottom; y += step) {
+          canvas.drawLine(Offset(area.left, y), Offset(area.right, y), line);
         }
-      case 'ISO_GRID':
-        {
-          // Doc 26 §5.5 isometric families (-30°, +30°, vertical), anchored
-          // to the world lattice so the grid pans with the paper.
-          const double step = 24;
-          final double diag = area.width + area.height;
-          for (final double angle in const <double>[
-            -math.pi / 6,
-            math.pi / 6,
-            math.pi / 2,
-          ]) {
-            final double ux = math.cos(angle);
-            final double uy = math.sin(angle);
-            final double nx = -uy;
-            final double ny = ux;
-            double minD = double.infinity;
-            double maxD = -double.infinity;
-            for (final Offset c in <Offset>[
-              area.topLeft,
-              area.topRight,
-              area.bottomLeft,
-              area.bottomRight,
-            ]) {
-              final double d = c.dx * nx + c.dy * ny;
-              if (d < minD) minD = d;
-              if (d > maxD) maxD = d;
-            }
-            // 1e-9 slop absorbs float32 trig rounding (e.g. sin(π/6) being
-            // 0.49999999999999994 would otherwise ceil past a lattice point).
-            final double d0 = ((minD / step) - 1e-9).ceilToDouble() * step;
-            for (double d = d0; d <= maxD; d += step) {
-              final Offset base = Offset(nx * d, ny * d);
-              canvas.drawLine(
-                base - Offset(ux, uy) * diag,
-                base + Offset(ux, uy) * diag,
-                line,
-              );
-            }
-          }
+        for (double x = x0; x <= area.right; x += step) {
+          canvas.drawLine(Offset(x, area.top), Offset(x, area.bottom), line);
         }
     }
     canvas.restore();
@@ -2040,6 +2026,7 @@ class CanvasBackgroundPainter extends CustomPainter {
   @override
   bool shouldRepaint(CanvasBackgroundPainter oldDelegate) =>
       oldDelegate.style != style ||
+      oldDelegate.spacing != spacing ||
       oldDelegate.pageColor != pageColor ||
       oldDelegate.boundary != boundary ||
       oldDelegate.scale != scale ||

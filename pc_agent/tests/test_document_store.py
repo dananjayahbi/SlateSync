@@ -222,7 +222,7 @@ def test_document_json_key_order_is_frozen(env: _Env) -> None:
     ]
     assert list(data["artboard"]) == [
         "preset", "width", "height", "is_infinite", "background_style",
-        "background_color",
+        "background_color", "background_spacing",
     ]
     assert list(data["content_bounds"]) == ["min_x", "min_y", "max_x", "max_y"]
 
@@ -231,8 +231,72 @@ def test_document_json_key_order_is_frozen(env: _Env) -> None:
     data = json.loads(_read_doc_json(path))
     element = data["elements"][0]
     assert list(element) == ["node_id", "kind", "layer", "bbox", "style", "geometry"]
+    # Round-9: `fill` is OPTIONAL and appended after the frozen four, so an
+    # unfilled node's style keeps its exact pre-round-9 key list.
     assert list(element["style"]) == ["color", "stroke_width", "opacity", "blend_mode"]
     assert list(element["geometry"]) == ["pts", "shape_type", "graph_config", "asset_ref"]
+
+
+def test_fill_and_groups_round_trip_without_changing_legacy_documents(
+    env: _Env,
+) -> None:
+    """Round-9 issues 04/05 — new state must be OPTIONAL on the wire."""
+    _bus, _config, graph, store = env
+    doc = store.new("A4", "Round 9")
+
+    # An untouched document emits neither `fill` nor `groups`, so a pre-round-9
+    # archive still round-trips byte-identically (asserted above).
+    path = store.save(doc)
+    data = json.loads(_read_doc_json(path))
+    assert "groups" not in data
+
+    graph.insert(
+        CanvasNode(
+            node_id="filled",
+            kind="SHAPE",
+            layer=0,
+            bbox=(0.0, 0.0, 10.0, 10.0),
+            style=NodeStyle(fill="#FF0000"),
+            geometry=NodeGeometry(pts=[], shape_type="RECT"),
+        )
+    )
+    doc.groups = {"grp-1": ["filled"]}
+    path = store.save(doc)
+    data = json.loads(_read_doc_json(path))
+    assert data["elements"][0]["style"]["fill"] == "#FF0000"
+    assert data["groups"] == {"grp-1": ["filled"]}
+
+    reloaded = store.open(path)
+    assert reloaded.groups == {"grp-1": ["filled"]}
+    assert reloaded.elements[0].style.fill == "#FF0000"
+
+
+def test_a_malformed_fill_or_groups_map_never_breaks_a_load(env: _Env) -> None:
+    """A hand-edited archive must still open — drop the bad value, keep the node."""
+    _bus, _config, graph, store = env
+    doc = store.new("A4", "Hostile")
+    graph.insert(_element("e", (1.0, 2.0, 3.0, 4.0)))
+    path = store.save(doc)
+    raw = json.loads(_read_doc_json(path))
+    raw["elements"][0]["style"]["fill"] = "not-a-colour"
+    raw["groups"] = {"grp-1": "not-a-list", "": ["dropped"]}
+
+    # The container is a ZIP, so rewrite document.json in place rather than
+    # replacing the file with bare JSON.
+    with zipfile.ZipFile(path, "r") as archive:
+        assets = {
+            name: archive.read(name)
+            for name in archive.namelist()
+            if name != "document.json"
+        }
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("document.json", json.dumps(raw))
+        for name, blob in assets.items():
+            archive.writestr(name, blob)
+
+    reloaded = store.open(path)
+    assert reloaded.elements[0].style.fill is None
+    assert reloaded.groups == {}
 
 
 def test_asset_upload_flow_embeds_and_reextracts(env: _Env) -> None:

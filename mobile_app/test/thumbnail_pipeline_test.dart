@@ -431,7 +431,7 @@ void main() {
           final CanvasDocumentModel d2 = buildNewCanvasDocument(
             title: 'Legacy Two',
             preset: 'INFINITE',
-            background: 'DOT_GRID',
+            background: 'SQUARE_GRID',
             canvasId: 'bf-2',
             now: 900,
           );

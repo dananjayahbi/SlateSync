@@ -26,12 +26,13 @@ import threading
 import time
 import uuid
 import zipfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from pc_agent.core.config_manager import AppConfig
 from pc_agent.core.events import (
     ARTBOARD_CHANGED,
+    ASSET_UPLOADED,
     COMMITTED_NODE,
     DOCUMENT_LOADED,
     RPC_MESSAGE,
@@ -54,8 +55,20 @@ _MAX_CHUNK_RAW = 262144
 
 _ZERO_BOUNDS: dict[str, float] = {"min_x": 0.0, "min_y": 0.0, "max_x": 0.0, "max_y": 0.0}
 _BOUND_KEYS = ("min_x", "min_y", "max_x", "max_y")
-_STYLE_KEYS = ("color", "stroke_width", "opacity", "blend_mode")
+_STYLE_KEYS = ("color", "stroke_width", "opacity", "blend_mode", "fill")
 _GEOM_KEYS = ("pts", "shape_type", "graph_config", "asset_ref")
+
+
+#: Round-9 background support: the three live styles plus the legacy two that
+#: still open (mapped to BLANK) so pre-round-9 documents are never rejected.
+LIVE_BACKGROUND_STYLES = ("BLANK", "RULED", "SQUARE_GRID")
+LEGACY_BACKGROUND_STYLES = ("DOT_GRID", "ISO_GRID")
+#: Default rule gap / square side in world units (Doc 03 `background_spacing`).
+DEFAULT_BACKGROUND_SPACING = 32.0
+#: Guard rails for a hostile `background_spacing` (0 would divide by zero in
+#: the pattern shaders and every exporter).
+MIN_BACKGROUND_SPACING = 1.0
+MAX_BACKGROUND_SPACING = 2000.0
 
 
 @dataclass
@@ -66,6 +79,8 @@ class Artboard:
     is_infinite: bool = False
     background_style: str = "BLANK"
     background_color: str = "#FFFFFF"
+    #: World-unit gap between rules (RULED) or square side (SQUARE_GRID).
+    background_spacing: float = DEFAULT_BACKGROUND_SPACING
 
 
 @dataclass
@@ -77,6 +92,10 @@ class CanvasDocument:
     artboard: Artboard
     content_bounds: dict[str, float]
     elements: list[CanvasNode]
+    #: Round-9 issue 05 — lock groups, ``group_id -> [node_id, ...]``. Empty for
+    #: a document that never used the selector's lock, so every pre-round-9
+    #: archive loads and re-saves byte-identically.
+    groups: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -89,6 +108,29 @@ class _Transfer:
     chunks: list[bytes | None]
 
 
+def _normalize_background_style(value: object) -> str:
+    """Round-9 style normaliser: unknown and legacy styles become ``BLANK``.
+
+    ``DOT_GRID`` / ``ISO_GRID`` were removed from the Doc 03 enum, but a
+    round-8 document still carries them. Mapping rather than raising keeps
+    every previously saved canvas openable (the alternative — a hard failure —
+    would make the user's own documents unreadable after an upgrade).
+    """
+    style = str(value or "BLANK").strip().upper()
+    return style if style in LIVE_BACKGROUND_STYLES else "BLANK"
+
+
+def _normalize_background_spacing(value: object) -> float:
+    """Positive, finite world-unit spacing clamped to the guard rails."""
+    try:
+        spacing = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_BACKGROUND_SPACING
+    if not (spacing == spacing) or spacing in (float("inf"), float("-inf")):
+        return DEFAULT_BACKGROUND_SPACING  # NaN / ±inf
+    return max(MIN_BACKGROUND_SPACING, min(MAX_BACKGROUND_SPACING, spacing))
+
+
 def _artboard_to_json(artboard: Artboard) -> dict:
     return {
         "preset": artboard.preset,
@@ -97,6 +139,7 @@ def _artboard_to_json(artboard: Artboard) -> dict:
         "is_infinite": artboard.is_infinite,
         "background_style": artboard.background_style,
         "background_color": artboard.background_color,
+        "background_spacing": artboard.background_spacing,
     }
 
 
@@ -147,8 +190,11 @@ def _artboard_from_json(data: dict) -> Artboard:
         width=width,
         height=height,
         is_infinite=is_infinite,
-        background_style=data.get("background_style", "BLANK"),
+        background_style=_normalize_background_style(data.get("background_style")),
         background_color=data.get("background_color", "#FFFFFF"),
+        background_spacing=_normalize_background_spacing(
+            data.get("background_spacing", DEFAULT_BACKGROUND_SPACING)
+        ),
     )
 
 
@@ -165,17 +211,36 @@ def artboard_is_infinite(artboard: Artboard) -> bool:
 
 
 def _style_to_json(style: NodeStyle) -> dict:
-    return {
+    data = {
         "color": style.color,
         "stroke_width": style.stroke_width,
         "opacity": style.opacity,
         "blend_mode": style.blend_mode,
     }
+    # Round-9 issue 04 — only emitted when set, so every pre-round-9 document
+    # round-trips byte-identically.
+    fill = getattr(style, "fill", None)
+    if fill:
+        data["fill"] = fill
+    return data
 
 
 def _style_from_json(data: dict | None) -> NodeStyle:
     data = data or {}
-    return NodeStyle(**{k: data[k] for k in _STYLE_KEYS if k in data})
+    kwargs = {k: data[k] for k in _STYLE_KEYS if k in data}
+    fill = kwargs.get("fill")
+    if fill is not None and not _is_hex_colour(fill):
+        # A malformed fill must never poison the node: drop it and keep the
+        # outline, which is what the document looked like before the tap.
+        kwargs.pop("fill", None)
+    return NodeStyle(**kwargs)
+
+
+def _is_hex_colour(value: object) -> bool:
+    """Doc 03 ``^#[0-9A-Fa-f]{6}$`` guard for the round-9 ``fill`` field."""
+    if not isinstance(value, str) or len(value) != 7 or value[0] != "#":
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in value[1:])
 
 
 def _geometry_to_json(geometry: NodeGeometry) -> dict:
@@ -219,7 +284,7 @@ def _node_from_json(data: dict) -> CanvasNode:
 
 def _doc_to_json(doc: CanvasDocument) -> dict:
     """Frozen top-level key order (overview §4.3) — byte-stable across saves."""
-    return {
+    data = {
         "canvas_id": doc.canvas_id,
         "title": doc.title,
         "created_at": int(doc.created_at),
@@ -228,6 +293,45 @@ def _doc_to_json(doc: CanvasDocument) -> dict:
         "content_bounds": {k: float(doc.content_bounds[k]) for k in _BOUND_KEYS},
         "elements": [_node_to_json(n) for n in doc.elements],
     }
+    # Round-9 issue 05 — omitted when empty so pre-round-9 archives stay
+    # byte-identical through a load/save cycle.
+    groups = _groups_to_json(doc)
+    if groups:
+        data["groups"] = groups
+    return data
+
+
+def _groups_to_json(doc: CanvasDocument) -> dict[str, list[str]]:
+    """Sanitised ``groups`` map: non-empty groups of non-empty node ids only."""
+    out: dict[str, list[str]] = {}
+    raw = getattr(doc, "groups", None)
+    if not isinstance(raw, dict):
+        return out
+    for group_id, members in raw.items():
+        if not isinstance(group_id, str) or not group_id:
+            continue
+        if not isinstance(members, (list, tuple)):
+            continue
+        ids = [str(m) for m in members if isinstance(m, str) and m]
+        if ids:
+            out[group_id] = ids
+    return out
+
+
+def _groups_from_json(value: object) -> dict[str, list[str]]:
+    """Tolerant reader: a malformed ``groups`` map is dropped, never fatal."""
+    out: dict[str, list[str]] = {}
+    if not isinstance(value, dict):
+        return out
+    for group_id, members in value.items():
+        if not isinstance(group_id, str) or not group_id:
+            continue
+        if not isinstance(members, (list, tuple)):
+            continue
+        ids = [m for m in members if isinstance(m, str) and m]
+        if ids:
+            out[group_id] = ids
+    return out
 
 
 def _doc_from_json(data: dict) -> CanvasDocument:
@@ -242,6 +346,7 @@ def _doc_from_json(data: dict) -> CanvasDocument:
             artboard=_artboard_from_json(data["artboard"]),
             content_bounds={k: float(data["content_bounds"][k]) for k in _BOUND_KEYS},
             elements=[_node_from_json(e) for e in data["elements"]],
+            groups=_groups_from_json(data.get("groups")),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid document.json: {exc}") from exc
@@ -409,6 +514,50 @@ class DocumentStore:
             self._dirty = False
         self._bus.emit(DOCUMENT_LOADED, doc=doc)  # state set BEFORE emit (Doc 10 §4)
         return doc
+
+    def sync_artboard(
+        self, canvas_id: str, artboard: Artboard, updated_at: int | None = None
+    ) -> bool:
+        """Round-9 issue 08 — apply an artboard change to an ALREADY-OPEN canvas.
+
+        A tablet artboard edit (background style/spacing, paper colour, size)
+        reaches the hub as a full ``CANVAS_PUT``. Before round 9 the store only
+        rebuilt the artboard inside :meth:`open_payload`, i.e. on a canvas
+        *switch*, so editing the background of the canvas the PC already
+        mirrors left the mirror painting the previous pattern forever.
+
+        ``updated_at`` guards against an out-of-order (older) PUT downgrading
+        the mirror. Returns ``True`` when the open document was the one
+        addressed and the scene artboard was replaced (which also emits
+        ``ARTBOARD_CHANGED`` so ``GLCanvasHost`` repaints).
+        """
+        canvas_id = str(canvas_id)
+        with self._lock:
+            current = self._current
+            if current is None or str(getattr(current, "canvas_id", "")) != canvas_id:
+                return False
+            if updated_at is not None and int(updated_at) < int(current.updated_at):
+                return False
+            target = current.artboard
+            # Mutate the EXISTING instance in place: the scene graph, the GL
+            # host and any in-flight exporter may already hold this reference
+            # and must observe the new page look (round-9 issue 08).
+            target.preset = artboard.preset
+            target.width = artboard.width
+            target.height = artboard.height
+            target.is_infinite = artboard.is_infinite
+            target.background_style = artboard.background_style
+            target.background_color = artboard.background_color
+            target.background_spacing = artboard.background_spacing
+            if updated_at is not None:
+                current.updated_at = int(updated_at)
+        self._scene.set_artboard(target)
+        self._bus.emit(
+            ARTBOARD_CHANGED,
+            artboard=target,
+            content_bounds=self._scene.content_bounds(),
+        )
+        return True
 
     def save(self, doc: CanvasDocument, path: Path | None = None) -> Path:
         """Atomic ZIP write; ``path`` falls back to ``current_path``, else
@@ -641,6 +790,10 @@ class DocumentStore:
             return
         with self._lock:
             self._dirty = True
+        # Round-9 issue 07b — the IMAGE node was committed (and drawn with the
+        # placeholder) BEFORE these bytes existed, so the viewport has to drop
+        # its cached textures now or the mirror keeps the filled block.
+        self._bus.emit(ASSET_UPLOADED, canvas_id=str(canvas_id), filename=name)
 
     def _discard(self, transfer_id: str, reason: str) -> None:
         with self._lock:

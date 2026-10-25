@@ -146,6 +146,8 @@ class ToolPropertyPanel extends StatelessWidget {
         return _strokeRows(tool, cfg);
       case StudioTool.eraser:
         return _eraserRows(cfg);
+      case StudioTool.fill:
+        return _fillRows(cfg);
       case StudioTool.line:
         return <Widget>[
           _tipSizeRow(cfg),
@@ -209,6 +211,18 @@ class ToolPropertyPanel extends StatelessWidget {
             style: toolPanelCaptionStyle,
           ),
         ];
+      case StudioTool.table:
+        return <Widget>[
+          _tipSizeRow(cfg),
+          const SizedBox(height: 4),
+          _paletteRow(cfg),
+          const SizedBox(height: 8),
+          const Text(
+            'Drag on the canvas to place the table. Rows, columns and the '
+            'header bands are chosen in the popup that opens with the tool.',
+            style: toolPanelCaptionStyle,
+          ),
+        ];
       case StudioTool.image:
         return <Widget>[
           FilledButton.icon(
@@ -225,6 +239,21 @@ class ToolPropertyPanel extends StatelessWidget {
           ),
         ];
     }
+  }
+
+  /// Round-9 issue 04 — the paint bucket's panel: one colour, no width (a fill
+  /// has no stroke of its own; the outline keeps the node's existing colour).
+  List<Widget> _fillRows(ToolConfig cfg) {
+    return <Widget>[
+      _paletteRow(cfg),
+      const SizedBox(height: 8),
+      const Text(
+        'Tap inside a CLOSED shape, or inside a pen loop that ends where it '
+        'started. The outline is kept and the interior takes this colour. '
+        'Tap a filled shape again to clear its fill.',
+        style: toolPanelCaptionStyle,
+      ),
+    ];
   }
 
   List<Widget> _strokeRows(StudioTool tool, ToolConfig cfg) {
@@ -489,6 +518,7 @@ String _toolLabel(StudioTool tool) => switch (tool) {
   StudioTool.pen => 'Pen',
   StudioTool.highlighter => 'Highlighter',
   StudioTool.eraser => 'Eraser',
+  StudioTool.fill => 'Fill',
   StudioTool.line => 'Line',
   StudioTool.rect => 'Rectangle',
   StudioTool.circle => 'Circle',
@@ -496,5 +526,6 @@ String _toolLabel(StudioTool tool) => switch (tool) {
   StudioTool.arrow => 'Arrow',
   StudioTool.cartesianGraph => 'Cartesian Graph',
   StudioTool.numberLine => 'Number Line',
+  StudioTool.table => 'Table',
   StudioTool.image => 'Image',
 };

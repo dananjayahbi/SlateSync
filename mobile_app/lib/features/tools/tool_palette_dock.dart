@@ -14,13 +14,13 @@ import 'package:mobile_app/core/theme/studio_theme.dart';
 import 'package:mobile_app/features/tools/tool_property_panels.dart';
 
 /// Tools exposed by the dock rail (Doc 24 §4; round-8 issue 07 added
-/// [select] as the FIRST tool — tapping an object to move/resize it is now
-/// the default way to work with existing content).
+/// [select] as the FIRST tool, round-9 issues 04/06 added [fill] and [table]).
 enum StudioTool {
   select,
   pen,
   highlighter,
   eraser,
+  fill,
   line,
   rect,
   circle,
@@ -28,6 +28,7 @@ enum StudioTool {
   arrow,
   cartesianGraph,
   numberLine,
+  table,
   image,
 }
 
@@ -71,6 +72,8 @@ int toolIdFor(StudioTool tool) => switch (tool) {
   StudioTool.arrow ||
   StudioTool.cartesianGraph ||
   StudioTool.numberLine ||
+  StudioTool.table ||
+  StudioTool.fill ||
   StudioTool.image => ToolId.shapePreview,
 };
 
@@ -168,8 +171,12 @@ ToolConfig defaultToolConfig(StudioTool tool) {
     case StudioTool.circle:
     case StudioTool.triangle:
     case StudioTool.arrow:
+    case StudioTool.table:
     case StudioTool.image:
       break; // Frozen Doc 24 §6 defaults: #1E1E1E / 2.5 / 1.0.
+    case StudioTool.fill:
+      cfg.width = 2.5; // fill only changes the interior colour
+      break;
     case StudioTool.highlighter:
       cfg.color = '#F1C40F';
       cfg.width = 8.0;
@@ -337,11 +344,16 @@ class _ToolDockState extends State<ToolDock> {
     }
   }
 
-  /// Compact rail buttons: 13×40 dp + dividers must fit a 600 dp-tall
-  /// viewport (the round-6 clear button would otherwise overflow the rail).
+  /// Compact rail buttons: 15×40 dp + divider + the clear button must fit a
+  /// 600 dp-tall viewport at the CURRENT tool count (round-9 added fill and
+  /// table, so the rail is now 14 tools + clear). Shrinking to 36 dp keeps the
+  /// whole dock inside 600 px without a scroller, which matters because the
+  /// dock is laid out inside a fixed-height column.
   static ButtonStyle _railButtonStyle({Color? background}) =>
       IconButton.styleFrom(
-        minimumSize: const Size(40, 40),
+        minimumSize: const Size(40, 36),
+        maximumSize: const Size(48, 36),
+        padding: EdgeInsets.zero,
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
         backgroundColor: background,
       );
@@ -686,27 +698,33 @@ class _ToolDockState extends State<ToolDock> {
       elevation: 6,
       borderRadius: BorderRadius.circular(StudioTheme.radiusSmall),
       clipBehavior: Clip.antiAlias,
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          const SizedBox(height: 4),
-          for (final StudioTool t in StudioTool.values) _buildToolButton(t),
-          const SizedBox(height: 4),
-          // Round-6 utility row (Doc 02 §10.7): destructive clear, gated by
-          // a confirmation dialog before onClearRequested fires.
-          const Divider(height: 1, thickness: 1, indent: 6, endIndent: 6),
-          IconButton(
-            key: const ValueKey<String>('clear-canvas'),
-            tooltip: 'Clear canvas',
-            onPressed: _confirmClear,
-            style: _railButtonStyle(),
-            icon: const Icon(
-              Icons.layers_clear,
-              size: 22,
-              color: StudioTheme.danger,
+      // Round-9: 14 tools + clear no longer fit a 600 dp-tall viewport on the
+      // real device, so the rail scrolls instead of overflowing. The dock is
+      // hosted inside a SingleChildScrollView by the canvas page, but a widget
+      // test (and any host that sizes it to the viewport) needs its own bound.
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            const SizedBox(height: 4),
+            for (final StudioTool t in StudioTool.values) _buildToolButton(t),
+            const SizedBox(height: 4),
+            // Round-6 utility row (Doc 02 §10.7): destructive clear, gated by
+            // a confirmation dialog before onClearRequested fires.
+            const Divider(height: 1, thickness: 1, indent: 6, endIndent: 6),
+            IconButton(
+              key: const ValueKey<String>('clear-canvas'),
+              tooltip: 'Clear canvas',
+              onPressed: _confirmClear,
+              style: _railButtonStyle(),
+              icon: const Icon(
+                Icons.layers_clear,
+                size: 22,
+                color: StudioTheme.danger,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -767,6 +785,7 @@ String _toolLabel(StudioTool tool) => switch (tool) {
   StudioTool.pen => 'Pen',
   StudioTool.highlighter => 'Highlighter',
   StudioTool.eraser => 'Eraser',
+  StudioTool.fill => 'Fill',
   StudioTool.line => 'Line',
   StudioTool.rect => 'Rectangle',
   StudioTool.circle => 'Circle',
@@ -774,6 +793,7 @@ String _toolLabel(StudioTool tool) => switch (tool) {
   StudioTool.arrow => 'Arrow',
   StudioTool.cartesianGraph => 'Cartesian Graph',
   StudioTool.numberLine => 'Number Line',
+  StudioTool.table => 'Table',
   StudioTool.image => 'Image',
 };
 
@@ -782,6 +802,7 @@ IconData _toolIcon(StudioTool tool) => switch (tool) {
   StudioTool.pen => Icons.draw,
   StudioTool.highlighter => Icons.highlight,
   StudioTool.eraser => Icons.cleaning_services,
+  StudioTool.fill => Icons.format_color_fill,
   StudioTool.line => Icons.horizontal_rule,
   StudioTool.rect => Icons.crop_square,
   StudioTool.circle => Icons.circle,
@@ -789,6 +810,7 @@ IconData _toolIcon(StudioTool tool) => switch (tool) {
   StudioTool.arrow => Icons.north_east,
   StudioTool.cartesianGraph => Icons.show_chart,
   StudioTool.numberLine => Icons.numbers,
+  StudioTool.table => Icons.table_chart,
   StudioTool.image => Icons.image,
 };
 

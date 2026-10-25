@@ -2,7 +2,10 @@
 /// Docs 20–27. Wire JSON keys are snake_case; Dart fields are camelCase.
 library;
 
+import 'dart:math' as math;
 import 'dart:typed_data';
+
+import 'package:flutter/widgets.dart' show Offset, Rect;
 
 // ---------------------------------------------------------------------------
 // Wire frame half (mirrors shared_specs/binary_stream_frame.json, Doc 02)
@@ -101,6 +104,56 @@ class Presets {
   static const letter = (2550.0, 3300.0);
 }
 
+/// Background styles (round-9: `DOT_GRID` / `ISO_GRID` retired in favour of
+/// `SQUARE_GRID`). Legacy documents that still carry a retired style are
+/// mapped to [kBackgroundBlank] by [normalizeBackgroundStyle] on load.
+const String kBackgroundBlank = 'BLANK';
+const String kBackgroundRuled = 'RULED';
+const String kBackgroundSquareGrid = 'SQUARE_GRID';
+
+/// The three selectable styles, in picker order.
+const List<String> kBackgroundStyles = <String>[
+  kBackgroundBlank,
+  kBackgroundRuled,
+  kBackgroundSquareGrid,
+];
+
+/// Retired Doc 03 styles (still present in pre-round-9 documents).
+const List<String> kRetiredBackgroundStyles = <String>['DOT_GRID', 'ISO_GRID'];
+
+/// Default rule gap / square side in world units (Doc 03 `background_spacing`).
+const double kDefaultBackgroundSpacing = 32.0;
+
+/// Selectable spacing steps for RULED / SQUARE_GRID (world units).
+const List<double> kBackgroundSpacingPresets = <double>[8, 16, 24, 32, 48, 64, 96];
+
+/// Maps any stored style onto one of [kBackgroundStyles].
+///
+/// Unknown or retired values become [kBackgroundBlank] so a round-8 document
+/// ("DOT_GRID") still opens instead of failing to parse.
+String normalizeBackgroundStyle(Object? value) {
+  final String style = (value ?? '').toString().trim().toUpperCase();
+  return kBackgroundStyles.contains(style) ? style : kBackgroundBlank;
+}
+
+/// Clamps a stored spacing into the sane range used by every renderer.
+double normalizeBackgroundSpacing(Object? value) {
+  if (value is num) {
+    final double spacing = value.toDouble();
+    if (spacing.isFinite && spacing >= 1 && spacing <= 2000) {
+      return spacing;
+    }
+  }
+  return kDefaultBackgroundSpacing;
+}
+
+/// Human-readable name for a background style key.
+String backgroundLabel(Object? value) => switch (normalizeBackgroundStyle(value)) {
+      kBackgroundRuled => 'Ruled',
+      kBackgroundSquareGrid => 'Square grid',
+      _ => 'Blank',
+    };
+
 class Artboard {
   String preset;
   double? width;
@@ -109,6 +162,9 @@ class Artboard {
   String backgroundStyle;
   String backgroundColor;
 
+  /// Gap between rules (RULED) or cell side (SQUARE_GRID), world units.
+  double backgroundSpacing;
+
   Artboard({
     required this.preset,
     required this.width,
@@ -116,20 +172,23 @@ class Artboard {
     required this.isInfinite,
     required this.backgroundStyle,
     required this.backgroundColor,
+    this.backgroundSpacing = kDefaultBackgroundSpacing,
   });
 
   /// INFINITE artboard: null dims, `is_infinite == true`.
   factory Artboard.infinite({
-    String backgroundStyle = 'BLANK',
+    String backgroundStyle = kBackgroundBlank,
     String backgroundColor = '#FFFFFF',
+    double backgroundSpacing = kDefaultBackgroundSpacing,
   }) =>
       Artboard(
         preset: 'INFINITE',
         width: null,
         height: null,
         isInfinite: true,
-        backgroundStyle: backgroundStyle,
+        backgroundStyle: normalizeBackgroundStyle(backgroundStyle),
         backgroundColor: backgroundColor,
+        backgroundSpacing: normalizeBackgroundSpacing(backgroundSpacing),
       );
 
   factory Artboard.fromJson(Map<String, dynamic> json) => Artboard(
@@ -137,8 +196,9 @@ class Artboard {
         width: (json['width'] as num?)?.toDouble(),
         height: (json['height'] as num?)?.toDouble(),
         isInfinite: json['is_infinite'] as bool,
-        backgroundStyle: json['background_style'] as String,
+        backgroundStyle: normalizeBackgroundStyle(json['background_style']),
         backgroundColor: json['background_color'] as String,
+        backgroundSpacing: normalizeBackgroundSpacing(json['background_spacing']),
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -148,6 +208,7 @@ class Artboard {
         'is_infinite': isInfinite,
         'background_style': backgroundStyle,
         'background_color': backgroundColor,
+        'background_spacing': backgroundSpacing,
       };
 }
 
@@ -157,11 +218,17 @@ class NodeStyleModel {
   double opacity;
   String blendMode;
 
+  /// Round-9 issue 04 — interior paint set by the fill tool, `null` when the
+  /// node has no fill. A node with a fill paints this colour inside its
+  /// outline; `stroke_width == 0` is the legacy "fill with [color]" spelling.
+  String? fill;
+
   NodeStyleModel({
     required this.color,
     required this.strokeWidth,
     required this.opacity,
     required this.blendMode,
+    this.fill,
   });
 
   factory NodeStyleModel.fromJson(Map<String, dynamic> json) => NodeStyleModel(
@@ -169,6 +236,7 @@ class NodeStyleModel {
         strokeWidth: (json['stroke_width'] as num).toDouble(),
         opacity: (json['opacity'] as num).toDouble(),
         blendMode: json['blend_mode'] as String,
+        fill: normalizeFill(json['fill']),
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -176,7 +244,19 @@ class NodeStyleModel {
         'stroke_width': strokeWidth,
         'opacity': opacity,
         'blend_mode': blendMode,
+        if (fill != null) 'fill': fill,
       };
+}
+
+/// `#RRGGBB` fill colour, or `null` when absent/malformed (Doc 03 pattern).
+String? normalizeFill(Object? value) {
+  if (value is! String) {
+    return null;
+  }
+  final String token = value.trim();
+  return RegExp(r'^#[0-9A-Fa-f]{6}$').hasMatch(token)
+      ? token.toUpperCase()
+      : null;
 }
 
 class NodeGeometryModel {
@@ -264,6 +344,15 @@ class CanvasDocumentModel {
   Map<String, double> contentBounds;
   List<CanvasNodeModel> elements;
 
+  /// Round-9 issue 05 — locked groups, `group_id → member node_ids`.
+  ///
+  /// A node flag cannot express this: `NodeStyle` is frozen at
+  /// `color/stroke_width/opacity/blend_mode` (Doc 03), and a group is a
+  /// DOCUMENT-level relation anyway (one node may only belong to one group).
+  /// A group behaves as a single object until it is unlocked: selecting any
+  /// member selects the whole group and transforms apply to every member.
+  Map<String, List<String>> groups;
+
   CanvasDocumentModel({
     required this.canvasId,
     required this.title,
@@ -272,7 +361,8 @@ class CanvasDocumentModel {
     required this.artboard,
     required this.contentBounds,
     required this.elements,
-  });
+    Map<String, List<String>>? groups,
+  }) : groups = groups ?? <String, List<String>>{};
 
   factory CanvasDocumentModel.fromJson(Map<String, dynamic> json) =>
       CanvasDocumentModel(
@@ -287,6 +377,7 @@ class CanvasDocumentModel {
         elements: (json['elements'] as List<dynamic>)
             .map((e) => CanvasNodeModel.fromJson(e as Map<String, dynamic>))
             .toList(),
+        groups: _groupsFromJson(json['groups']),
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -297,7 +388,18 @@ class CanvasDocumentModel {
         'artboard': artboard.toJson(),
         'content_bounds': contentBounds,
         'elements': elements.map((e) => e.toJson()).toList(),
+        if (groups.isNotEmpty) 'groups': groups,
       };
+
+  /// The group [nodeId] belongs to, or `null` when it is free.
+  String? groupOf(String nodeId) {
+    for (final MapEntry<String, List<String>> e in groups.entries) {
+      if (e.value.contains(nodeId)) {
+        return e.key;
+      }
+    }
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -317,3 +419,80 @@ Map<String, double> _boundsFromJson(Map<String, dynamic> json) =>
       'max_x': (json['max_x'] as num).toDouble(),
       'max_y': (json['max_y'] as num).toDouble(),
     };
+
+/// Tolerant `groups` reader: unknown shapes are dropped rather than fatal, so
+/// a hand-edited or future document still opens.
+Map<String, List<String>> _groupsFromJson(Object? value) {
+  if (value is! Map) {
+    return <String, List<String>>{};
+  }
+  final Map<String, List<String>> out = <String, List<String>>{};
+  for (final MapEntry<dynamic, dynamic> e in value.entries) {
+    final String id = e.key.toString();
+    final Object? members = e.value;
+    if (id.isEmpty || members is! List) {
+      continue;
+    }
+    final List<String> ids = <String>[
+      for (final Object? m in members)
+        if (m is String && m.isNotEmpty) m,
+    ];
+    if (ids.isNotEmpty) {
+      out[id] = ids;
+    }
+  }
+  return out;
+}
+
+/// Rounds the four edges of [rect] into a rotation rectangle for [angle]
+/// radians around the centre (round-9 issue 05 — rotated shapes are stored as
+/// a `PATH` polygon, so no renderer needs a rotation field).
+List<List<double>> rotatedRectPoints(Rect rect, double angle) {
+  final Offset c = rect.center;
+  final double cos = math.cos(angle);
+  final double sin = math.sin(angle);
+  Offset rotate(Offset p) {
+    final double dx = p.dx - c.dx;
+    final double dy = p.dy - c.dy;
+    return Offset(c.dx + dx * cos - dy * sin, c.dy + dx * sin + dy * cos);
+  }
+
+  final List<Offset> corners = <Offset>[
+    rotate(rect.topLeft),
+    rotate(rect.topRight),
+    rotate(rect.bottomRight),
+    rotate(rect.bottomLeft),
+  ];
+  return <List<double>>[
+    for (final Offset p in corners) <double>[p.dx, p.dy],
+  ];
+}
+
+/// Axis-aligned bounds of [pts] (no padding).
+List<double> pointsBounds(List<List<double>> pts) {
+  if (pts.isEmpty) {
+    return <double>[0, 0, 0, 0];
+  }
+  double minX = pts.first[0];
+  double minY = pts.first[1];
+  double maxX = minX;
+  double maxY = minY;
+  for (final List<double> p in pts) {
+    if (p.length < 2) {
+      continue;
+    }
+    if (p[0] < minX) {
+      minX = p[0];
+    }
+    if (p[1] < minY) {
+      minY = p[1];
+    }
+    if (p[0] > maxX) {
+      maxX = p[0];
+    }
+    if (p[1] > maxY) {
+      maxY = p[1];
+    }
+  }
+  return <double>[minX, minY, maxX, maxY];
+}
