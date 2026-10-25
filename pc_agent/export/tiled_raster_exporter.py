@@ -31,7 +31,7 @@ from PIL import Image
 from pc_agent.core.config_manager import AppConfig
 from pc_agent.engine.document_store import Artboard, CanvasDocument, artboard_is_infinite
 from pc_agent.engine.scene_graph import CanvasNode
-from pc_agent.export.cairo_shapes import apply_fill, trace_shape
+from pc_agent.export.cairo_shapes import apply_fill, apply_stroke_fill, trace_shape
 
 #: Export strip size in px (template §3 "Export strips").
 STRIP_PX: int = 2048
@@ -92,15 +92,20 @@ def resolve_extent(doc: CanvasDocument) -> tuple[float, float, float, float]:
 
 
 def extent_to_px(extent: tuple[float, float, float, float], dpi: int) -> tuple[int, int]:
-    """``ceil(world * dpi / 300)`` padded up to multiples of ``STRIP_PX``."""
+    """EXACT output pixel size: ``ceil(world * dpi / 300)``.
+
+    Round-11 issue 05 — this used to round BOTH axes up to the next 2048
+    multiple, so an A4 canvas (2480×3508 world units) exported as 4096×4096:
+    the aspect ratio was destroyed and every A4 PNG came out square. The 2048
+    strip grid is a renderer detail, not a property of the delivered file; the
+    memmap is allocated at exactly this size and edge strips are clipped.
+    """
     if dpi not in SUPPORTED_DPIS:
         raise ValueError(f"unsupported dpi {dpi!r}; expected one of {sorted(SUPPORTED_DPIS)}")
     min_x, min_y, max_x, max_y = extent
     px_w = max(1, math.ceil((max_x - min_x) * dpi / 300.0))
     px_h = max(1, math.ceil((max_y - min_y) * dpi / 300.0))
-    canvas_w = math.ceil(px_w / STRIP_PX) * STRIP_PX
-    canvas_h = math.ceil(px_h / STRIP_PX) * STRIP_PX
-    return canvas_w, canvas_h
+    return px_w, px_h
 
 
 def _is_cubic_chain(pts: list[list[float]]) -> bool:
@@ -273,14 +278,17 @@ def _intersects(
 def _draw_stroke(ctx: cairo.Context, node: CanvasNode, kind: str) -> None:
     style = node.style
     pts = node.geometry.pts
-    _set_color(ctx, style.color, style.opacity)
-    ctx.set_line_width(max(1e-3, float(style.stroke_width)))
-    ctx.set_line_cap(cairo.LINE_CAP_ROUND)
-    ctx.set_line_join(cairo.LINE_JOIN_ROUND)
     multiply = kind == "HIGHLIGHT" or style.blend_mode == "MULTIPLY"
     if multiply:
         ctx.set_operator(cairo.OPERATOR_MULTIPLY)
     try:
+        # Round-11 issue 04 — the interior of a closed pen loop goes UNDER the
+        # ink, exactly as `paintNodeFill` paints it before the outline.
+        apply_stroke_fill(ctx, node)
+        _set_color(ctx, style.color, style.opacity)
+        ctx.set_line_width(max(1e-3, float(style.stroke_width)))
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
         if len(pts) == 1:
             x, y = float(pts[0][0]), float(pts[0][1])
             ctx.arc(x, y, max(0.5, float(style.stroke_width) / 2.0), 0.0, math.tau)
@@ -456,15 +464,23 @@ def _draw_node(ctx: cairo.Context, node: CanvasNode, assets_root: Path) -> None:
 
 
 def _blit_strip(buf: np.memmap, surface: cairo.ImageSurface, sx: int, sy: int) -> None:
-    """Copy one rendered strip into the disk-backed RGBA canvas (O(strip))."""
+    """Copy one rendered strip into the disk-backed RGBA canvas (O(strip)).
+
+    Round-11 issue 05 — the buffer is the EXACT canvas size, so the final row
+    and column strips are clipped to whatever remains instead of the image
+    being padded up to a 2048 multiple on both axes.
+    """
     stride = surface.get_stride()
     data = np.frombuffer(surface.get_data(), np.uint8)
     if stride == STRIP_PX * 4:
         view = data.reshape(STRIP_PX, STRIP_PX, 4)
     else:
         view = data.reshape(STRIP_PX, stride)[:, : STRIP_PX * 4].reshape(STRIP_PX, STRIP_PX, 4)
+    buf_h, buf_w = buf.shape[0], buf.shape[1]
     y0, x0 = sy * STRIP_PX, sx * STRIP_PX
-    buf[y0 : y0 + STRIP_PX, x0 : x0 + STRIP_PX] = view
+    h, w = min(STRIP_PX, buf_h - y0), min(STRIP_PX, buf_w - x0)
+    if h > 0 and w > 0:
+        buf[y0 : y0 + h, x0 : x0 + w] = view[:h, :w]
 
 
 class TiledRasterExporter:
@@ -495,8 +511,8 @@ class TiledRasterExporter:
         part = _part_path(out_path)
         min_x, min_y, _, _ = extent
         world_per_strip = STRIP_PX * 300.0 / dpi
-        strips_x = canvas_w // STRIP_PX
-        strips_y = canvas_h // STRIP_PX
+        strips_x = math.ceil(canvas_w / STRIP_PX)
+        strips_y = math.ceil(canvas_h / STRIP_PX)
         total_strips = strips_x * strips_y
         assets_root = self._config.assets_dir / doc.canvas_id
         elements = sorted(doc.elements, key=lambda n: n.layer)

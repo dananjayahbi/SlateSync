@@ -153,19 +153,12 @@ class _RecCtx:
     "dpi,expected", [(300, (1748, 2480)), (600, (3496, 4960)), (1200, (6992, 9920))]
 )
 def test_dim_formula_a5(dpi: int, expected: tuple[int, int]) -> None:
-    # px = ceil(world * dpi / 300), pre-pad values, ±1 px tolerance.
+    # Round-11 issue 05: the DELIVERED image is exactly ceil(world * dpi / 300).
     pre_w = math.ceil(1748 * dpi / 300)
     pre_h = math.ceil(2480 * dpi / 300)
     assert abs(pre_w - expected[0]) <= 1
     assert abs(pre_h - expected[1]) <= 1
-    canvas = tiled.extent_to_px((0.0, 0.0, 1748.0, 2480.0), dpi)
-    # padded canvas = ceil(pre / 2048) * 2048 on each axis.
-    assert abs(canvas[0] - math.ceil(pre_w / 2048) * 2048) <= 1
-    assert abs(canvas[1] - math.ceil(pre_h / 2048) * 2048) <= 1
-    assert canvas[0] % 2048 == 0
-    assert canvas[1] % 2048 == 0
-    assert canvas[0] >= pre_w
-    assert canvas[1] >= pre_h
+    assert tiled.extent_to_px((0.0, 0.0, 1748.0, 2480.0), dpi) == (pre_w, pre_h)
 
 
 def test_bounded_extent() -> None:
@@ -206,7 +199,7 @@ def test_png_magic(exporter: tiled.TiledRasterExporter, tmp_path: Path) -> None:
     assert result == out
     assert out.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
     with Image.open(out) as img:
-        assert img.size == (2048, 2048)  # extent 200×150 padded to strip multiples
+        assert img.size == (200, 150)  # round-11 issue 05: EXACT extent, no strip padding
     assert values == [1.0]  # single strip ⇒ progress = strips/total = 1.0
     assert list(out.parent.glob("*.part")) == []
 
@@ -239,7 +232,7 @@ def test_progress_monotonic_and_memmap_ram_gate(
 
     monkeypatch.setattr(np, "memmap", spy)
 
-    # 2100×100 world @300 DPI ⇒ 4096×2048 px ⇒ exactly two row-major strips.
+    # 2100×100 world @300 DPI ⇒ 2100×100 px ⇒ two row-major strips of 2048.
     wide = _doc(width=2100.0, height=100.0, elements=[_node(pts=[[100.0, 20.0], [2000.0, 80.0]])])
     values: list[float] = []
     out = _exports(tmp_path, "wide.png")
@@ -250,12 +243,13 @@ def test_progress_monotonic_and_memmap_ram_gate(
     args, kwargs = calls[0]
     assert str(args[0]).endswith(".part")
     assert kwargs["mode"] == "w+"
-    assert kwargs["shape"] == (2048, 4096, 4)
+    # Round-11 issue 05: allocated at the EXACT delivered size, not 2048-padded.
+    assert kwargs["shape"] == (100, 2100, 4)
 
     # progress = strips_done / strips_total, monotonic, ending at 1.0.
     assert values == [0.5, 1.0]
     with Image.open(out) as img:
-        assert img.size == (4096, 2048)
+        assert img.size == (2100, 100)
     assert list(out.parent.glob("*.part")) == []
 
 

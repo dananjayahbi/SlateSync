@@ -39,6 +39,7 @@ import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 import 'package:mobile_app/core/storage/local_db.dart'; // Doc 26
 import 'package:mobile_app/core/theme/studio_theme.dart'; // Doc 05
 import 'package:mobile_app/features/canvas/canvas_history_controller.dart'; // round-9 issue 03
+import 'package:mobile_app/features/canvas/canvas_history_sync.dart'; // round-11 issue 02
 import 'package:mobile_app/features/canvas/canvas_publish.dart'; // round-9 issue 08
 import 'package:mobile_app/features/canvas/canvas_shape_conventions.dart';
 import 'package:mobile_app/features/canvas/image_source_popup.dart';
@@ -293,15 +294,41 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     _dirty = true;
   }
 
-  void _undo() {
-    if (_history.undo(_doc)) {
-      _reloadFromDoc();
-    }
-  }
+  void _undo() => _historyStep(redo: false);
 
-  void _redo() {
-    if (_history.redo(_doc)) {
-      _reloadFromDoc();
+  void _redo() => _historyStep(redo: true);
+
+  /// Round-11 issue 02 — replay a history step on the mirror.
+  ///
+  /// An undo/redo only rewrote local state before, so the PC kept showing the
+  /// pre-undo canvas. The document is snapshotted BEFORE the step, then the
+  /// minimal node diff is emitted as ordinary `ELEMENT_COMMIT`s. Lock groups
+  /// cannot travel in an element commit, so when they changed the whole
+  /// document is published instead (`CANVAS_PUT` is the only carrier).
+  void _historyStep({required bool redo}) {
+    final List<CanvasNodeModel> before = List<CanvasNodeModel>.of(_doc.elements);
+    final Map<String, List<String>> groupsBefore =
+        <String, List<String>>{
+      for (final MapEntry<String, List<String>> e in _doc.groups.entries)
+        e.key: List<String>.of(e.value),
+    };
+    final bool moved = redo ? _history.redo(_doc) : _history.undo(_doc);
+    if (!moved) {
+      return;
+    }
+    _reloadFromDoc();
+    if (groupsDiffer(groupsBefore, _doc.groups)) {
+      // A lock/unlock step: node-level RPCs cannot express the group, so the
+      // published document carries both the nodes and the groups.
+      _publishedGroups = _groupsSignature();
+      _publishedArtboard = ArtboardFingerprint.of(_doc.artboard);
+      unawaited(publishCanvasDocument(widget.client, _doc));
+      return;
+    }
+    for (final HistoryRpc rpc in diffNodes(before: before, after: _doc.elements)) {
+      unawaited(
+        widget.client.sendRpc(_commitEnvelope(rpc.action, rpc.payload)),
+      );
     }
   }
 
@@ -707,13 +734,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   /// Frozen Doc 02 action that re-creates a node of [kind] on the PC.
-  static String _addActionForKind(String kind) => switch (kind) {
-        'STROKE' || 'HIGHLIGHT' || 'LINE' => 'ADD_STROKE',
-        'SHAPE' => 'ADD_SHAPE',
-        'GRAPH_AXES' => 'ADD_GRAPH',
-        'IMAGE' => 'ADD_IMAGE',
-        _ => 'ADD_STROKE',
-      };
+  static String _addActionForKind(String kind) => addActionForKind(kind);
 
   /// Deletes the current selection (works for free strokes too).
   void _deleteSelection() {
@@ -966,7 +987,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   // -------------------------------------------------------------------------
-  // Round-9 issue 06 — table add-row / add-column
+  // Round-9 issue 06 / round-11 issue 03 — table row & column handles
   // -------------------------------------------------------------------------
 
   /// The selected node when it is a TABLE (the grow handles key off this).
@@ -981,7 +1002,46 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     return n;
   }
 
-  void _growTable({required bool row}) {
+  /// Grid of the selected table, or `null` when nothing suitable is selected.
+  TableGrid? get _selectedTableGrid {
+    final CanvasNodeModel? table = _selectedTable;
+    if (table == null) {
+      return null;
+    }
+    return tableGridOf(_rectOf(table), table.geometry.graphConfig);
+  }
+
+  /// Round-11 issue 03 — `true` when a row can still be removed.
+  bool get _tableCanRemoveRow {
+    final TableGrid? grid = _selectedTableGrid;
+    if (grid == null) {
+      return false;
+    }
+    return grid.rows > kMinTableRows;
+  }
+
+  /// Round-11 issue 03 — `true` when a column can still be removed.
+  bool get _tableCanRemoveColumn {
+    final TableGrid? grid = _selectedTableGrid;
+    if (grid == null) {
+      return false;
+    }
+    return grid.cols > kMinTableCols;
+  }
+
+  void _addTableRow() => _resizeTable(row: true, grow: true);
+  void _addTableColumn() => _resizeTable(row: false, grow: true);
+  void _removeTableRow() => _resizeTable(row: true, grow: false);
+  void _removeTableColumn() => _resizeTable(row: false, grow: false);
+
+  /// Adds or removes one row/column, keeping the CURRENT cell size.
+  ///
+  /// Growing extends the table's bbox by one cell along that axis (otherwise
+  /// the cells would just get thinner and the handle would feel inert);
+  /// removing shrinks the bbox by the cell being dropped, so the remaining
+  /// cells keep the size the user drew. Both directions are a single undo step
+  /// and mirror through `DELETE_NODE` + `ADD_SHAPE`, like every other transform.
+  void _resizeTable({required bool row, required bool grow}) {
     final CanvasNodeModel? table = _selectedTable;
     if (table == null) {
       return;
@@ -993,23 +1053,35 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     }
     final Rect box = _rectOf(table);
     final TableGrid grid = tableGridOf(box, table.geometry.graphConfig);
-    // A new row/column needs physical space, so the table's bbox grows by one
-    // cell along that axis; otherwise the cells would just get thinner and the
-    // handle would feel like it did nothing.
+    final Map<String, dynamic>? config = grow
+        ? (row
+            ? withExtraRow(table.geometry.graphConfig)
+            : withExtraColumn(table.geometry.graphConfig))
+        : (row
+            ? withFewerRow(table.geometry.graphConfig)
+            : withFewerColumn(table.geometry.graphConfig));
+    if (config == null) {
+      _showHint(row
+          ? 'A table needs at least one row.'
+          : 'A table needs at least one column.');
+      return;
+    }
     final double cellH = grid.box.height / grid.rows;
     final double cellW = grid.box.width / grid.cols;
-    final Rect grown = row
-        ? Rect.fromLTRB(box.left, box.top, box.right, box.bottom + cellH)
-        : Rect.fromLTRB(box.left, box.top, box.right + cellW, box.bottom);
-    final Map<String, dynamic> config = row
-        ? withExtraRow(table.geometry.graphConfig)
-        : withExtraColumn(table.geometry.graphConfig);
+    final double deltaH = row ? (grow ? cellH : -cellH) : 0.0;
+    final double deltaW = row ? 0.0 : (grow ? cellW : -cellW);
+    final Rect resized = Rect.fromLTRB(
+      box.left,
+      box.top,
+      math.max(box.right + deltaW, 1.0),
+      math.max(box.bottom + deltaH, 1.0),
+    );
     _beginEdit(); // round-9 issue 03
     final CanvasNodeModel updated = CanvasNodeModel(
       nodeId: table.nodeId,
       kind: table.kind,
       layer: table.layer,
-      bbox: <double>[grown.left, grown.top, grown.right, grown.bottom],
+      bbox: <double>[resized.left, resized.top, resized.right, resized.bottom],
       style: NodeStyleModel(
         color: table.style.color,
         strokeWidth: table.style.strokeWidth,
@@ -2367,8 +2439,13 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                             Offset(box.right, box.center.dy),
                             _viewport,
                           ),
-                          onAddRow: () => _growTable(row: true),
-                          onAddColumn: () => _growTable(row: false),
+                          onAddRow: _addTableRow,
+                          onAddColumn: _addTableColumn,
+                          onRemoveRow:
+                              _tableCanRemoveRow ? _removeTableRow : null,
+                          onRemoveColumn: _tableCanRemoveColumn
+                              ? _removeTableColumn
+                              : null,
                         ),
                     ],
                   );

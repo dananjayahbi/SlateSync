@@ -29,7 +29,7 @@ import cairo
 from pc_agent.core.config_manager import AppConfig
 from pc_agent.engine.document_store import Artboard, CanvasDocument, artboard_is_infinite
 from pc_agent.engine.scene_graph import CanvasNode
-from pc_agent.export.cairo_shapes import apply_fill, trace_shape
+from pc_agent.export.cairo_shapes import apply_fill, apply_stroke_fill, trace_shape
 
 #: Points = world_units × 72/300 (template §3).
 UNIT_TO_PT: float = 72 / 300
@@ -266,14 +266,17 @@ def _intersects(
 def _draw_stroke(ctx: cairo.Context, node: CanvasNode, kind: str) -> None:
     style = node.style
     pts = node.geometry.pts
-    _set_color(ctx, style.color, style.opacity)
-    ctx.set_line_width(max(1e-3, float(style.stroke_width)))
-    ctx.set_line_cap(cairo.LINE_CAP_ROUND)
-    ctx.set_line_join(cairo.LINE_JOIN_ROUND)
     multiply = kind == "HIGHLIGHT" or style.blend_mode == "MULTIPLY"
     if multiply:
         ctx.set_operator(cairo.OPERATOR_MULTIPLY)
     try:
+        # Round-11 issue 04 — the interior of a closed pen loop goes UNDER the
+        # ink, exactly as `paintNodeFill` paints it before the outline.
+        apply_stroke_fill(ctx, node)
+        _set_color(ctx, style.color, style.opacity)
+        ctx.set_line_width(max(1e-3, float(style.stroke_width)))
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
         if len(pts) == 1:
             x, y = float(pts[0][0]), float(pts[0][1])
             ctx.arc(x, y, max(0.5, float(style.stroke_width) / 2.0), 0.0, math.tau)

@@ -25,6 +25,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from pc_agent.viewport.shape_fill import shape_is_filled
+from pc_agent.viewport.stroke_fill import stroke_fill_polygon_of
 from pc_agent.viewport.vector_geometry import (
     outline_segments,
     points_of,
@@ -786,7 +787,12 @@ class PrimitiveRenderer:
             key=lambda node: (getattr(node, "layer", 0), str(getattr(node, "node_id", ""))),
         )
         images = [node for node in ordered if getattr(node, "kind", "") == "IMAGE"]
-        shapes = [node for node in ordered if getattr(node, "kind", "") in ("SHAPE", "LINE")]
+        shapes = [
+            node
+            for node in ordered
+            if getattr(node, "kind", "") in ("SHAPE", "LINE")
+            or _stroke_fill_interior(node) is not None
+        ]
         graphs = [node for node in ordered if getattr(node, "kind", "") == "GRAPH_AXES"]
         # Frozen phase order (Doc 08 §4): background → shadow → images → shapes → graphs.
         self._draw_background(artboard, cam, view_w, view_h)
@@ -1019,6 +1025,13 @@ class PrimitiveRenderer:
             # straight stroke — GLCanvasHost._commit_node tessellates it via
             # the stroke mesh path. Never fall into shape-ring/circle fills.
             return
+        if _stroke_fill_interior(node) is not None:
+            # Round-11 issue 04 — a filled free-hand loop. The ink itself is
+            # drawn by GLCanvasHost's stroke meshes, which know nothing about
+            # `style.fill`, so the interior is emitted here where the fill
+            # batch lives.
+            _push_stroke_fill(node, fills)
+            return
         shape_type = str(getattr(geometry, "shape_type", "") or "")
         stroke_width = float(getattr(style, "stroke_width", 0.0) or 0.0)
         rgba = parse_color(getattr(style, "color", "#1E1E1E"), getattr(style, "opacity", 1.0))
@@ -1097,6 +1110,10 @@ class PrimitiveRenderer:
                 rgba,
             )
         # Unknown shape_type (incl. graph types on SHAPE nodes) — skipped per Doc 08 §4.
+
+    def _tessellate_stroke_fill(self, node: "CanvasNode", fills: list[float]) -> None:
+        """Round-11 issue 04 — interior triangles for a filled pen loop."""
+        _push_stroke_fill(node, fills)
 
     def _tessellate_path(
         self,
@@ -1407,6 +1424,36 @@ def _fill_rgba(style: object) -> tuple[float, ...] | None:
     except ValueError:
         return None
     return parse_color(colour, float(getattr(style, "opacity", 1.0) or 1.0))
+
+
+def _stroke_fill_interior(node: object) -> tuple[float, ...] | None:
+    """Round-11 issue 04 — the fill colour for a CLOSED free-hand stroke.
+
+    Returns ``None`` for every non-stroke node (the shape tessellators own
+    those), for a stroke with no fill, and for a stroke whose ends do not meet
+    — an open pen line encloses nothing, so painting it would leak colour over
+    the whole page.
+    """
+    kind = str(getattr(node, "kind", "") or "")
+    if kind not in ("STROKE", "HIGHLIGHT"):
+        return None
+    style = getattr(node, "style", None)
+    interior = _fill_rgba(style)
+    if interior is None:
+        return None
+    if stroke_fill_polygon_of(node) is None:
+        return None
+    return interior
+
+
+def _push_stroke_fill(node: object, fills: list[float]) -> None:
+    """Round-11 issue 04 — append the interior triangles of a filled pen loop."""
+    interior = _stroke_fill_interior(node)
+    if interior is None:
+        return
+    polygon = stroke_fill_polygon_of(node) or []
+    if len(polygon) >= 3:
+        _push_tri(fills, triangulate(polygon), interior)
 
 
 def _circle_frame(

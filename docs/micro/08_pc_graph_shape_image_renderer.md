@@ -263,7 +263,7 @@ what legitimately differs â€” colour and line width (the thumbnail scales the wi
 
 ### 10.1 `assets_root` is resolved per mirrored canvas, not per open event
 
-§5(8) requires `PrimitiveRenderer` to resolve `geometry.asset_ref` against the
+ï¿½5(8) requires `PrimitiveRenderer` to resolve `geometry.asset_ref` against the
 open canvas's `assets_dir`. `resolve_asset_path(root, ref)` deliberately keeps
 only `Path(ref).name`, so the root is the only thing that decides whether an
 IMAGE draws real pixels or the 1x1 magenta placeholder.
@@ -288,3 +288,29 @@ miss MUST NOT be stored under the asset key. `ASSET_DONE` normally arrives after
 the IMAGE node was committed and drawn, and caching the miss pinned the magenta
 texel for the rest of the session. `invalidate_images()` on `ASSET_UPLOADED` is
 the recovery path and only works if the miss was not cached.
+
+## Round-11 Amendment - The viewport fills closed pen loops (NORMATIVE)
+
+The paint bucket can fill a free-hand `STROKE` whose ends meet or whose tail
+crosses its head. The mirrored ink is drawn by the stroke tessellators in
+`gl_canvas_host`, which have no concept of `style.fill`, so the interior would
+never appear on the PC (round-11 issue 04).
+
+`PrimitiveRenderer.render` therefore admits a node into its shape pass when it
+is `SHAPE`/`LINE` **or** when `_stroke_fill_interior(node)` is not `None`. The
+latter requires all three of: `kind in (STROKE, HIGHLIGHT)`, a valid
+`style.fill`, and `stroke_fill.stroke_fill_polygon_of(node) is not None`.
+
+`_tessellate_shape` short-circuits such a node into the TRIANGLES batch and
+emits NO outline: the ink is already owned by the stroke meshes, and drawing
+the polygon outline here would double-stroke the loop.
+
+The closure rule lives in `pc_agent/viewport/stroke_fill.py` (a pure leaf
+module, no GL and no engine imports) and MUST stay identical to
+`mobile_app/lib/canvas_engine/region_fill.dart`:
+
+* endpoints within `max(6, 12 percent of the diagonal, stroke_width)`; or
+* the polyline crosses itself (strict intersection, end-adjacent pairs ignored).
+
+An OPEN stroke encloses nothing and MUST NOT be filled - filling it would flood
+the whole page.

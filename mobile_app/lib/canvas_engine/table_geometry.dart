@@ -153,6 +153,40 @@ Map<String, dynamic> withExtraColumn(Map<String, dynamic>? config) {
   return cfg;
 }
 
+/// Copies [config] with one FEWER row (round-11 issue 03).
+///
+/// Returns `null` when the table already has [kMinTableRows] rows, so the
+/// caller can disable the handle instead of producing an invalid grid.
+Map<String, dynamic>? withFewerRow(Map<String, dynamic>? config) {
+  final Map<String, dynamic> cfg =
+      Map<String, dynamic>.from(config ?? const <String, dynamic>{});
+  final int rows = _intIn(cfg['rows'], kDefaultTableRows, kMinTableRows, kMaxTableRows);
+  if (rows <= kMinTableRows) {
+    return null;
+  }
+  cfg['rows'] = rows - 1;
+  // A one-row table cannot carry a header band any more.
+  if (rows - 1 < 2) {
+    cfg['header_row'] = false;
+  }
+  return cfg;
+}
+
+/// Copies [config] with one FEWER column (round-11 issue 03).
+Map<String, dynamic>? withFewerColumn(Map<String, dynamic>? config) {
+  final Map<String, dynamic> cfg =
+      Map<String, dynamic>.from(config ?? const <String, dynamic>{});
+  final int cols = _intIn(cfg['cols'], kDefaultTableCols, kMinTableCols, kMaxTableCols);
+  if (cols <= kMinTableCols) {
+    return null;
+  }
+  cfg['cols'] = cols - 1;
+  if (cols - 1 < 2) {
+    cfg['header_col'] = false;
+  }
+  return cfg;
+}
+
 /// The rect a new table occupies when dragged from [start] to [end], with a
 /// minimum size so a stray tap still produces a usable grid.
 Rect planTableRect(Offset start, Offset end, TableGridSizeHint hint) {

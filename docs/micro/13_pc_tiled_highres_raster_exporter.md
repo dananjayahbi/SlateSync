@@ -159,3 +159,23 @@ Acceptance: progress is monotonic `strips_done/strips_total` ending at `1.0`; `.
 
 **Wave 2.A** (template §6 — Subagent 2 executes Docs 13 + 14; Subagent 3 executes Doc 15) alongside Docs 08, 14, 15, 16, 17, 24, 26, 27 in one merged parallel wave. Zero path overlap: this doc alone owns `pc_agent/export/__init__.py`, `tiled_raster_exporter.py`, `thumbnail_renderer.py` (Doc 02 §10.6), and its tests (`test_tiled_raster_exporter.py`, `test_thumbnail_renderer.py`, `test_export_extent_matrix.py`); Docs 14/15 only create sibling files. All cross-module contact points (`TiledRasterExporter.export` → `ExportCoordinator`, Doc 15) are frozen in template §4, so no intra-wave ordering constraints exist.
 **Never touches:** this doc never edits `pc_agent/viewport/`, `pc_agent/network/`, `pc_agent/engine/`, `pc_agent/gui/`, `pc_agent/core/`, `pc_agent/main.py`, or any `mobile_app/` file — those trees are read-only references (Docs 04, 06–12, 16, 17) or owned by other same-wave subagents.
+
+
+## Round-11 Amendment - The delivered raster is NOT strip-padded (NORMATIVE)
+
+`extent_to_px(extent, dpi)` MUST return `(ceil((max_x - min_x) * dpi / 300),
+ceil((max_y - min_y) * dpi / 300))` exactly. It used to round BOTH axes up to
+the next `STRIP_PX` (2048) multiple, which turned every A4 export into
+4096x4096 - a square - and stretched every other preset whose short side fell
+below 2048 and long side above it (round-11 issue 05).
+
+`STRIP_PX` remains the render grid: `export()` allocates the `np.memmap` at the
+EXACT delivered size, loops `ceil(canvas_w / STRIP_PX) x ceil(canvas_h /
+STRIP_PX)` strips, and `_blit_strip` clips the final row and column strips to
+whatever remains. Peak RAM is still one strip plus the memmap page cache, and no
+full-canvas RGBA Python copy is ever created, so the Doc 13 §5 RAM gate holds
+unchanged.
+
+`apply_stroke_fill` (from `pc_agent/export/cairo_shapes.py`) is called at the
+top of `_draw_stroke`, so a filled closed pen loop exports with its interior -
+matching the viewport, the PDF exporter and the tablet.

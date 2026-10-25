@@ -40,7 +40,7 @@ from pc_agent.engine.document_store import (
     artboard_is_infinite,
 )
 from pc_agent.engine.scene_graph import CanvasNode
-from pc_agent.export.cairo_shapes import apply_fill, trace_shape
+from pc_agent.export.cairo_shapes import apply_fill, apply_stroke_fill, trace_shape
 
 logger = logging.getLogger("slatesync.thumbnail")
 
@@ -298,14 +298,16 @@ def _draw_stroke(ctx: cairo.Context, node: CanvasNode, kind: str, scale: float) 
         return
     style = node.style
     lw = _line_w(scale, style.stroke_width)
-    _set_color(ctx, style.color, style.opacity)
-    ctx.set_line_width(lw)
-    ctx.set_line_cap(cairo.LINE_CAP_ROUND)
-    ctx.set_line_join(cairo.LINE_JOIN_ROUND)
     multiply = kind == "HIGHLIGHT" or style.blend_mode == "MULTIPLY"
     if multiply:
         ctx.set_operator(cairo.OPERATOR_MULTIPLY)
     try:
+        # Round-11 issue 04 — interior of a closed pen loop, under the ink.
+        apply_stroke_fill(ctx, node)
+        _set_color(ctx, style.color, style.opacity)
+        ctx.set_line_width(lw)
+        ctx.set_line_cap(cairo.LINE_CAP_ROUND)
+        ctx.set_line_join(cairo.LINE_JOIN_ROUND)
         coords = _finite_pts(pts)
         if coords is None:
             return

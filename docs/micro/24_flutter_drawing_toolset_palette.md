@@ -321,7 +321,7 @@ thinner.
 
 ### 10.1 Fill: "no leak" includes ink-sealed and self-crossing loops
 
-Round 9 (§9.2) required the object to be *closed*. That was implemented as
+Round 9 (ï¿½9.2) required the object to be *closed*. That was implemented as
 "the polyline's last sample is within tolerance of its first", which rejects the
 two ways people actually close a loop:
 
@@ -346,7 +346,7 @@ rebuild MUST carry `node.style.fill`. The sites are `_applyTransform`,
 
 ### 10.3 A locked group refuses every tool
 
-Round 9 (§9.4) only made a group *select as one object*; nothing consulted the
+Round 9 (ï¿½9.4) only made a group *select as one object*; nothing consulted the
 group before mutating. `canvas_engine/lock_guard.dart` is now the single rule:
 
 | Helper | Use |
@@ -365,3 +365,39 @@ out of a lock.
 
 An honest "unlock then delete" still works: `_deleteSelection` filters through
 `unlockedIds`, so after the group is removed the members are deletable.
+
+## Round-11 Amendment - Undo/redo reach the mirror; tables shrink (NORMATIVE)
+
+### Undo and redo replay a minimal node diff
+
+Round 9 added the buttons; until round 11 a history step rewrote only the local
+document, so the tablet rewound while the PC kept the pre-undo canvas.
+
+`_undo` / `_redo` now delegate to `_historyStep(redo:)`, which snapshots the
+element list BEFORE the step, runs the step, and replays the difference through
+`mobile_app/lib/features/canvas/canvas_history_sync.dart`:
+
+* removed ids -> `DELETE_NODE`;
+* new or changed ids -> `DELETE_NODE` then the per-kind `ADD_*`;
+* an empty diff -> no traffic at all.
+
+Nodes are emitted in ascending `layer` order. When the step changed the lock
+`groups` map the whole document is published with `CANVAS_PUT` instead, because
+a group is a document-level relation an element commit cannot carry (Doc 02
+Â§13.1).
+
+### Table rows and columns can be removed after placement
+
+The `TABLE` selector handles are now four chips in a cross layout around the
+row and column anchors: `table-add-row` / `table-remove-row` below the bottom
+edge and `table-add-column` / `table-remove-column` right of the right edge.
+
+`table_geometry.withFewerRow` / `withFewerColumn` return `null` at
+`kMinTableRows` / `kMinTableCols`, which the page turns into a DISABLED chip
+(muted, no callback) rather than a hidden one, so the controls never jump. Both
+clear `header_row` / `header_col` when the grid drops below two, because a
+header band over the only row would hide the data.
+
+Removal shrinks the node bbox by exactly one cell so the surviving cells keep
+the size the user drew, and the whole operation is still one undo step
+(`DELETE_NODE` + `ADD_SHAPE`, still refused by the lock guard).

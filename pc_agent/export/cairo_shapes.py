@@ -23,6 +23,7 @@ import math
 
 import cairo
 
+from pc_agent.viewport.stroke_fill import stroke_fill_polygon
 from pc_agent.viewport.vector_geometry import (
     outline_segments,
     points_of,
@@ -166,6 +167,40 @@ def apply_fill(
     else:
         bx0, by0, bx1, by1 = box
         ctx.rectangle(bx0, by0, bx1 - bx0, by1 - by0)
+    ctx.fill()
+    return True
+
+
+def apply_stroke_fill(ctx: cairo.Context, node: object) -> bool:
+    """Round-11 issue 04 — fills a CLOSED free-hand pen loop.
+
+    The paint bucket can fill a free-hand stroke when the pen returns to its
+    own start, and the tablet paints that interior (``paintNodeFill``). The
+    cairo exporters used to trace only the ink, so the exported PNG/PDF showed
+    the outline of a loop the user had filled.
+
+    Returns ``True`` when an interior was painted. ``False`` for an open stroke
+    (it encloses nothing — filling it would flood the page) and for a stroke
+    with no fill colour.
+    """
+    kind = str(getattr(node, "kind", "") or "")
+    if kind not in ("STROKE", "HIGHLIGHT"):
+        return False
+    style = getattr(node, "style", None)
+    colour = fill_colour(style)
+    if colour is None:
+        return False
+    geometry = getattr(node, "geometry", None)
+    polygon = stroke_fill_polygon(
+        getattr(geometry, "pts", None) or [],
+        float(getattr(style, "stroke_width", 0.0) or 0.0),
+    )
+    if polygon is None or len(polygon) < 3:
+        return False
+    set_fill_colour(ctx, colour, getattr(style, "opacity", 1.0))
+    ctx.new_path()
+    if not _polygon_path(ctx, polygon):
+        return False
     ctx.fill()
     return True
 

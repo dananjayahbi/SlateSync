@@ -149,3 +149,19 @@ Acceptance: progress monotonic ending at `1.0`, throttled ≤10 Hz; bounded docs
 
 **Wave 2.A** (template §6 — Subagent 2 executes Docs 13 + 14; Subagent 3 executes Doc 15) alongside Docs 08, 13, 15, 16, 17, 24, 26, 27. Zero path overlap: this doc alone owns `vector_pdf_exporter.py` and its test; Doc 13 owns `export/__init__.py`; Doc 15 owns `export_coordinator.py`. The `VectorPdfExporter` → `ExportCoordinator` contact point is frozen (template §4) — no intra-wave ordering.
 **Never touches:** this doc never edits `pc_agent/viewport/`, `pc_agent/network/`, `pc_agent/engine/`, `pc_agent/gui/`, `pc_agent/core/`, `pc_agent/main.py`, or any `mobile_app/` file — read-only references (Docs 04, 06–12, 16, 17) only; Doc 13's `export/__init__.py` is import-only.
+
+
+## Round-11 Amendment - Stroke fills and exact page size (NORMATIVE)
+
+Two round-11 fixes land in this module's shared helpers:
+
+* `cairo_shapes.apply_stroke_fill(ctx, node)` paints the interior of a closed
+  free-hand loop under its ink. It returns `False` for an open stroke and for a
+  stroke with no `style.fill`, so an unfilled or leaking path can never be
+  flooded. `_draw_stroke` calls it before setting the ink colour.
+* The page is emitted at the artboard's exact `world * dpi / 300` size -
+  `page_size_pt` was already artboard-proportional and is unchanged; the raster
+  exporter now agrees with it (see Doc 13, round-11 amendment).
+
+Both rules are shared with the viewport and the other two exporters so the four
+renderers cannot drift.

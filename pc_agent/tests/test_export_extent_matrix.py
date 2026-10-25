@@ -15,6 +15,7 @@ NORMATIVE checks (Doc 02 §10.4):
 from __future__ import annotations
 
 import json
+import math
 import zipfile
 from pathlib import Path
 from uuid import uuid4
@@ -41,18 +42,20 @@ _PRESETS: dict[str, tuple[float, float]] = {
 }
 #: IDENTICAL content for every preset — overflows A5 on purpose (real docs do too).
 _CONTENT: dict[str, float] = {"min_x": 100.0, "min_y": 100.0, "max_x": 3000.0, "max_y": 1200.0}
-#: Expected padded raster dims: (preset, dpi) → (w, h) per §10.4 / issue 06.
+#: Expected raster dims: (preset, dpi) → (w, h) per §10.4.
+#: Round-11 issue 05 — these are the EXACT ``world * dpi / 300`` sizes; the
+#: 2048 strip grid is a renderer detail and no longer pads the delivered file.
 _DIM_MATRIX: dict[tuple[str, int], tuple[int, int]] = {
-    ("A5", 300): (2048, 4096),
-    ("A5", 600): (4096, 6144),
-    ("A4", 300): (4096, 4096),
-    ("A4", 600): (6144, 8192),
-    ("LETTER", 300): (4096, 4096),
-    ("LETTER", 600): (6144, 8192),
+    ("A5", 300): (1748, 2480),
+    ("A5", 600): (3496, 4960),
+    ("A4", 300): (2480, 3508),
+    ("A4", 600): (4960, 7016),
+    ("LETTER", 300): (2550, 3300),
+    ("LETTER", 600): (5100, 6600),
 }
 #: INFINITE content extent: content ±64 ⇒ 3028×1228 world.
 _INFINITE_EXTENT = (36.0, 36.0, 3064.0, 1264.0)
-_INFINITE_DIMS = {300: (4096, 2048), 600: (6144, 4096)}
+_INFINITE_DIMS = {300: (3028, 1228), 600: (6056, 2456)}
 
 
 def _stroke_layer() -> list[CanvasNode]:
@@ -135,6 +138,32 @@ def test_bounded_extent_is_exact_artboard(preset: str) -> None:
 def test_extent_matrix_px_dims(preset: str, dpi: int) -> None:
     extent = tiled.resolve_extent(make_doc(preset))
     assert tiled.extent_to_px(extent, dpi) == _DIM_MATRIX[(preset, dpi)]
+
+
+@pytest.mark.parametrize(("preset", "dpi"), sorted(_DIM_MATRIX, key=lambda k: (k[0], k[1])))
+def test_bounded_matches_artboard_aspect_ratio(preset: str, dpi: int) -> None:
+    """Round-11 issue 05 — a 1:√2 A4 page must never export as a square."""
+    world_w, world_h = _PRESETS[preset]
+    px_w, px_h = tiled.extent_to_px(tiled.resolve_extent(make_doc(preset)), dpi)
+    assert px_w / px_h == pytest.approx(world_w / world_h, rel=5e-4)
+
+
+def test_a4_export_is_not_square_at_any_dpi() -> None:
+    for dpi in sorted(tiled.SUPPORTED_DPIS):
+        w, h = tiled.extent_to_px((0.0, 0.0, 2480.0, 3508.0), dpi)
+        assert (w, h) == (math.ceil(2480 * dpi / 300), math.ceil(3508 * dpi / 300))
+        assert w != h
+
+
+@pytest.mark.parametrize(("preset", "dpi"), sorted(_DIM_MATRIX, key=lambda k: (k[0], k[1])))
+def test_render_grid_is_exact_target(preset: str, dpi: int) -> None:
+    """The memmap is allocated at the delivered size — no 2048 padding."""
+    extent = tiled.resolve_extent(make_doc(preset))
+    assert tiled.extent_to_px(extent, dpi) == _DIM_MATRIX[(preset, dpi)]
+    # Strip counts cover the last partial row/column (ceil, never truncate).
+    w, h = _DIM_MATRIX[(preset, dpi)]
+    assert math.ceil(w / tiled.STRIP_PX) * tiled.STRIP_PX >= w
+    assert math.ceil(h / tiled.STRIP_PX) * tiled.STRIP_PX >= h
 
 
 @pytest.mark.parametrize("dpi", [300, 600])

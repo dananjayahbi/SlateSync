@@ -551,12 +551,12 @@ Docs agent: `docs/micro/**` EXCEPT the ยง5 body of Doc 02 (still schema-locked).
 
 ## 12. Round-10 Amendment - Mirror Follow, Sealed Loops, Lock Enforcement (NORMATIVE)
 
-Round 10 fixed five mirror/tool defects. Only ง12.1 changes observable
+Round 10 fixed five mirror/tool defects. Only ยง12.1 changes observable
 protocol behaviour; the rest are client-side rules with no new wire fields.
 
 ### 12.1 The PC mirror follows the device that owns it
 
-Round 7 (ง11.2, issue 07) pinned the mirror to the FIRST opened canvas so two
+Round 7 (ยง11.2, issue 07) pinned the mirror to the FIRST opened canvas so two
 tablets on two canvases could not steal it. That rule also froze the *owning*
 device: a tablet switching from canvas A to canvas B persisted B and left the
 viewport on A, so the mirror kept A's artboard (the round-10 "background does
@@ -592,3 +592,68 @@ the 1x1 magenta placeholder.
 render pass re-resolve the folder whenever the mirrored canvas id changes.
 `DOCUMENT_LOADED` injection stays (it is the warm path); the resolver is the
 self-healing fallback and MUST NOT be removed.
+
+## 13. Round-11 Amendment - History Replay, Stroke Fill, Exact Export Size (NORMATIVE)
+
+Round 11 fixed four mirror-fidelity defects. Section 13.1 adds a *client-side*
+replay rule on top of the frozen action set; no action is added, removed or
+renamed.
+
+### 13.1 Undo / redo is replayed as a minimal node diff
+
+An undo step rewrites the document's element list wholesale, but the action set
+has no "replace the document" primitive. A history step MUST therefore be
+replayed against the mirror as a minimal diff, computed between the element
+list BEFORE the step and the element list AFTER it:
+
+| Node situation | Emitted on the mirror |
+| --- | --- |
+| present before, absent after | `DELETE_NODE {node_id}` |
+| absent before, present after | the per-kind `ADD_*` for its `kind` |
+| present in both, JSON differs | `DELETE_NODE {node_id}` **then** the per-kind `ADD_*` |
+| present in both, JSON identical | nothing (an empty diff MUST NOT touch the socket) |
+
+`ADD_*` selection is fixed by kind: `STROKE` / `HIGHLIGHT` / `LINE` -> `ADD_STROKE`,
+`SHAPE` -> `ADD_SHAPE`, `GRAPH_AXES` -> `ADD_GRAPH`, `IMAGE` -> `ADD_IMAGE`.
+
+Added nodes MUST be emitted in ascending `layer` order, because the mirror
+appends in arrival order and the array is stored layer-sorted anyway.
+
+Lock groups are a DOCUMENT-level relation and cannot travel in an element
+commit. When a history step changes the `groups` map, the whole document is
+published with `CANVAS_PUT {canvas, source: "device"}` instead of a node diff -
+that is the only carrier the action set provides.
+
+### 13.2 A filled free-hand loop paints its interior on every renderer
+
+The paint bucket fills a `STROKE` node when the pen returns to its own start
+*or* crosses itself (the loop that overshoots). The ink geometry is unchanged:
+the interior is a `style.fill` colour under the existing ink.
+
+Closure is a client-side rule with two independent tests, and both sides MUST
+agree or a fill the user sees would be missing from the mirror:
+
+* endpoints within `max(6 world units, 12 percent of the path diagonal, stroke_width)`;
+* otherwise, the path crosses itself (strict segment intersection, ignoring the
+  adjacency pairs at the ends).
+
+The PC closure rule lives in `pc_agent/viewport/stroke_fill.py` and MUST be used
+by the GL fill pass and by all three cairo exporters (`tiled_raster_exporter`,
+`vector_pdf_exporter`, `thumbnail_renderer`) through
+`cairo_shapes.apply_stroke_fill`. An OPEN stroke MUST NOT be filled: it encloses
+nothing and painting it would flood the page.
+
+Because the mirrored ink is drawn by the stroke tessellators rather than by
+`PrimitiveRenderer`, a filled `STROKE` node MUST additionally be offered to
+`PrimitiveRenderer` so its interior reaches the TRIANGLES batch.
+
+### 13.3 Bounded raster exports keep the artboard aspect ratio
+
+`extent_to_px` MUST return the EXACT `ceil(world * dpi / 300)` size for a
+bounded artboard. The 2048 px strip grid is an implementation detail of the
+renderer (peak RAM = one strip) and MUST NOT pad the delivered file: an A4 page
+(2480x3508 world at 300 DPI) exports as 2480x3508, never 4096x4096.
+
+The disk-backed buffer is allocated at exactly that size and the final row and
+column strips are clipped, so no full-canvas copy is ever made and the strip
+grid still drives the render loop.

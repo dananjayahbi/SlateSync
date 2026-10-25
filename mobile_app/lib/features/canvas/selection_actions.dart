@@ -154,7 +154,12 @@ class SelectionActionBar extends StatelessWidget {
   }
 }
 
-/// Add-row (below the table) and add-column (right of the table) handles.
+/// Add/remove-row (below the table) and add/remove-column (right) handles.
+///
+/// Round-11 issue 03 — the round-9 widget only grew a table; the user needs to
+/// shrink it too. Each axis now owns a small pair: an `add` chip and a `remove`
+/// chip next to it. The remove chips are DISABLED (`null` callback) at the
+/// minimum grid size rather than hidden, so the control does not jump around.
 class TableGrowHandles extends StatelessWidget {
   const TableGrowHandles({
     super.key,
@@ -162,6 +167,8 @@ class TableGrowHandles extends StatelessWidget {
     required this.colAnchor,
     required this.onAddRow,
     required this.onAddColumn,
+    this.onRemoveRow,
+    this.onRemoveColumn,
   });
 
   /// Screen-space CENTRE of the table's bottom edge.
@@ -173,14 +180,19 @@ class TableGrowHandles extends StatelessWidget {
   final VoidCallback onAddRow;
   final VoidCallback onAddColumn;
 
+  /// `null` when the table already has the minimum number of rows/columns.
+  final VoidCallback? onRemoveRow;
+  final VoidCallback? onRemoveColumn;
+
   static const double _size = 26;
+  static const double _gap = 4;
 
   @override
   Widget build(BuildContext context) {
     return Stack(
       children: <Widget>[
         Positioned(
-          left: rowAnchor.dx - _size / 2,
+          left: rowAnchor.dx - _size - _gap / 2,
           top: rowAnchor.dy + 4,
           child: _chip(
             keyName: 'table-add-row',
@@ -190,13 +202,35 @@ class TableGrowHandles extends StatelessWidget {
           ),
         ),
         Positioned(
+          left: rowAnchor.dx + _gap / 2,
+          top: rowAnchor.dy + 4,
+          child: _chip(
+            keyName: 'table-remove-row',
+            icon: Icons.remove,
+            tooltip: 'Delete row',
+            onPressed: onRemoveRow,
+            danger: true,
+          ),
+        ),
+        Positioned(
           left: colAnchor.dx + 4,
-          top: colAnchor.dy - _size / 2,
+          top: colAnchor.dy - _size - _gap / 2,
           child: _chip(
             keyName: 'table-add-column',
             icon: Icons.add,
             tooltip: 'Add column',
             onPressed: onAddColumn,
+          ),
+        ),
+        Positioned(
+          left: colAnchor.dx + 4,
+          top: colAnchor.dy + _gap / 2,
+          child: _chip(
+            keyName: 'table-remove-column',
+            icon: Icons.remove,
+            tooltip: 'Delete column',
+            onPressed: onRemoveColumn,
+            danger: true,
           ),
         ),
       ],
@@ -207,12 +241,16 @@ class TableGrowHandles extends StatelessWidget {
     required String keyName,
     required IconData icon,
     required String tooltip,
-    required VoidCallback onPressed,
+    required VoidCallback? onPressed,
+    bool danger = false,
   }) {
+    final Color background = onPressed == null
+        ? StudioTheme.surface
+        : (danger ? StudioTheme.danger : StudioTheme.accent);
     return Material(
-      color: StudioTheme.accent,
+      color: background,
       shape: const CircleBorder(),
-      elevation: 4,
+      elevation: onPressed == null ? 0 : 4,
       child: IconButton(
         key: ValueKey<String>(keyName),
         tooltip: tooltip,
@@ -220,7 +258,12 @@ class TableGrowHandles extends StatelessWidget {
         iconSize: 16,
         padding: EdgeInsets.zero,
         constraints: const BoxConstraints.tightFor(width: _size, height: _size),
-        icon: Icon(icon, color: Colors.white),
+        icon: Icon(
+          icon,
+          color: onPressed == null
+              ? StudioTheme.text.withValues(alpha: 0.35)
+              : Colors.white,
+        ),
       ),
     );
   }

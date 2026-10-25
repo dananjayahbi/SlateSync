@@ -356,6 +356,14 @@ def test_module_imports_only_contract_models() -> None:
             "table_geometry",
             "triangulate",
         },
+        # Round-11 issue 04: PC twin of `region_fill.dart`'s stroke branch —
+        # "does this pen loop enclose a region". Pure geometry leaf, shared by
+        # the viewport fill pass and all three exporters.
+        "pc_agent.viewport.stroke_fill": {
+            "polyline_closes",
+            "stroke_fill_polygon",
+            "stroke_fill_polygon_of",
+        },
     }
     pc_modules = {module for module in imported if module.startswith("pc_agent")}
     assert pc_modules <= set(allowed), f"unexpected pc_agent imports: {pc_modules}"
