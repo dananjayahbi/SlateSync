@@ -22,6 +22,18 @@ void main() {
   /// tool for 500 ms. Shared by every widget test that needs the panel.
   Future<void> openPanel(WidgetTester tester, [StudioTool tool = StudioTool.pen]) async {
     final Finder button = find.byKey(ValueKey<String>('tool-${tool.name}'));
+    // The dock's rail is now taller than a short test viewport, and the
+    // overlay panel is stacked BELOW the dock in the page, so tapping at (4,4)
+    // can land on the panel instead of outside it. Give every dock test
+    // headroom so "tap outside to dismiss" really is outside.
+    tester.view.physicalSize = const Size(1200, 1400);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+    await tester.pump();
+
+    await tester.ensureVisible(button);
+    await tester.pump();
     final TestGesture gesture = await tester.startGesture(tester.getCenter(button));
     await tester.pump(const Duration(milliseconds: 550));
     await gesture.up();
@@ -305,10 +317,17 @@ void main() {
       StudioTool.fill: 0x04,
       StudioTool.table: 0x04,
       StudioTool.image: 0x04,
+      // Round-12 issue 05 — polygon and text box are shapes: a polygon drag
+      // previews like a shape, and a text box drag previews its rectangle.
+      StudioTool.polygon: 0x04,
+      StudioTool.text: 0x04,
+      // Round-12 issue 09 — the OCR tool streams no ink of its own; it shares
+      // the preview identifier like the other non-drawing tools.
+      StudioTool.ocr: 0x04,
     };
 
-    test('all 14 StudioTool values map to the expected byte', () {
-      expect(StudioTool.values.length, 14);
+    test('all 17 StudioTool values map to the expected byte', () {
+      expect(StudioTool.values.length, 17);
       expect(expected.keys, containsAll(StudioTool.values));
       expected.forEach((StudioTool tool, int byte) {
         expect(toolIdFor(tool), byte, reason: 'toolIdFor($tool)');

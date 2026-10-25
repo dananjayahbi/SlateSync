@@ -25,6 +25,14 @@ void main() {
     required ValueNotifier<StudioTool> tool,
     VoidCallback? onClearRequested,
   }) {
+    // Round-12 issue 05/09 added polygon, text and OCR to the rail, so on the
+    // default 800x600 test surface the last tools (and the Clear button, which
+    // is below them) fall outside the viewport and cannot be tapped. Give the
+    // dock room instead of asserting on a scrolled-away widget.
+    tester.view.physicalSize = const Size(1200, 1600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
     return tester.pumpWidget(
       MaterialApp(
         home: Scaffold(

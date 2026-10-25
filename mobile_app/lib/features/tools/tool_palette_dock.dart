@@ -26,10 +26,13 @@ enum StudioTool {
   circle,
   triangle,
   arrow,
+  polygon,
+  text,
   cartesianGraph,
   numberLine,
   table,
   image,
+  ocr,
 }
 
 /// Eraser behavior (Doc 24 §4; round-8 issue 03 changed the default).
@@ -70,11 +73,14 @@ int toolIdFor(StudioTool tool) => switch (tool) {
   StudioTool.circle ||
   StudioTool.triangle ||
   StudioTool.arrow ||
+  StudioTool.polygon ||
+  StudioTool.text ||
   StudioTool.cartesianGraph ||
   StudioTool.numberLine ||
   StudioTool.table ||
   StudioTool.fill ||
-  StudioTool.image => ToolId.shapePreview,
+  StudioTool.image ||
+  StudioTool.ocr => ToolId.shapePreview,
 };
 
 /// Doc 03 `CARTESIAN_2D` `graph_config` object.
@@ -171,8 +177,11 @@ ToolConfig defaultToolConfig(StudioTool tool) {
     case StudioTool.circle:
     case StudioTool.triangle:
     case StudioTool.arrow:
+    case StudioTool.polygon:
+    case StudioTool.text:
     case StudioTool.table:
     case StudioTool.image:
+    case StudioTool.ocr:
       break; // Frozen Doc 24 §6 defaults: #1E1E1E / 2.5 / 1.0.
     case StudioTool.fill:
       cfg.width = 2.5; // fill only changes the interior colour
@@ -844,10 +853,13 @@ String _toolLabel(StudioTool tool) => switch (tool) {
   StudioTool.circle => 'Circle',
   StudioTool.triangle => 'Triangle',
   StudioTool.arrow => 'Arrow',
+  StudioTool.polygon => 'Polygon',
+  StudioTool.text => 'Text',
   StudioTool.cartesianGraph => 'Cartesian Graph',
   StudioTool.numberLine => 'Number Line',
   StudioTool.table => 'Table',
   StudioTool.image => 'Image',
+  StudioTool.ocr => 'OCR Scan',
 };
 
 IconData _toolIcon(StudioTool tool) => switch (tool) {
@@ -861,10 +873,13 @@ IconData _toolIcon(StudioTool tool) => switch (tool) {
   StudioTool.circle => Icons.circle,
   StudioTool.triangle => Icons.change_history,
   StudioTool.arrow => Icons.north_east,
+  StudioTool.polygon => Icons.pentagon_outlined,
+  StudioTool.text => Icons.text_fields,
   StudioTool.cartesianGraph => Icons.show_chart,
   StudioTool.numberLine => Icons.numbers,
   StudioTool.table => Icons.table_chart,
   StudioTool.image => Icons.image,
+  StudioTool.ocr => Icons.document_scanner_outlined,
 };
 
 List<String>? _splitPair(String text) {

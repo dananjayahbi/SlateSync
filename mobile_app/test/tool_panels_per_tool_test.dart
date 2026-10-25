@@ -18,6 +18,14 @@ void main() {
     required ValueNotifier<ToolConfig> config,
     required ValueNotifier<StudioTool> tool,
   }) {
+    // Round-12 added polygon, text and OCR to the rail; on the default
+    // 800x600 surface the tools near the bottom — and the property overlay,
+    // which is stacked under the dock — no longer fit alongside a "tap
+    // outside" point. Give the fixture room so those taps mean what they say.
+    tester.view.physicalSize = const Size(1200, 1600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
     return tester.pumpWidget(
       MaterialApp(
         home: Scaffold(

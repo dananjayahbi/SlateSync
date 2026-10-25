@@ -160,6 +160,7 @@ class ToolPropertyPanel extends StatelessWidget {
       case StudioTool.circle:
       case StudioTool.triangle:
       case StudioTool.arrow:
+      case StudioTool.polygon:
         return <Widget>[
           _tipSizeRow(cfg),
           const SizedBox(height: 4),
@@ -235,6 +236,24 @@ class ToolPropertyPanel extends StatelessWidget {
           const Text(
             'Bytes only — the canvas page streams ASSET_START/CHUNK/DONE then '
             'ADD_IMAGE.',
+            style: toolPanelCaptionStyle,
+          ),
+        ];
+      case StudioTool.text:
+        return <Widget>[
+          _paletteRow(cfg),
+          const SizedBox(height: 8),
+          const Text(
+            'Drag a box, then type with the keyboard. The text lives in the '
+            'node\'s graph_config so it survives a round trip.',
+            style: toolPanelCaptionStyle,
+          ),
+        ];
+      case StudioTool.ocr:
+        return <Widget>[
+          const Text(
+            'Circle the text you want scanned, or scan the whole canvas. The '
+            'PC does the recognition and returns editable text.',
             style: toolPanelCaptionStyle,
           ),
         ];
@@ -524,8 +543,11 @@ String _toolLabel(StudioTool tool) => switch (tool) {
   StudioTool.circle => 'Circle',
   StudioTool.triangle => 'Triangle',
   StudioTool.arrow => 'Arrow',
+  StudioTool.polygon => 'Polygon',
+  StudioTool.text => 'Text',
   StudioTool.cartesianGraph => 'Cartesian Graph',
   StudioTool.numberLine => 'Number Line',
   StudioTool.table => 'Table',
   StudioTool.image => 'Image',
+  StudioTool.ocr => 'OCR Scan',
 };

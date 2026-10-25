@@ -94,7 +94,12 @@ Future<void> _flushReal(WidgetTester tester, {int rounds = 6}) async {
 }
 
 Future<void> _pickTool(WidgetTester tester, String toolKey) async {
-  await tester.tap(find.byKey(ValueKey<String>(toolKey)));
+  // The dock is a vertical scroller: adding tools can push a button below the
+  // fold on a short viewport, so bring the target into view before tapping.
+  final Finder target = find.byKey(ValueKey<String>(toolKey));
+  await tester.ensureVisible(target);
+  await tester.pump();
+  await tester.tap(target);
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 50));
 }

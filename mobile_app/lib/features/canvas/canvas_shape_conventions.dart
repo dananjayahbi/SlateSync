@@ -11,6 +11,14 @@
 /// | circle     | `SHAPE`  | `CIRCLE`      | `[]` (bbox convention — below)   |
 /// | triangle   | `SHAPE`  | `TRIANGLE`    | `[lb, rb, center-top]`           |
 /// | arrow      | `SHAPE`  | `ARROW`       | `[[sx,sy],[ex,ey]]` (shaft)      |
+/// | polygon    | `SHAPE`  | `PATH`        | regular-polygon vertices         |
+/// | text box   | `SHAPE`  | `TEXT`        | `[]` (`graph_config` carries it) |
+///
+/// The last two rows are round-12 issue 05. Both reuse an existing shape
+/// layout on purpose: `PATH` already renders a closed polygon everywhere, and
+/// a text box is a rect whose content lives in `graph_config` the way a
+/// `TABLE`'s grid does — see `polygon_geometry.dart` and `text_box_model.dart`
+/// for the builders that produce them.
 ///
 /// * `pc_agent/viewport/primitive_renderer.py` — `rect_corners` reads
 ///   `pts[0]/pts[1]` as the two bbox corners, `triangle_points` takes the
