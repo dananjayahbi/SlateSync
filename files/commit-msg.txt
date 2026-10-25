@@ -1,27 +1,29 @@
-﻿Round 12 (part 6): polygon and text box models, plus PC text rendering
+﻿Round 12 (part 7): wire the polygon, text and OCR tools into the canvas
 
-Issue 05. Two design decisions were forced by the existing schema and are
-worth recording, because the obvious alternatives do not work:
+Polygon commits SHAPE+PATH with the vertices from regularPolygonInBox; the text
+tool commits SHAPE+TEXT and immediately opens the keyboard editor, then writes
+the result back into graph_config; the OCR tool draws a free-hand outline and
+its panel drives the PC job, inserting the returned text as a real text box.
 
-* POLYGON reuses SHAPE + shape_type PATH with its vertices in geometry.pts.
-  No schema change, and both painters already render PATH -- a separate
-  POLYGON shape type would have meant touching every renderer to draw
-  something they can already draw.
-* TEXT travels in graph_config ({"text", "font_size", "align"}), exactly as
-  TABLE stores its grid. NodeStyle is frozen and geometry.pts is numeric
-  only, so there is nowhere else for a string to live without unfreezing the
-  node model.
+Three genuine bugs surfaced while wiring this, all of the kind that would have
+shipped as "the feature does not work" and none visible from the code alone:
 
-Text needed attention beyond the obvious path: once TEXT became a reachable
-shape_type, the PDF exporter and the thumbnail renderer would have drawn a
-frame around the box (they outline every shape). Both now delegate TEXT, so
-the box looks the same everywhere rather than being framed in three of four
-renderers.
+1. The OCR overlay was a CONDITIONAL Stack child. Adding it changed the number
+   of unkeyed children above the ToolDock, so Flutter remounted the dock —
+   which destroyed an open property panel mid-interaction. The slot is now
+   always present and merely paints nothing for other tools.
+2. CustomPaint hit-tests like any other box, so the overlay swallowed the very
+   drag it existed to visualise. It is now unconditionally pointer-transparent.
+3. The OCR panel lives in the dock's OverlayEntry, which is NOT in this page's
+   element tree, so setState never reached it: the outline, progress and errors
+   would all silently never appear. It now listens to its own notifier.
+   Separately, the running flag was cleared only AFTER `await sub.cancel()`,
+   leaving the panel stuck on "scanning" for a frame after the job ended.
 
-Polygon hit-testing is boundary-inclusive on purpose: tapping exactly on an
-edge should select the polygon, not miss it.
+Also hardened two lifetime edges: the notifier is guarded against use after
+dispose (an OCR job can outlive the page), and `_bumpOcr` is safe to call from
+any async continuation.
 
-62 Dart tests, 105 Python tests (including real GL read-back), ruff clean,
-full PC suite 955 green, flutter analyze clean, full mobile suite 636 green.
+23 integration tests; flutter analyze clean; full mobile suite 659 green.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

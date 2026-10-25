@@ -28,6 +28,7 @@ import 'package:mobile_app/canvas_engine/artboard_manager.dart'; // Doc 23
 import 'package:mobile_app/canvas_engine/camera_controller.dart'; // Doc 20
 import 'package:mobile_app/canvas_engine/image_placeholder_ticker.dart'; // round-12 issue 06
 import 'package:mobile_app/canvas_engine/lock_guard.dart'; // round-10 issue 05
+import 'package:mobile_app/canvas_engine/polygon_geometry.dart'; // round-12 issue 05
 import 'package:mobile_app/canvas_engine/region_fill.dart'; // round-9 issue 04
 import 'package:mobile_app/canvas_engine/selection_groups.dart'; // round-9 issue 05
 import 'package:mobile_app/canvas_engine/selection_transform.dart'; // round-8 issue 07
@@ -35,6 +36,7 @@ import 'package:mobile_app/canvas_engine/stroke_eraser.dart'; // round-8 issue 0
 import 'package:mobile_app/canvas_engine/stroke_eraser_controller.dart';
 import 'package:mobile_app/canvas_engine/stroke_processor.dart'; // Doc 21
 import 'package:mobile_app/canvas_engine/table_geometry.dart'; // round-9 issue 06
+import 'package:mobile_app/canvas_engine/text_box_model.dart'; // round-12 issue 05
 import 'package:mobile_app/canvas_engine/tiled_canvas_painter.dart'; // Doc 22
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 import 'package:mobile_app/core/storage/local_db.dart'; // Doc 26
@@ -50,6 +52,10 @@ import 'package:mobile_app/features/canvas/remote_mutation_applier.dart';
 import 'package:mobile_app/features/canvas/selection_actions.dart'; // round-9 05/06
 import 'package:mobile_app/features/canvas/selection_overlay.dart'; // round-8 issue 07
 import 'package:mobile_app/features/canvas/table_config_popup.dart'; // round-9 issue 06
+import 'package:mobile_app/features/canvas/text_box_editor.dart'; // round-12 issue 05
+import 'package:mobile_app/features/ocr/ocr_client.dart'; // round-12 issue 09
+import 'package:mobile_app/features/ocr/ocr_panel.dart'; // round-12 issue 09
+import 'package:mobile_app/features/ocr/ocr_selection_painter.dart'; // round-12 issue 09
 import 'package:mobile_app/features/export/export_modal_sheet.dart'; // Doc 27
 import 'package:mobile_app/features/home/home_canvas_dashboard.dart'; // Doc 26
 import 'package:mobile_app/features/pairing/pairing_screen.dart'; // Issue 03
@@ -115,6 +121,35 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
 
   /// Round-12 issue 03 — focus mode hides the chrome while notes are written.
   final FocusModeController _focus = FocusModeController();
+
+  /// Round-12 issue 05 — polygon tool side count (tap-to-configure later).
+  final int _polygonSides = 6;
+
+  /// Round-12 issue 09 — the free-drawn OCR outline, plus job state.
+  final OcrSelectionPath _ocrPath = OcrSelectionPath();
+  OcrClient? _ocrClient;
+  bool _ocrRunning = false;
+  String _ocrStage = 'QUEUED';
+  double _ocrPercent = 0;
+  String? _ocrError;
+  String? _ocrSummary;
+
+  /// Bumped on every OCR state change.
+  ///
+  /// The OCR panel lives in the dock's `OverlayEntry`, which is built once and
+  /// is NOT part of this page's element tree — so `setState` here would never
+  /// reach it and the outline, progress and errors would all silently fail to
+  /// appear. A notifier the panel listens to is the only thing that rebuilds
+  /// across that boundary.
+  final ValueNotifier<int> _ocrTick = ValueNotifier<int>(0);
+  bool _ocrTickDisposed = false;
+
+  /// Safe to call from an async OCR callback that outlives the page.
+  void _bumpOcr() {
+    if (!_ocrTickDisposed) {
+      _ocrTick.value++;
+    }
+  }
   late final ArtboardManager _artboard;
 
   /// Doc 02 §10.2 live-mutation relay receive side (shared with the local
@@ -279,6 +314,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     _canvasTick.dispose();
     _history.dispose();
     _focus.dispose();
+    unawaited(_ocrClient?.dispose());
+    _ocrTickDisposed = true;
+    _ocrTick.dispose();
     _hintTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
@@ -1166,6 +1204,26 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     if (tool == StudioTool.cartesianGraph || tool == StudioTool.numberLine) {
       return; // dock graph-builder dialogs — no direct canvas input
     }
+    if (tool == StudioTool.ocr) {
+      // Round-12 issue 09 — single-finger drag draws the scan outline; a
+      // second finger falls through to the camera gesture so the user can
+      // still zoom mid-circle.
+      if (_pointers.length == 1) {
+        _ocrPath.clear();
+        _ocrPath.add(_camera.screenToWorld(e.localPosition, _viewport));
+        _canvasTick.value++;
+        _bumpOcr();
+        // Schedule a rebuild after the gesture settles: the property panel is
+        // an OverlayEntry inserted by the hold, so a notifier bump that lands
+        // in the same frame as its insertion can be missed.
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted) {
+            _bumpOcr();
+          }
+        });
+      }
+      return;
+    }
     if (tool == StudioTool.table && _tableConfig == null) {
       // Round-9 issue 06 — the config popup opens WITH the tool; a tap before
       // it is answered just re-opens it rather than drawing a default table.
@@ -1210,6 +1268,12 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       }
       return;
     }
+    if (_tool.value == StudioTool.ocr) {
+      if (_ocrPath.add(_camera.screenToWorld(e.localPosition, _viewport))) {
+        _canvasTick.value++;
+        _bumpOcr();
+      }
+      return;    }
     if (_shapeStart != null) {
       if (e.pointer != _shapePointer) {
         return;
@@ -1621,6 +1685,48 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     // Doc 02 §10.3 — kind / shape_type / pts follow the PC conventions
     // (canvas_shape_conventions.dart); then index locally + RPC in one step.
     _streamEnd();
+    if (tool == StudioTool.polygon) {
+      // Round-12 issue 05 — a polygon is a SHAPE with `shape_type: PATH` and
+      // its vertices in `geometry.pts`, so both painters render it without a
+      // new shape type (PATH already exists).
+      final List<List<double>> vertices = polygonPts(
+        regularPolygonInBox(rect, sides: _polygonSides),
+      );
+      _commitElement(
+        _buildNode(
+          kind: 'SHAPE',
+          shapeType: 'PATH',
+          pts: vertices,
+          rect: rect,
+        ),
+        rect,
+        'ADD_SHAPE',
+      );
+      _canvasTick.value++;
+      return;
+    }
+    if (tool == StudioTool.text) {
+      // Round-12 issue 05 — the text box's content lives in `graph_config`
+      // (`NodeStyle` is frozen and `pts` is numeric-only), then the keyboard
+      // opens so the user can type immediately.
+      final TextBoxModel box = TextBoxModel(rect: rect);
+      _commitElement(        _buildNode(
+          kind: 'SHAPE',
+          shapeType: 'TEXT',
+          pts: <List<double>>[
+            <double>[rect.left, rect.top],
+            <double>[rect.right, rect.bottom],
+          ],
+          rect: rect,
+          graphConfig: box.toGraphConfig(),
+        ),
+        rect,
+        'ADD_SHAPE',
+      );
+      _canvasTick.value++;
+      unawaited(_editTextBox(_doc.elements.last.nodeId));
+      return;
+    }
     if (tool == StudioTool.table) {
       // Round-9 issue 06 — a table is a SHAPE with `shape_type: TABLE` and its
       // grid in `graph_config`, so every renderer gains tables by reading one
@@ -1715,9 +1821,197 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     );
   }
 
+  // -------------------------------------------------------------------------
+  // Round-12 issue 09 — OCR (the PC does the recognition)
+  // -------------------------------------------------------------------------
+
+  OcrClient get _ocr =>
+      _ocrClient ??= OcrClient(client: widget.client, canvasId: _doc.canvasId);
+
+  /// Builds the OCR controls for the tool's property panel.
+  Widget _buildOcrPanel(BuildContext context) {
+    // Listens to [_ocrTick] rather than relying on the page's setState: this
+    // widget is built into the dock's OverlayEntry, outside this page's tree.
+    return ValueListenableBuilder<int>(
+      valueListenable: _ocrTick,
+      builder: (BuildContext context, int _, Widget? child) => OcrPanel(
+        canvasIsInfinite: _canvasIsInfinite,
+        running: _ocrRunning,
+        stage: _ocrStage,
+        percent: _ocrPercent,
+        hasSelection: _ocrPath.isUsable,
+        errorText: _ocrError,
+        resultSummary: _ocrSummary,
+        onScanSelection: () => unawaited(_scanSelection()),
+        onScanCanvas: () => unawaited(_scanWholeCanvas()),
+        onCancel: () => unawaited(_ocr.cancel()),
+      ),
+    );
+  }
+
+  /// True when the artboard has no bounded page (whole-canvas scans are
+  /// meaningless there).
+  bool get _canvasIsInfinite => _artboard.current.isInfinite;
+
+  Future<void> _scanSelection() => _runOcr(
+        OcrScope.region,
+        path: _ocrPath.toWire(),
+      );
+
+  Future<void> _scanWholeCanvas() => _runOcr(OcrScope.canvas);
+
+  /// Runs one OCR job and inserts the result as an editable text box.
+  Future<void> _runOcr(OcrScope scope, {List<List<double>>? path}) async {
+    if (_ocrRunning) {
+      return;
+    }
+    setState(() {
+      _ocrRunning = true;
+      _ocrStage = 'QUEUED';
+      _ocrPercent = 0;
+      _ocrError = null;
+      _ocrSummary = null;
+    });
+    _bumpOcr();
+
+    final OcrClient ocr = _ocr;
+    final StreamSubscription<OcrProgress> sub = ocr.progress.listen(
+      (OcrProgress progress) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _ocrStage = progress.stage;
+          _ocrPercent = progress.percent;
+        });
+        _bumpOcr();
+      },
+    );
+
+    try {
+      final OcrOutcome outcome = await ocr.scan(scope: scope, path: path);
+      if (!mounted) {
+        return;
+      }
+      setState(() => _ocrSummary = describeOcrOutcome(outcome));
+      if (outcome.hasText) {
+        _insertOcrText(outcome);
+        _ocrPath.clear();
+      } else {
+        setState(() => _ocrError = 'No text found in that area.');
+      }
+      _bumpOcr();
+    } on OcrRequestError catch (error) {
+      if (mounted) {
+        setState(() => _ocrError = error.message);
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() => _ocrError = 'Scan failed: $error');
+      }
+    } finally {
+      // Flip the running flag BEFORE the await: `sub.cancel()` is asynchronous,
+      // and leaving the panel in its "scanning" state across that await makes
+      // the UI look stuck for a frame after the job has already finished.
+      if (mounted) {
+        setState(() => _ocrRunning = false);
+      }
+      _bumpOcr();
+      await sub.cancel();
+    }
+  }
+
+  /// Places recognised text as a real, editable text box (issue 05's tool).
+  void _insertOcrText(OcrOutcome outcome) {
+    // Anchor the box to the scanned region when there is one, so the text lands
+    // where the user pointed instead of somewhere arbitrary.
+    Rect rect = _ocrPath.bounds ?? _viewportWorldRect();
+    if (rect.width < kMinTextBoxSize) {
+      rect = Rect.fromLTWH(rect.left, rect.top, kMinTextBoxSize * 6, rect.height);
+    }
+    final TextBoxModel box = TextBoxModel(
+      rect: rect,
+      text: outcome.text,
+      fontSize: kDefaultTextFontSize,
+    );
+    _commitElement(
+      _buildNode(
+        kind: 'SHAPE',
+        shapeType: 'TEXT',
+        pts: <List<double>>[
+          <double>[rect.left, rect.top],
+          <double>[rect.right, rect.bottom],
+        ],
+        rect: rect,
+        graphConfig: box.toGraphConfig(),
+      ),
+      rect,
+      'ADD_SHAPE',
+    );
+    _canvasTick.value++;
+    _showHint('Scanned text added — tap it with Select to edit.');
+  }
+
+  /// The visible world rect, used as a fallback anchor for whole-canvas scans.
+  Rect _viewportWorldRect() {
+    if (_viewport.width <= 0 || _viewport.height <= 0) {
+      return const Rect.fromLTWH(0, 0, 400, 120);
+    }
+    final Offset topLeft = _camera.screenToWorld(Offset.zero, _viewport);
+    final Offset bottomRight = _camera.screenToWorld(
+      Offset(_viewport.width, _viewport.height),
+      _viewport,
+    );
+    return Rect.fromPoints(topLeft, bottomRight);
+  }
+
+  // -------------------------------------------------------------------------
+  // Round-12 issue 05 — text boxes
+  // -------------------------------------------------------------------------
+
+  /// Opens the keyboard editor for the text box [nodeId] and writes the result
+  /// back into the node's `graph_config`.
+  ///
+  /// The node is the source of truth (no shadow field on the page), so an edit
+  /// is a normal document mutation and goes through undo like anything else.
+  Future<void> _editTextBox(String nodeId) async {
+    final CanvasNodeModel? node = _nodeById(nodeId);
+    if (node == null) {
+      return;
+    }
+    final TextBoxModel before = TextBoxModel.fromGraphConfig(
+      node.geometry.graphConfig,
+      _rectOf(node),
+    );
+    final TextBoxEdit? edit = await showTextBoxEditor(context, box: before);
+    if (edit == null || !mounted) {
+      return;
+    }
+    final TextBoxModel after = before.copyWith(
+      text: edit.text,
+      fontSize: edit.fontSize,
+      align: edit.align,
+    );
+    if (after.text == before.text &&
+        after.fontSize == before.fontSize &&
+        after.align == before.align) {
+      return; // nothing changed — do not create an undo step
+    }
+    _applyTextBox(node, after);
+  }
+
+  /// Rewrites a text node's config in place and relays the change.
+  void _applyTextBox(CanvasNodeModel node, TextBoxModel box) {
+    node.geometry.graphConfig = box.toGraphConfig();
+    _dirty = true;
+    _canvasTick.value++;
+    unawaited(
+      widget.client.sendRpc(_commitEnvelope('ADD_SHAPE', node.toJson())),
+    );
+  }
+
   /// Round-9 issue 06 — the table's initial-config popup.
-  Future<void> _openTableConfig() async {
-    if (_imageFlowActive) {
+  Future<void> _openTableConfig() async {    if (_imageFlowActive) {
       return;
     }
     _imageFlowActive = true;
@@ -2428,6 +2722,33 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                   );
                 },
               ),
+            // Round-12 issue 09 — the free-drawn OCR outline follows the same
+            // camera matrix as the ink, so it stays glued to the page at any
+            // zoom while the user circles the text.
+            //
+            // Two invariants, both learned the hard way. The slot is ALWAYS
+            // present (even for other tools) because adding it conditionally
+            // shifts the unkeyed dock below it in the Stack's child list and
+            // remounts the dock, destroying an open property panel mid-hold.
+            // And it is ALWAYS pointer-transparent: `CustomPaint` hit-tests
+            // like any other box, so without `IgnorePointer` it swallowed the
+            // very drag it was supposed to visualise.
+            Positioned.fill(
+              child: IgnorePointer(
+                child: ValueListenableBuilder<int>(
+                  valueListenable: _canvasTick,
+                  builder: (BuildContext context, int tick, Widget? child) =>
+                      CustomPaint(
+                    painter: OcrSelectionPainter(
+                      viewMatrix: _camera.viewMatrix,
+                      points: _tool.value == StudioTool.ocr
+                          ? List<Offset>.of(_ocrPath.points)
+                          : const <Offset>[],
+                    ),
+                  ),
+                ),
+              ),
+            ),
             if (_focus.chrome.showToolDock)
               Positioned(
                 left: 6,
@@ -2444,6 +2765,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                       onPickImage: (PendingImage img) =>
                           unawaited(_onPickImage(img)),
                       onGraphCommitted: _onGraphCommitted,
+                      ocrPanelBuilder: _buildOcrPanel,
                     ),
                   ),
                 ),

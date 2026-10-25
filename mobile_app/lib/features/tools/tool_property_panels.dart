@@ -70,6 +70,7 @@ class ToolPropertyPanel extends StatelessWidget {
     this.onOpenCartesian,
     this.onOpenNumberLine,
     this.onImportImage,
+    this.ocrPanel,
   });
 
   /// Tool whose rows are rendered (the held tool for the overlay — the hold
@@ -94,6 +95,10 @@ class ToolPropertyPanel extends StatelessWidget {
 
   /// Starts the gallery import flow (bytes delivered by the dock).
   final VoidCallback? onImportImage;
+
+  /// Round-12 issue 09 — the OCR scan controls, built by the canvas page so
+  /// this panel never has to know about the WebSocket or the job lifecycle.
+  final Widget? ocrPanel;
 
   @override
   Widget build(BuildContext context) {
@@ -251,11 +256,16 @@ class ToolPropertyPanel extends StatelessWidget {
         ];
       case StudioTool.ocr:
         return <Widget>[
-          const Text(
-            'Circle the text you want scanned, or scan the whole canvas. The '
-            'PC does the recognition and returns editable text.',
-            style: toolPanelCaptionStyle,
-          ),
+          // Round-12 issue 09 — the scan actions are injected so this panel
+          // stays widgets-only and the page owns the OCR client.
+          if (ocrPanel != null)
+            ocrPanel!
+          else
+            const Text(
+              'Circle the text you want scanned, or scan the whole canvas. The '
+              'PC does the recognition and returns editable text.',
+              style: toolPanelCaptionStyle,
+            ),
         ];
     }
   }

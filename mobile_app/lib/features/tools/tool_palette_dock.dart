@@ -224,6 +224,7 @@ class ToolDock extends StatefulWidget {
     this.pickImage,
     this.planWorldRect,
     this.snapEnabled,
+    this.ocrPanelBuilder,
   });
 
   /// Injected; on tool switch the dock REPLACES `value` with the active
@@ -257,6 +258,12 @@ class ToolDock extends StatefulWidget {
 
   /// Dock-local 15° snapping flag; a notifier is created when omitted.
   final ValueNotifier<bool>? snapEnabled;
+
+  /// Round-12 issue 09 — builds the OCR scan controls for the property panel.
+  ///
+  /// Injected rather than imported so the dock never depends on the OCR client
+  /// or the WebSocket: the canvas page owns the job, the dock only renders.
+  final WidgetBuilder? ocrPanelBuilder;
 
   @override
   State<ToolDock> createState() => _ToolDockState();
@@ -619,6 +626,9 @@ class _ToolDockState extends State<ToolDock> {
                     onOpenCartesian: _showCartesianDialog,
                     onOpenNumberLine: _showNumberLineDialog,
                     onImportImage: _pickAndDeliverImage,
+                    ocrPanel: tool == StudioTool.ocr
+                        ? widget.ocrPanelBuilder?.call(context)
+                        : null,
                   ),
                 ),
               ),
