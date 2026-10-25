@@ -83,6 +83,11 @@ void paintNodeFill(Canvas canvas, CanvasNodeModel n) {
     case 'TABLE':
       // The grid itself is the outline; the bands are painted by [paintTable].
       break;
+    case 'TEXT':
+      // The glyphs are the content; a filled box would hide them. Fill still
+      // works as a background (it is painted before the text), so this only
+      // skips the generic rect.
+      break;
     default:
       canvas.drawRect(box, fill);
   }

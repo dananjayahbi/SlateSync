@@ -22,6 +22,7 @@ import 'package:flutter/widgets.dart';
 import 'package:mobile_app/canvas_engine/asset_image_cache.dart'; // round-8 issue 05
 import 'package:mobile_app/canvas_engine/image_placeholder.dart'; // round-12 issue 06
 import 'package:mobile_app/canvas_engine/shape_render_extras.dart'; // round-9 04/05/06
+import 'package:mobile_app/canvas_engine/text_box_painter.dart'; // round-13 01
 import 'package:mobile_app/canvas_engine/tile_chunks.dart'; // Issue 05
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 
@@ -1424,6 +1425,11 @@ void _drawShape(
     case 'TABLE':
       // Round-9 issue 06 — rows/columns come from `graph_config`.
       paintTable(canvas, n, paint);
+    case 'TEXT':
+      // Round-13 issue 01 — glyphs, not a line. Without this case a TEXT node
+      // fell through to the polyline `default:` below and its two corner points
+      // drew as one diagonal stroke, which read as "the text tool makes a line".
+      paintTextBox(canvas, n, color: paint.color);
     default:
       if (pts.length < 2) {
         canvas.drawRect(r, paint);

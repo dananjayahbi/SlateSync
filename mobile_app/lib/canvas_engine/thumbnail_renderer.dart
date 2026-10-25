@@ -112,6 +112,22 @@ Future<Uint8List> renderDocThumbnail(
         _drawTableThumb(canvas, node, map, paint);
         break;
       default:
+        // Round-13 issue 01 — a TEXT node has the same shape as a table: two
+        // bbox corners in `pts`, so the generic path draws one diagonal line.
+        // A thumbnail cannot render glyphs at 1/20th scale anyway, so draw a
+        // block instead of a misleading line.
+        if (node.geometry.shapeType == 'TEXT') {
+          final List<double> b = node.bbox;
+          if (b.length >= 4) {
+            canvas.drawRect(
+              ui.Rect.fromPoints(map(b[0], b[1]), map(b[2], b[3])),
+              ui.Paint()
+                ..color = _hex(node.style.color, 0.35)
+                ..style = ui.PaintingStyle.fill,
+            );
+          }
+          break;
+        }
         _drawPath(canvas, pts, map, paint, node.geometry.shapeType);
     }
   }
