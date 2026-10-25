@@ -734,3 +734,43 @@ renderer (peak RAM = one strip) and MUST NOT pad the delivered file: an A4 page
 The disk-backed buffer is allocated at exactly that size and the final row and
 column strips are clipped, so no full-canvas copy is ever made and the strip
 grid still drives the render loop.
+---
+
+**§11.1 — Round-12 OCR job extension (actions 21–24).**
+
+The tablet never recognises text itself. It asks, and the PC computes: OCR is
+CPU/GPU heavy and the PC is the machine with the resources.
+
+New RPC type `OCR_JOB` with four actions:
+
+| action | direction | payload |
+|---|---|---|
+| `START_OCR` | tablet → PC | `job_id`, `scope` (`region` \| `canvas`), optional `path`, `padding` |
+| `CANCEL_OCR` | tablet → PC | `job_id` |
+| `OCR_PROGRESS` | PC → tablet | `job_id`, `stage`, `percent` |
+| `OCR_RESULT` | PC → tablet | `job_id`, `text`, optional `lines`, `origin`, `provider`, `error` |
+
+Two rules carry real weight:
+
+* **`scope: "region"` sends a free-drawn polygon in world units**, not a
+  rectangle — the user circles the text. Fewer than three usable points is an
+  error, refused by BOTH sides (the tablet refuses locally so useless work is
+  never sent; the PC refuses again as a backstop). The PC masks the raster to
+  that polygon, grown by a stroke radius, so ink outside the loop cannot leak
+  into the result.
+* **`scope: "canvas"` MUST be refused when the canvas is infinite.** "The
+  entire canvas" is not a bounded area there. The tablet disables the control;
+  the PC refuses the request. `is_infinite` is decided by the artboard table in
+  `artboard_is_infinite`, not by the advisory flag.
+
+`OCR_PROGRESS` is throttled to ≤10 Hz and its terminal `OCR_RESULT` always
+follows, so a client is never left waiting on a stage that has already finished.
+
+`OCR_RESULT.provider` reports the ONNX Runtime provider that **actually bound**
+(`DmlExecutionProvider` means the GPU did the work). It is in the payload on
+purpose: ONNX Runtime demotes an unavailable provider to CPU without raising, so
+without this field a silent fallback would be indistinguishable from success.
+`origin` is the raster crop's world-space top-left, which is what lets per-line
+pixel boxes be mapped back onto the canvas.
+
+Envelope counts change from 20 actions / 5 types to **24 actions / 6 types**.

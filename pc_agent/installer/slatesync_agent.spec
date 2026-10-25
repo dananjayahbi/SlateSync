@@ -73,6 +73,34 @@ if not cairo_binaries:
         if dll.name.startswith(("libcairo", "libgif"))
     ]
 
+# --- OCR (round-12 issue 09): onnxruntime + rapidocr ------------------------
+# `collect_all` rather than a bare hiddenimport, for two distinct reasons:
+#
+#  * rapidocr ships its model catalogue as package DATA (config.yaml and
+#    default_models.yaml). Miss those and the frozen build fails with a config
+#    error rather than a missing module, which is much harder to diagnose.
+#  * the DirectML GPU backend lives in onnxruntime's own provider DLLs, so they
+#    must be collected or the exe silently falls back to CPU — the exact
+#    failure mode this feature was built to avoid.
+#
+# The TensorRT submodule is skipped: rapidocr's own collector logs that it
+# cannot import it (no `tensorrt` package), and nothing here uses it.
+ocr_datas, ocr_binaries, ocr_hidden = collect_all("rapidocr")
+datas += ocr_datas
+binaries += ocr_binaries
+hiddenimports += [
+    module for module in ocr_hidden if ".tensorrt" not in module
+]
+
+ort_datas, ort_binaries, ort_hidden = collect_all("onnxruntime")
+datas += ort_datas
+binaries += ort_binaries
+hiddenimports += ort_hidden
+hiddenimports += [
+    "onnxruntime.capi._pybind_state",
+    "onnxruntime.capi.onnxruntime_pybind11_state",
+]
+
 # --- Analysis -> PYZ -> EXE -> COLLECT (Doc 18 §4 pipeline) ------------------
 a = Analysis(
     # Doc 04 bootstrap (Wave 3.A-finalized). Absolute: PyInstaller joins

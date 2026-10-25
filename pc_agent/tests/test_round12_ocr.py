@@ -350,3 +350,115 @@ class TestLineNormalisation:
         # Non-finite geometry falls through to the stacked fallback.
         lines = OcrEngine._to_lines(Raw(), (0.0, 0.0))
         assert len(lines) == 1
+
+class TestSelfTestCli:
+    """`--ocr-selftest` is the only honest answer to "is the GPU being used?".
+
+    These stay hermetic: they patch the engine singleton rather than loading a
+    real model, so the suite never depends on a GPU or a downloaded weight.
+    """
+
+    def test_it_reports_ok_and_the_provider(self, capsys, monkeypatch):
+        from pc_agent import main as agent_main
+        from pc_agent.ocr import ocr_engine
+
+        class _Eng:
+            def release(self):
+                pass
+
+            def recognize(self, _image, *, offset=(0.0, 0.0)):
+                return ocr_engine.OcrResult(
+                    lines=[
+                        ocr_engine.OcrLine(
+                            text="SlateSync OCR 24680", score=1.0, box=(0, 0, 10, 10)
+                        )
+                    ],
+                    provider="DmlExecutionProvider",
+                    width=720,
+                    height=160,
+                    elapsed_ms=12,
+                )
+
+        ocr_engine.reset_engine_for_tests()
+        monkeypatch.setattr(ocr_engine, "_ENGINE", _Eng())
+        assert agent_main.run_ocr_selftest() == 0
+        out = capsys.readouterr().out
+        assert "provider: DmlExecutionProvider" in out
+        assert "OK" in out
+        ocr_engine.reset_engine_for_tests()
+
+    def test_a_cpu_fallback_warns_but_still_passes(self, capsys, monkeypatch):
+        from pc_agent import main as agent_main
+        from pc_agent.ocr import ocr_engine
+
+        class _Eng:
+            def release(self):
+                pass
+
+            def recognize(self, _image, *, offset=(0.0, 0.0)):
+                return ocr_engine.OcrResult(
+                    lines=[
+                        ocr_engine.OcrLine(
+                            text="SlateSync 24680", score=0.9, box=(0, 0, 9, 9)
+                        )
+                    ],
+                    provider="CPUExecutionProvider",
+                )
+
+        ocr_engine.reset_engine_for_tests()
+        monkeypatch.setattr(ocr_engine, "_ENGINE", _Eng())
+        assert agent_main.run_ocr_selftest() == 0
+        assert "WARNING" in capsys.readouterr().err
+        ocr_engine.reset_engine_for_tests()
+
+    def test_recognising_nothing_is_a_failure(self, monkeypatch):
+        from pc_agent import main as agent_main
+        from pc_agent.ocr import ocr_engine
+
+        class _Eng:
+            def release(self):
+                pass
+
+            def recognize(self, _image, *, offset=(0.0, 0.0)):
+                return ocr_engine.OcrResult()
+
+        ocr_engine.reset_engine_for_tests()
+        monkeypatch.setattr(ocr_engine, "_ENGINE", _Eng())
+        assert agent_main.run_ocr_selftest() == 1
+        ocr_engine.reset_engine_for_tests()
+
+    def test_unexpected_text_is_a_failure(self, monkeypatch):
+        from pc_agent import main as agent_main
+        from pc_agent.ocr import ocr_engine
+
+        class _Eng:
+            def release(self):
+                pass
+
+            def recognize(self, _image, *, offset=(0.0, 0.0)):
+                return ocr_engine.OcrResult(
+                    lines=[ocr_engine.OcrLine(text="???", score=0.9, box=(0, 0, 1, 1))],
+                    provider="DmlExecutionProvider",
+                )
+
+        ocr_engine.reset_engine_for_tests()
+        monkeypatch.setattr(ocr_engine, "_ENGINE", _Eng())
+        assert agent_main.run_ocr_selftest() == 1
+        ocr_engine.reset_engine_for_tests()
+
+    def test_an_engine_failure_is_reported_not_raised(self, monkeypatch, capsys):
+        from pc_agent import main as agent_main
+        from pc_agent.ocr import ocr_engine
+
+        class _Eng:
+            def release(self):
+                pass
+
+            def recognize(self, _image, *, offset=(0.0, 0.0)):
+                raise ocr_engine.OcrEngineUnavailable("no onnxruntime")
+
+        ocr_engine.reset_engine_for_tests()
+        monkeypatch.setattr(ocr_engine, "_ENGINE", _Eng())
+        assert agent_main.run_ocr_selftest() == 1
+        assert "no onnxruntime" in capsys.readouterr().err
+        ocr_engine.reset_engine_for_tests()

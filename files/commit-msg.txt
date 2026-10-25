@@ -1,29 +1,30 @@
-﻿Round 12 (part 7): wire the polygon, text and OCR tools into the canvas
+﻿Round 12 release: 1.0.6
 
-Polygon commits SHAPE+PATH with the vertices from regularPolygonInBox; the text
-tool commits SHAPE+TEXT and immediately opens the keyboard editor, then writes
-the result back into graph_config; the OCR tool draws a free-hand outline and
-its panel drives the PC job, inserting the returned text as a real text box.
+Bumps the version and ships both artifacts.
 
-Three genuine bugs surfaced while wiring this, all of the kind that would have
-shipped as "the feature does not work" and none visible from the code alone:
+PyInstaller spec gained `collect_all` for rapidocr and onnxruntime. Both are
+needed for non-obvious reasons: rapidocr ships its model catalogue as package
+DATA (config.yaml / default_models.yaml), so a bare hiddenimport fails at
+runtime with a config error rather than a missing module; and onnxruntime's
+DirectML provider lives in its own DLLs, so without collecting them the frozen
+exe silently falls back to CPU -- the exact failure mode this feature exists to
+avoid. The TensorRT submodule is filtered out (rapidocr cannot import it here).
 
-1. The OCR overlay was a CONDITIONAL Stack child. Adding it changed the number
-   of unkeyed children above the ToolDock, so Flutter remounted the dock —
-   which destroyed an open property panel mid-interaction. The slot is now
-   always present and merely paints nothing for other tools.
-2. CustomPaint hit-tests like any other box, so the overlay swallowed the very
-   drag it existed to visualise. It is now unconditionally pointer-transparent.
-3. The OCR panel lives in the dock's OverlayEntry, which is NOT in this page's
-   element tree, so setState never reached it: the outline, progress and errors
-   would all silently never appear. It now listens to its own notifier.
-   Separately, the running flag was cleared only AFTER `await sub.cancel()`,
-   leaving the panel stuck on "scanning" for a frame after the job ended.
+New `--ocr-selftest` flag. It is deliberately separate from `--smoke`:
+`--smoke` must stay instant and pass with no GPU and no model, while this loads
+the recogniser and reports which provider ACTUALLY bound. Running it after an
+install is the only honest answer to "is the GPU being used?", because ONNX
+Runtime demotes an unavailable provider without raising.
 
-Also hardened two lifetime edges: the notifier is guarded against use after
-dispose (an OCR job can outlive the page), and `_bumpOcr` is safe to call from
-any async continuation.
+Frozen-build verification:
+  FileVersion   1.0.6
+  --smoke       OK
+  --ocr-selftest  provider: DmlExecutionProvider, 3 lines correct, 4.5s, OK
 
-23 integration tests; flutter analyze clean; full mobile suite 659 green.
+Docs: §11.1 added to Doc 02 (the OCR contract, its two hard rules, and why
+`provider` is on the wire); round12_plan.md gains a release summary recording
+the defects that measurement found and the traps for the next round.
+
+960 PC tests, 659 mobile tests, ruff and flutter analyze clean.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

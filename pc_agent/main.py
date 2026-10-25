@@ -44,6 +44,64 @@ def run_smoke() -> int:
     return 0
 
 
+def run_ocr_selftest() -> int:
+    """Round-12 issue 09 — prove OCR works in THIS build, on THIS machine.
+
+    Separate from ``--smoke`` on purpose: ``--smoke`` must stay instant and must
+    pass on a machine with no GPU and no model, while this deliberately loads
+    the recogniser and reports which ONNX Runtime provider actually bound.
+
+    It exists because the whole feature hinges on something that fails silently:
+    ONNX Runtime demotes an unavailable provider to CPU without raising. Running
+    this after an install is the only honest answer to "is the GPU being used?".
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    from pc_agent.ocr.ocr_engine import get_engine
+
+    # A printed sample: deterministic, and it exercises det + rec + cls.
+    image = Image.new("RGB", (720, 160), (255, 255, 255))
+    drawer = ImageDraw.Draw(image)
+    try:
+        font = ImageFont.truetype("arial.ttf", 48)
+    except OSError:  # pragma: no cover - font availability is environment-specific
+        font = ImageFont.load_default()
+    drawer.text((24, 24), "SlateSync OCR 24680", fill=(0, 0, 0), font=font)
+    drawer.text((24, 88), "handwriting test", fill=(0, 0, 0), font=font)
+
+    try:
+        engine = get_engine()
+        result = engine.recognize(image)
+    except Exception as exc:
+        print(f"OCR FAIL: {exc}", file=sys.stderr)
+        return 1
+
+    joined = " ".join(line.text for line in result.lines).lower()
+    print(f"provider: {result.provider}")
+    print(f"lines:    {len(result.lines)}")
+    print(f"elapsed:  {result.elapsed_ms} ms")
+    for line in result.lines:
+        print(f"  {line.score:.3f}  {line.text}")
+
+    if not result.lines:
+        print("OCR FAIL: recognised nothing", file=sys.stderr)
+        return 1
+    # Loose on purpose: the point is "the pipeline runs", not "the model is
+    # perfect on this font". Digits and a word are enough to prove det + rec.
+    if "24680" not in joined and "slatesync" not in joined:
+        print(f"OCR FAIL: unexpected text {joined!r}", file=sys.stderr)
+        return 1
+
+    if result.provider != "DmlExecutionProvider":
+        print(
+            "WARNING: the GPU provider did not bind — OCR is running on CPU. "
+            "This still works, just slower.",
+            file=sys.stderr,
+        )
+    print("OK")
+    return 0
+
+
 def attach_view_fit(bus, gl_host, window, current_doc: dict) -> None:
     """Doc 02 §10.5 — fit-the-view + HUD refresh when a document finishes loading.
 
@@ -378,9 +436,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="headless self-check (config + bus + shader dir); exit 0, no GUI/GL/network",
     )
+    parser.add_argument(
+        "--ocr-selftest",
+        action="store_true",
+        help="load the OCR model and report the ONNX Runtime provider actually used",
+    )
     args = parser.parse_args(argv)
     if args.smoke:
         return run_smoke()
+    if args.ocr_selftest:
+        return run_ocr_selftest()
     return run_full()
 
 

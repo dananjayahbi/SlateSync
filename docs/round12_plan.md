@@ -4,6 +4,9 @@ Ten reported tasks (02–11). Each entry records the **confirmed root cause or
 design decision**, the **files owned**, and the **acceptance criteria** so
 nothing is lost mid-implementation.
 
+**All ten items are implemented as of 1.0.6.** Status per section below; the
+release summary is at the end.
+
 Guiding constraints carried over from every previous round:
 
 * the wire schema is **frozen by intent** — an RPC/action may only be added with
@@ -340,3 +343,58 @@ temporarily reverting the fix.
    (verify versionName/versionCode + unchanged signing cert), copy to `dist/`,
    delete the previous APK;
 7. commit.
+
+---
+
+## Release summary — 1.0.6
+
+All ten items delivered. Test surface grew from 704 PC / 458 mobile to
+**960 PC / 659 mobile**, plus 105 Python and 62 Dart tests for the new tools.
+
+| Artifact | Version | Verified |
+|---|---|---|
+| `dist/SlateSync_Setup.exe` | 1.0.6 | `FileVersion` 1.0.6, compiled clean |
+| `dist/SlateSync-1.0.6-release.apk` | 1.0.6 (code 7) | `versionName`/`versionCode` match, signing cert unchanged so it installs over 1.0.5 |
+
+Frozen-build checks (`dist\SlateSyncAgent\SlateSyncAgent.exe`):
+
+* `--smoke` → `OK`
+* `--ocr-selftest` → `provider: DmlExecutionProvider`, 3 lines read correctly
+  in 4.5 s, `OK`
+
+### Defects found by measurement rather than by reading code
+
+Three of these would have shipped as "the feature does not work", and none were
+visible from the source alone:
+
+1. **`onnxruntime-gpu` cannot work on this machine.** It installs and imports
+   fine, then its CUDA provider fails to load (`cuDNN 9.*` and `CUDA 13.*`
+   required; the box has CUDA 12.4 with no cuDNN) and ONNX Runtime **silently
+   demotes to CPU**. The code would have looked correct and merely been slow.
+   Switched to `onnxruntime-directml`, whose provider binds and was verified by
+   reading back the active provider list, not by trusting the request.
+2. **PP-OCRv6 `medium` is worse than `small` on handwriting** (0.64–0.79 vs
+   0.83–0.89 confidence) *and* 28× slower on first run. The larger model is
+   tuned for dense CJK print. Choosing by reputation would have picked it.
+3. **The OCR overlay broke two things by existing.** As a conditional `Stack`
+   child it changed the unkeyed child count above the `ToolDock`, remounting the
+   dock and destroying an open property panel mid-hold; and `CustomPaint`
+   hit-tests like any box, so it swallowed the very drag it was there to
+   visualise. Both are now structural invariants with tests.
+4. **The OCR panel is inside the dock's `OverlayEntry`**, which is not part of
+   the page's element tree, so `setState` never reached it — outline, progress
+   and errors would all have silently never appeared.
+5. **The header could not fit its own buttons** on a narrow viewport (4.4 px
+   overflow in `fit_open_test`) once the focus toggle was added, so the title row
+   is now horizontally scrollable.
+
+### Notes for the next round
+
+* `git commit 334a04c "cp"` deleted the whole `docs/` tree; it was restored from
+  `5705c1a`. Watch for that pattern.
+* `flutter test` wipes the committed fixtures under
+  `mobile_app/test/.home_card_badges_tmp/`; restore with
+  `git checkout 602dc59 -- mobile_app/test/.home_card_badges_tmp`.
+* The dock rail is now 17 tools tall. Widget-test fixtures that tap rail buttons
+  need a taller surface (see `tool_panels_*_test.dart`), otherwise a tap lands
+  outside the viewport and the failure message looks like a product bug.
