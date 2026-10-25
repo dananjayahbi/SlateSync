@@ -18,6 +18,7 @@ import 'package:mobile_app/canvas_engine/artboard_manager.dart'; // Doc 23
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 import 'package:mobile_app/core/storage/local_db.dart';
 import 'package:mobile_app/core/theme/studio_theme.dart'; // Doc 05
+import 'package:mobile_app/features/home/thumbnail_cache.dart'; // round-12 issue 08
 import 'package:mobile_app/features/pairing/pairing_screen.dart'; // Issue 03
 import 'package:mobile_app/network/vector_sync_client.dart'
     show VectorSyncClient, uuidV4; // Doc 25
@@ -909,7 +910,12 @@ class _CanvasGridCard extends StatelessWidget {
   /// [Image.file] on top, and the preset badge chip overlaid top-left.
   Widget _thumbnailArea() {
     final String path = record.thumbPath;
-    final bool hasThumb = path.isNotEmpty && File(path).existsSync();
+    // Round-12 issue 08: the PNG is rewritten on every save, but `Image.file`
+    // caches by PATH, so the old decode was served forever. `refreshThumbnail`
+    // evicts the stale FileImage and returns a version token that is folded
+    // into the widget key, forcing the reload.
+    final String version = refreshThumbnail(path);
+    final bool hasThumb = version != '0';
     return Stack(
       fit: StackFit.expand,
       children: <Widget>[
@@ -918,7 +924,7 @@ class _CanvasGridCard extends StatelessWidget {
           Positioned.fill(
             child: Image.file(
               File(path),
-              key: Key('card_thumb_${record.id}'),
+              key: thumbnailKey(record.id, version),
               fit: BoxFit.cover,
               frameBuilder: (
                 BuildContext context,

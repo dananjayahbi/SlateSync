@@ -252,10 +252,13 @@ void main() {
       expect(bottom.inkCount, greaterThan(100)); // axis below the boundary
     });
 
-    test('IMAGE: no decodable bytes paints NOTHING (round-8 issue 05)', () async {
-      // The bug: an IMAGE node drew a filled bbox rect, so a picked photo
-      // never appeared and a missing asset looked like a solid block. Now an
-      // unresolved asset paints no ink at all.
+    test('IMAGE: an unresolved asset paints only the placeholder (round-12 06)',
+        () async {
+      // Round-8 fixed the filled-BBOX bug; round-12 issue 06 then replaced the
+      // resulting BLANK frame with an explicit loading placeholder, because a
+      // canvas full of images looked broken until every decode landed.
+      // The invariant that must still hold: no photo is faked - the ink is a
+      // faint skeleton, not a solid block of the image colour.
       final TiledCanvasEngine engine = newEngine();
       engine.addNode(makeKind(
         'img',
@@ -267,7 +270,12 @@ void main() {
       expect(visibleIds(engine), <String>['img']);
       expect(engine.rebakeCount, lessThanOrEqualTo(4));
       final _Raster r = await _rasterOf(engine.getTile(const TileKey(0, 0)));
-      expect(r.inkCount, 0);
+      // A placeholder is drawn (not nothing), but it is a faint tint plus a
+      // 1 dp outline — never an opaque block that could pass for the photo.
+      expect(r.inkCount, greaterThan(0),
+          reason: 'a blank frame was the round-12 issue-06 defect');
+      expect(r.solidCount, lessThan(300 * 200 ~/ 4),
+          reason: 'the placeholder must stay translucent, not fake the image');
     });
 
     test('IMAGE: decoded bytes paint inside the bbox', () async {
@@ -543,6 +551,17 @@ class _Raster {
     int count = 0;
     for (int i = 3; i < bytes.length; i += 4) {
       if (bytes[i] >= _minAlpha) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /// Pixels that are substantially OPAQUE — a photo's interior, not a tint.
+  int get solidCount {
+    int count = 0;
+    for (int i = 3; i < bytes.length; i += 4) {
+      if (bytes[i] >= 200) {
         count++;
       }
     }

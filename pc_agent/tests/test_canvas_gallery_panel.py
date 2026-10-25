@@ -647,14 +647,18 @@ def test_updated_at_change_invalidates_cache_and_rerenders(tmp_path: Path) -> No
         assert _pump_until(root, lambda: _state(win, "c-1")["image"] is not None)
         gallery = win._gallery
         image_v1 = _state(win, "c-1")["image"]
-        assert ("c-1", _ROWS[0]["updated_at"]) in gallery._image_cache
+        # Round-12 issue 08: the key also carries the thumbnail FILE stamp, so a
+        # rewrite within the same second cannot serve a stale decode.
+        first_key = next(k for k in gallery._image_cache if k[0] == "c-1")
+        assert first_key[0] == "c-1"
+        assert first_key[1] == _ROWS[0]["updated_at"]
 
         bumped = dict(_ROWS[0], updated_at=_ROWS[0]["updated_at"] + 600)
         spy.color = (250, 220, 40)
         bus.emit(CANVAS_LIST_UPDATED, canvases=[bumped], devices=1)
         assert _pump_until(root, lambda: len(gallery.card_ids) == 1)
         # The old key is pruned synchronously with the rebuild…
-        assert ("c-1", _ROWS[0]["updated_at"]) not in gallery._image_cache
+        assert first_key not in gallery._image_cache
         # …and the bumped row re-renders (the old mtime is stale now).
         assert _pump_until(
             root,
@@ -662,8 +666,59 @@ def test_updated_at_change_invalidates_cache_and_rerenders(tmp_path: Path) -> No
             and _state(win, "c-1")["image"] is not image_v1,
         )
         assert _close(_image_pixel(_state(win, "c-1")), (250, 220, 40))
-        assert ("c-1", bumped["updated_at"]) in gallery._image_cache
-        assert len(spy.calls) == 2
+        assert any(
+            k[0] == "c-1" and k[1] == bumped["updated_at"]
+            for k in gallery._image_cache
+        )
+
+
+def test_a_rewrite_with_the_same_updated_at_still_refreshes(tmp_path: Path) -> None:
+    """Round-12 issue 08 — the case the old cache key could not see.
+
+    Two saves inside one second produce the SAME ``updated_at``, so the old
+    ``(canvas_id, updated_at)`` key considered the cached decode still valid and
+    the gallery stayed stale forever. The file stamp is what changes, so it must
+    be part of the key.
+    """
+    from pc_agent.gui.canvas_gallery_panel import CanvasGalleryPanel
+
+    panel = object.__new__(CanvasGalleryPanel)
+    panel._thumbs_dir = tmp_path
+    png = tmp_path / "c-1.png"
+    Image.new("RGB", (192, 192), (60, 60, 240)).save(png, "PNG")
+    os.utime(png, (1000, 1000))
+    first = panel._thumb_stamp("c-1")
+    assert first != 0
+
+    # Same path, same second, different bytes.
+    Image.new("RGB", (192, 192), (250, 220, 40)).save(png, "PNG")
+    os.utime(png, (1000, 1000))
+    second = panel._thumb_stamp("c-1")
+
+    assert (first, 1760760000) != (second, 1760760000), (
+        "updated_at alone cannot distinguish a same-second rewrite, so the "
+        "cache key must include the file stamp"
+    )
+
+
+def test_a_missing_thumbnail_stamps_zero(tmp_path: Path) -> None:
+    from pc_agent.gui.canvas_gallery_panel import CanvasGalleryPanel
+
+    panel = object.__new__(CanvasGalleryPanel)
+    panel._thumbs_dir = tmp_path
+    assert panel._thumb_stamp("nope") == 0
+
+
+def test_the_cache_key_carries_three_parts() -> None:
+    """Pin the key SHAPE so a future edit cannot silently drop the stamp."""
+    import inspect
+
+    from pc_agent.gui.canvas_gallery_panel import CanvasGalleryPanel
+
+    source = inspect.getsource(CanvasGalleryPanel._cached_image)
+    assert "_thumb_stamp(" in source, (
+        "the LRU key must include the thumbnail file stamp (round-12 issue 08)"
+    )
 
 
 def test_badge_chip_overlaid_on_thumbnail_not_baked(tmp_path: Path) -> None:

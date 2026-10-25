@@ -92,6 +92,15 @@ class AssetImageCache {
   bool isPending(String? assetRef) =>
       assetRef != null && _inFlight.contains(assetRef);
 
+  /// Round-12 issue 06 — is ANY image still decoding?
+  ///
+  /// The placeholder ticker uses this to decide whether to keep requesting
+  /// frames, so an idle canvas costs nothing.
+  bool get hasPending => _inFlight.isNotEmpty;
+
+  /// The refs currently decoding (used to invalidate only their tiles).
+  Set<String> get pendingRefs => Set<String>.unmodifiable(_inFlight);
+
   /// Number of decoded images held — test/diagnostic hook.
   int get cachedCount => _decoded.length;
 

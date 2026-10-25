@@ -489,17 +489,48 @@ class TiledRasterExporter:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
 
+    @staticmethod
+    def _validate_extent(
+        extent: tuple[float, float, float, float],
+    ) -> tuple[float, float, float, float]:
+        """Reject a degenerate/!finite extent before it reaches the strip math.
+
+        A bad extent would otherwise surface as a zero-pixel memmap or a NaN
+        scale, i.e. a native crash rather than a message the caller can show.
+        """
+        try:
+            min_x, min_y, max_x, max_y = (float(v) for v in extent)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid extent {extent!r}") from exc
+        if not all(math.isfinite(v) for v in (min_x, min_y, max_x, max_y)):
+            raise ValueError(f"non-finite extent {extent!r}")
+        if max_x - min_x < 1.0 or max_y - min_y < 1.0:
+            raise ValueError(f"degenerate extent {extent!r}")
+        return (min_x, min_y, max_x, max_y)
+
     def export(
         self,
         doc: CanvasDocument,
         dpi: int,
         out_path: Path,
         progress: Callable[[float], None] | None = None,
+        *,
+        extent: tuple[float, float, float, float] | None = None,
     ) -> Path:
+        """Rasterise [doc] to [out_path].
+
+        [extent] overrides the region drawn, as `(min_x, min_y, max_x, max_y)` in
+        world units. Round 12 issue 09 uses it to rasterise just the area a user
+        circled for OCR, rather than duplicating this strip loop in the OCR
+        package. When omitted the whole artboard is used.
+        """
         out_path = Path(out_path)
         if dpi not in SUPPORTED_DPIS:
             raise ValueError(f"unsupported dpi {dpi!r}; expected one of {sorted(SUPPORTED_DPIS)}")
-        extent = resolve_extent(doc)  # raises ValueError("empty canvas")
+        if extent is None:
+            extent = resolve_extent(doc)  # raises ValueError("empty canvas")
+        else:
+            extent = self._validate_extent(extent)
         canvas_w, canvas_h = extent_to_px(extent, dpi)
         is_jpg = out_path.suffix.lower() in (".jpg", ".jpeg")
         if is_jpg and max(canvas_w, canvas_h) > JPG_MAX_PX:

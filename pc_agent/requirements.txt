@@ -11,6 +11,13 @@ qrcode
 pystray
 rtree
 numpy
+# Round-12 issue 09 — on-device OCR (PP-OCRv6 via ONNX Runtime).
+# DirectML variant on purpose: it binds to the GPU with nothing to install,
+# whereas `onnxruntime-gpu` needs CUDA 13 + cuDNN 9 and silently falls back to
+# CPU when they are missing (see docs/round12_plan.md §09).
+onnxruntime-directml
+rapidocr
+onnx
 # dev (Doc 01 pytest.ini / ruff.toml)
 pytest
 ruff

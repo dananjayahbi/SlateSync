@@ -202,11 +202,55 @@ type `OCR_JOB` with actions `START_OCR`, `OCR_PROGRESS`, `OCR_RESULT`,
 `validate_specs.py`, `protocol.py`, `test_protocol.py`,
 `test_contract_cross_specs.py`.
 
-**PC engine:** Tesseract via the `pytesseract` wrapper (binary is already on
-PATH at `C:\Program Files\Tesseract-OCR\tesseract.exe`; `PIL`/`numpy` present).
-Declare `pytesseract` in the PyInstaller spec (`hiddenimports` + the tesseract
-binary and `tessdata` under `binaries`), and bundle a tesseract install so a
-clean machine works — with a clear error if the engine is missing.
+**PC engine — measured, not assumed.** Tesseract was the first candidate and was
+**rejected on evidence**: this is a *handwriting* app, and Tesseract's LSTM models
+are tuned for print. The engine chosen is **RapidOCR (PaddleOCR PP-OCRv6,
+`model_type=small`, `lang=en`) on ONNX Runtime**, so no CUDA/cuDNN install is
+needed on the user's machine.
+
+Why ONNX Runtime **DirectML** and not CUDA:
+
+* `onnxruntime-gpu` 1.31 loads but its CUDA provider **refuses to initialise**
+  here — it demands `cuDNN 9.*` **and `CUDA 13.*`**, and the box has CUDA 12.4
+  with no cuDNN (`cublasLt64_13.dll` missing). ORT then **silently falls back to
+  CPU**, which is the worst outcome: it looks like it works and is just slow.
+* `onnxruntime-directml` 1.24.4 (the only line with a cp314 wheel) exposes
+  `DmlExecutionProvider`, which **binds to the GTX 1660 Ti successfully** —
+  verified with a synthetic ONNX graph reporting
+  `['DmlExecutionProvider', 'CPUExecutionProvider']` as the *active* providers.
+  DirectML also ships the GPU backend itself (via the OS), so there is nothing
+  for the user to install and nothing large to bundle.
+
+Measured on a realistic hand-print sample (uppercase + mixed case + digits,
+light Gaussian blur to mimic stylus ink bleed):
+
+| candidate | accuracy on hand-print | first run | peak VRAM |
+|---|---|---|---|
+| PP-OCRv6 `medium` | **worse** (0.64–0.79 confidence) | 60.9 s | 2.5 GB |
+| PP-OCRv5 `mobile` `ch` | unusable (splits lines, drops words) | 30.5 s | — |
+| **PP-OCRv6 `small` `en`** | **3/3 lines exact, 0.994–0.998** | **2.06 s** | **~1.9 GB** |
+
+`medium` being *worse* than `small` is not a fluke — the larger recogniser is
+tuned for dense CJK print and over-fits, while the `en` route uses the Latin
+alphabet head. So **small/en is both the most accurate and the fastest** here.
+
+VRAM budget: baseline desktop usage on this machine is ~942 MiB, and the engine
+added **~900 MiB** for a peak of ~1.9 GB — comfortably inside 6 GB, leaving room
+for the OpenGL mirror. The session is still **lazy-loaded and released** after
+an idle period so a 6 GB card is never permanently occupied.
+
+RapidOCR exposes DirectML directly, so no custom provider plumbing is needed:
+`RapidOCR(params={"EngineConfig.onnxruntime.use_dml": True,
+"Det.model_type": ModelType.SMALL, "Rec.model_type": ModelType.SMALL,
+"Det.ocr_version": OCRVersion.PPOCRV6, "Rec.ocr_version": OCRVersion.PPOCRV6,
+"Det.lang_type": LangDet.EN, "Rec.lang_type": LangRec.EN})`.
+
+Packaging caveat that must be handled: `onnxruntime-directml` + `rapidocr` +
+the PP-OCRv6 ONNX weights need to be declared in the PyInstaller spec
+(`hiddenimports` for `rapidocr.*` and its yaml config/`default_models.yaml` as
+`datas`), and the weights must live under the app-data dir rather than inside
+the bundle so first-run download failure produces a clear error instead of a
+silent hang. `numpy`/`PIL` are already present.
 
 **Rasterise the region:** the tiled exporter already loops strips for any
 origin/size, so add an optional `extent=` override to `export()` (one code path,

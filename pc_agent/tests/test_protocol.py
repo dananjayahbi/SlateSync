@@ -96,9 +96,14 @@ def test_rpc_actions_mirror_doc02_exactly() -> None:
         "CANVAS_PULL",
         # Doc 02 §10.1 — Round-6 clear (20 actions).
         "CLEAR_CANVAS",
+        # Doc 02 §11.1 — Round-12 OCR job (24 actions).
+        "START_OCR",
+        "CANCEL_OCR",
+        "OCR_PROGRESS",
+        "OCR_RESULT",
     }
     assert RPC_ACTIONS == frozenset(expected)
-    assert len(RPC_ACTIONS) == 20
+    assert len(RPC_ACTIONS) == 24
 
 
 def test_rpc_types_mirror_doc02_exactly() -> None:
@@ -108,6 +113,7 @@ def test_rpc_types_mirror_doc02_exactly() -> None:
         "ARTBOARD_RESIZE",
         "ASSET_UPLOAD",
         "EXPORT_JOB",
+        "OCR_JOB",
     }
     assert RPC_TYPES == frozenset(expected)
-    assert len(RPC_TYPES) == 5
+    assert len(RPC_TYPES) == 6

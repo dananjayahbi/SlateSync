@@ -20,6 +20,7 @@ import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:mobile_app/canvas_engine/asset_image_cache.dart'; // round-8 issue 05
+import 'package:mobile_app/canvas_engine/image_placeholder.dart'; // round-12 issue 06
 import 'package:mobile_app/canvas_engine/shape_render_extras.dart'; // round-9 04/05/06
 import 'package:mobile_app/canvas_engine/tile_chunks.dart'; // Issue 05
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
@@ -784,6 +785,14 @@ class TiledCanvasEngine {
   /// and re-bakes the affected tiles whenever a decode completes.
   final AssetImageCache assets = AssetImageCache();
 
+  /// Round-12 issue 06 — animation phase (0..1) for the loading placeholder.
+  ///
+  /// A tile bake is synchronous and cached, so a placeholder painted once would
+  /// freeze. The page drives this from an [ImagePlaceholderTicker]; changing it
+  /// discards the tiles holding a pending IMAGE so the next paint advances the
+  /// sheen.
+  double placeholderPhase = 0.0;
+
   /// Round-9 issue 07a — invoked after an asset decode invalidated tiles.
   ///
   /// Dropping the cached pictures is necessary but not sufficient: unless the
@@ -800,6 +809,14 @@ class TiledCanvasEngine {
     assets.onReady = _invalidateAssetTiles;
   }
 
+  /// Round-12 issue 06 — re-bake the tiles that hold one now-decoded asset.
+  ///
+  /// Public so the page can chain its own completion handling (ticker stop,
+  /// repaint) without stealing [AssetImageCache.onReady] from the engine.
+  void invalidateAllTilesForAsset(String assetRef) {
+    _invalidateAssetTiles(assetRef);
+  }
+
   /// Drops every cached tile so the next paint re-bakes from the index.
   /// Used when content the bake depends on changes outside the tile
   /// dirty-set — e.g. an IMAGE asset finishing its decode.
@@ -807,6 +824,48 @@ class TiledCanvasEngine {
     cache.invalidateAll();
     _dirty.clear();
     _bakedBucket.clear();
+  }
+
+  /// Round-12 issue 06 — advance the placeholder animation.
+  ///
+  /// Only tiles that actually contain a pending IMAGE need re-baking, and only
+  /// while something is pending; otherwise this is a no-op so an idle canvas
+  /// never pays for the animation.
+  /// Returns `true` when a repaint is needed.
+  bool advancePlaceholderPhase(double phase) {
+    if (!assets.hasPending) {
+      return false;
+    }
+    final double next = phase.isFinite ? phase : 0.0;
+    if ((next - placeholderPhase).abs() < 1e-6) {
+      return false;
+    }
+    placeholderPhase = next;
+    _invalidatePendingImageTiles();
+    return true;
+  }
+
+  /// Drops the tiles whose cached picture contains an undecoded IMAGE.
+  void _invalidatePendingImageTiles() {
+    final Set<String> pendingRefs = assets.pendingRefs;
+    if (pendingRefs.isEmpty) {
+      return;
+    }
+    for (final CanvasNodeModel node in _tree.query(Rect.largest)) {
+      if (node.kind != 'IMAGE') {
+        continue;
+      }
+      final String? ref = node.geometry.assetRef;
+      if (ref == null || !pendingRefs.contains(ref)) {
+        continue;
+      }
+      final Rect rect = _rectOfNode(node);
+      for (final TileKey k in tilesCovering(rect)) {
+        cache.invalidate(k);
+        _bakedBucket.remove(k);
+        _dirty.add(k);
+      }
+    }
   }
 
   void _invalidateAssetTiles(String assetRef) {
@@ -1152,7 +1211,7 @@ class TiledCanvasEngine {
     canvas.translate(-origin.left, -origin.top);
     canvas.clipRect(origin);
     _ensureAssets(<CanvasNodeModel>[node]);
-    _drawNode(canvas, node, assets);
+    _drawNode(canvas, node, assets, placeholderPhase);
     canvas.restore();
     return recorder.endRecording();
   }
@@ -1207,7 +1266,7 @@ class TiledCanvasEngine {
         a.layer.compareTo(b.layer));
     _ensureAssets(nodes);
     for (final CanvasNodeModel n in nodes) {
-      _drawNode(canvas, n, assets);
+      _drawNode(canvas, n, assets, placeholderPhase);
     }
     bakeStats.strokeReplays += nodes.length;
     canvas.restore();
@@ -1267,7 +1326,12 @@ Color _colorFrom(String hex, double opacity) {
 /// `ui.Image`; without it an IMAGE node paints nothing (round-8 issue 05:
 /// it used to paint an empty filled rect, which is why a picked photo never
 /// appeared).
-void _drawNode(Canvas canvas, CanvasNodeModel n, [AssetImageCache? assets]) {
+void _drawNode(
+  Canvas canvas,
+  CanvasNodeModel n, [
+  AssetImageCache? assets,
+  double placeholderPhase = 0.0,
+]) {
   final Paint paint = _paintFor(n);
   final List<List<double>> pts = n.geometry.pts;
   // Round-9 issue 04 — the interior goes UNDER the outline so the stroke keeps
@@ -1279,7 +1343,7 @@ void _drawNode(Canvas canvas, CanvasNodeModel n, [AssetImageCache? assets]) {
     case 'GRAPH_AXES':
       _drawGraph(canvas, n, paint);
     case 'IMAGE':
-      _drawImage(canvas, n, assets);
+      _drawImage(canvas, n, assets, phase: placeholderPhase);
     case 'LINE':
       _drawLine(canvas, pts, paint);
     default:
@@ -1289,26 +1353,45 @@ void _drawNode(Canvas canvas, CanvasNodeModel n, [AssetImageCache? assets]) {
 
 /// IMAGE — draw the decoded bitmap stretched over the node bbox.
 ///
-/// While the asset is still decoding this paints nothing (a placeholder box
-/// would be a lie); the engine re-bakes the tile once
-/// [AssetImageCache.onReady] reports it, because a tile bake is cached.
-void _drawImage(Canvas canvas, CanvasNodeModel n, AssetImageCache? assets) {
-  final ui.Image? image = assets?.imageOf(n.geometry.assetRef);
+/// Round-12 issue 06: while the asset is still decoding this used to paint
+/// NOTHING, so a canvas full of images showed empty frames until every decode
+/// landed. It now paints an animated placeholder (or a broken-image mark when
+/// the decode failed), because a blank frame reads as a broken app.
+///
+/// [phase] comes from [ImagePlaceholderTicker]; passing 0 simply freezes the
+/// sheen, which is what a thumbnail/export wants.
+void _drawImage(
+  Canvas canvas,
+  CanvasNodeModel n,
+  AssetImageCache? assets, {
+  double phase = 0.0,
+}) {
+  final String? ref = n.geometry.assetRef;
   final Rect rect = _rectOfNode(n);
-  if (image == null) {
+  final ui.Image? image = assets?.imageOf(ref);
+  if (image != null) {
+    canvas.drawImageRect(
+      image,
+      Rect.fromLTWH(
+        0,
+        0,
+        image.width.toDouble(),
+        image.height.toDouble(),
+      ),
+      rect,
+      Paint()..filterQuality = FilterQuality.medium,
+    );
     return;
   }
-  canvas.drawImageRect(
-    image,
-    Rect.fromLTWH(
-      0,
-      0,
-      image.width.toDouble(),
-      image.height.toDouble(),
-    ),
-    rect,
-    Paint()..filterQuality = FilterQuality.medium,
+  final ImagePlaceholderKind? kind = imagePlaceholderFor(
+    isPending: assets?.isPending(ref) ?? false,
+    hasFailed: assets?.hasFailed(ref) ?? false,
+    isReady: assets?.isReady(ref) ?? false,
+    hasAssetRef: ref != null && ref.isNotEmpty,
   );
+  if (kind != null) {
+    paintImagePlaceholder(canvas, rect, kind, phase: phase);
+  }
 }
 
 void _drawShape(

@@ -186,8 +186,19 @@ void main() {
       final Finder card = find.byKey(Key('canvas_card_$id'));
       expect(card, findsOneWidget);
       // Thumbnail image widget, fade-in wrapper, neutral placeholder kept.
+      // Round-12 issue 08: the thumbnail key now carries a version token so a
+      // rewritten PNG is reloaded instead of served from the stale ImageCache.
       expect(
-        find.descendant(of: card, matching: find.byKey(Key('card_thumb_$id'))),
+        find.descendant(
+          of: card,
+          matching: find.byWidgetPredicate(
+            (Widget w) =>
+                w.key is ValueKey<String> &&
+                (w.key! as ValueKey<String>)
+                    .value
+                    .startsWith('card_thumb_$id'),
+          ),
+        ),
         findsOneWidget,
       );
       expect(find.descendant(of: card, matching: find.byType(Image)),

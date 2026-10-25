@@ -26,6 +26,7 @@ import 'package:flutter/material.dart';
 
 import 'package:mobile_app/canvas_engine/artboard_manager.dart'; // Doc 23
 import 'package:mobile_app/canvas_engine/camera_controller.dart'; // Doc 20
+import 'package:mobile_app/canvas_engine/image_placeholder_ticker.dart'; // round-12 issue 06
 import 'package:mobile_app/canvas_engine/lock_guard.dart'; // round-10 issue 05
 import 'package:mobile_app/canvas_engine/region_fill.dart'; // round-9 issue 04
 import 'package:mobile_app/canvas_engine/selection_groups.dart'; // round-9 issue 05
@@ -105,6 +106,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   late final CanvasDocumentModel _doc;
   late final CameraController _camera;
   late final TiledCanvasEngine _engine;
+
+  /// Round-12 issue 06 — drives the image loading placeholder.
+  ImagePlaceholderTicker? _placeholderTicker;
   late final ArtboardManager _artboard;
 
   /// Doc 02 §10.2 live-mutation relay receive side (shared with the local
@@ -214,6 +218,26 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
         _canvasTick.value++;
       }
     };
+    // Round-12 issue 06 — animate the image loading placeholder. The ticker runs
+    // only while an asset is still decoding, so an idle canvas costs nothing.
+    _placeholderTicker = ImagePlaceholderTicker(
+      pending: () => _engine.assets.hasPending,
+      onTick: (double phase) {
+        if (!mounted) {
+          return;
+        }
+        if (_engine.advancePlaceholderPhase(phase)) {
+          _canvasTick.value++;
+        }
+      },
+    );
+    _engine.assets.onReady = (String ref) {
+      _engine.invalidateAllTilesForAsset(ref);
+      _placeholderTicker?.onAssetReady();
+      if (mounted) {
+        _canvasTick.value++;
+      }
+    };
     unawaited(_primeArchivedAssets());
     _remote = RemoteMutationApplier(
       doc: _doc,
@@ -236,6 +260,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   @override
   void dispose() {
     _autosave?.cancel();
+    _placeholderTicker?.dispose();
     _events?.cancel();
     _camera.onCameraChanged = null;
     _tool.removeListener(_onToolStateChanged);
@@ -1765,6 +1790,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     // Round-8 issue 05: hand the encoded bytes to the engine's image cache so
     // the IMAGE node can actually paint (it used to draw an empty rect).
     _engine.assets.resolve(ref, Uint8List.fromList(img.bytes));
+    // Round-12 issue 06: show the loading placeholder until this decodes.
+    _placeholderTicker?.ensureRunning();
 
     final int total =
         (img.bytes.length + kAssetChunkRawCap - 1) ~/ kAssetChunkRawCap;
@@ -1863,6 +1890,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
         _engine.assets.resolve(ref, await file.readAsBytes());
       }
       _engine.assets.ensureDecoded(refs);
+      // Round-12 issue 06: start the placeholder animation for the decodes we
+      // just kicked off, so the frames are never blank.
+      _placeholderTicker?.ensureRunning();
     } catch (_) {
       // Offline/partial environment (widget tests) — images stay blank.
     }

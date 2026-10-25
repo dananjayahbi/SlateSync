@@ -41,6 +41,7 @@ import threading
 import time
 import tkinter as tk
 import zipfile
+import zlib
 from collections import OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -469,9 +470,28 @@ class CanvasGalleryPanel:
         card["image_label"].configure(image=image, text="")
         return True
 
+    def _thumb_stamp(self, canvas_id: str) -> int:
+        """Content-derived stamp for the thumbnail PNG (0 when missing).
+
+        Round-12 issue 08: the cache key was ``(canvas_id, updated_at)``, and a
+        save within the same second leaves ``updated_at`` unchanged. The PNG is
+        rewritten at the same path, so the LRU happily served the previous
+        decode and the gallery stayed stale.
+
+        mtime alone is not enough either: two solid-colour thumbnails can have
+        the same size and a coarse filesystem timestamp. Hashing the bytes is
+        the only thing that changes exactly when the picture does — thumbnails
+        are ~192², so this is a cheap read.
+        """
+        try:
+            data = self._thumb_path(canvas_id).read_bytes()
+        except OSError:
+            return 0
+        return zlib.crc32(data)
+
     def _cached_image(self, canvas_id: str, updated_at: int) -> ctk.CTkImage | None:
         """LRU-cached PIL→CTkImage decode of the PNG (None when unreadable)."""
-        key = (canvas_id, updated_at)
+        key = (canvas_id, updated_at, self._thumb_stamp(canvas_id))
         image = self._image_cache.get(key)
         if image is not None:
             self._image_cache.move_to_end(key)
@@ -492,7 +512,7 @@ class CanvasGalleryPanel:
         self._remember_image(key, image)
         return image
 
-    def _remember_image(self, key: tuple[str, int], image: ctk.CTkImage) -> None:
+    def _remember_image(self, key: tuple[str, int, int], image: ctk.CTkImage) -> None:
         """Insert into the LRU, evicting oldest entries beyond ``_LRU_CAP``."""
         self._image_cache.pop(key, None)
         self._image_cache[key] = image

@@ -63,6 +63,11 @@ class SettingsPanel:
         self._device_rows: list[dict] = []
 
         self._build()
+        # Round-12 issue 10: the settings window is a dialog too — own it and put
+        # it in front, or the WM can open it behind the studio window.
+        from pc_agent.gui import dialog_utils
+
+        dialog_utils.present_dialog(self._dialog, root)
 
     # ------------------------------------------------------------------
     # Construction
@@ -254,6 +259,9 @@ class SettingsPanel:
     # Lifecycle
     # ------------------------------------------------------------------
     def close(self) -> None:
+        from pc_agent.gui.dialog_utils import release_dialog
+
+        release_dialog(self._dialog)  # round-12 issue 10: drop the modal grab
         try:
             self._dialog.destroy()
         except tk.TclError:  # already gone

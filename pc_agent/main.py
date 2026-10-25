@@ -97,6 +97,7 @@ def run_full() -> int:
     from pc_agent.network.canvas_sync import CanvasSyncManager
     from pc_agent.network.discovery_pairing import DiscoveryPairing
     from pc_agent.network.ws_stream_server import WsStreamServer
+    from pc_agent.ocr.ocr_coordinator import OcrCoordinator
     from pc_agent.viewport import GLCanvasHost
 
     logger = logging.getLogger(__name__)
@@ -196,6 +197,19 @@ def run_full() -> int:
         push=server.broadcast_json,
     )
     coordinator.attach_document_loader(document_for_export)
+
+    # --- 4b. PC-side OCR (Round-12 issue 09) --------------------------------
+    # Reuses the same document resolver as export: a scan must see the canvas
+    # as it is right now, not the snapshot captured when it was opened.
+    ocr_raster = TiledRasterExporter(config)
+    ocr_coordinator = OcrCoordinator(
+        bus,
+        config,
+        ocr_raster,
+        push=server.broadcast_json,
+    )
+    ocr_coordinator.attach_document_loader(document_for_export)
+    current_host["ocr"] = ocr_coordinator
 
     # --- 5. Tk root → StudioWindow → GL host (Doc 16 layout) ----------------
     root = tk.Tk()  # visible at launch (withdrawn=False)
@@ -310,6 +324,7 @@ def run_full() -> int:
             state["torn_down"] = True
         tray.stop()  # skips its own thread when called from pystray (Doc 17)
         canvas_sync.shutdown()  # symmetric with its constructor subscription
+        ocr_coordinator.shutdown()  # drop any in-flight scan + its VRAM
         server.stop()
         pairing.stop()
         if threading.current_thread() is threading.main_thread():
@@ -335,6 +350,10 @@ def run_full() -> int:
                 # The hub store changed (§9.2): advertise the new updated_at so
                 # devices can PULL the fresh copy (§9.4 flow 2).
                 canvas_sync.broadcast_hub_list()
+                # Round-12 issue 08: the PC's OWN gallery has to be told too.
+                # Without this a canvas edited on the PC kept showing its old
+                # thumbnail (and old title) until something else emitted a list.
+                canvas_sync.refresh_local_list()
         except Exception:
             logger.exception("autosave failed")
         root.after(autosave_ms, autosave_tick)

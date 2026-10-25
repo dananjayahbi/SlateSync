@@ -97,16 +97,6 @@ Future<void> _pumpStudio(WidgetTester tester, _FakeSyncClient client) async {
   await tester.pump(); // frame 2 applies the §10.5 post-frame fit
 }
 
-/// Round-8 issue 04: the tool's config panel opens by pressing and holding the
-/// rail button for 500 ms (the expandable column and its toggle are gone).
-Future<void> _holdTool(WidgetTester tester, String toolKey) async {
-  final Finder button = find.byKey(ValueKey<String>(toolKey));
-  final TestGesture gesture = await tester.startGesture(tester.getCenter(button));
-  await tester.pump(const Duration(milliseconds: 550));
-  await gesture.up();
-  await tester.pumpAndSettle();
-}
-
 Future<void> _disposeStudio(WidgetTester tester, _FakeSyncClient client) async {
   await tester.pumpWidget(const SizedBox.shrink());
   await tester.pump();

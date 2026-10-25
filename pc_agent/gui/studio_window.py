@@ -45,7 +45,7 @@ from pc_agent.core.events import (
     PAIRING_INFO,
     EventBus,
 )
-from pc_agent.gui import pairing_status
+from pc_agent.gui import dialog_utils, pairing_status
 from pc_agent.gui.canvas_gallery_panel import CanvasGalleryPanel
 from pc_agent.gui.settings_panel import SettingsPanel
 
@@ -495,7 +495,9 @@ class StudioWindow:
             self._qr_token_label = ctk.CTkLabel(dialog, text="", wraplength=220)
             self._qr_token_label.pack(pady=(2, 12))
         self._render_qr()
-        dialog.lift()
+        # Round-12 issue 10: own the dialog and raise it, or the WM may stack it
+        # behind the studio window (the reported "popups open behind" defect).
+        dialog_utils.present_dialog(dialog, root, modal=False)
 
     def update_hud(self, scale: float, preset: str) -> None:
         """Zoom ``%`` (clamped 0.05–20.0) + artboard preset labels (§5.13)."""
@@ -988,6 +990,9 @@ class StudioWindow:
         tk.Button(buttons, text="Open", command=self._confirm_sync_open).pack(
             side="right"
         )
+        # Round-12 issue 10: present it above the studio window (modality is
+        # taken while it is open, so the user answers it before continuing).
+        dialog_utils.present_dialog(dialog, self._root)
 
     def _confirm_sync_open(self) -> None:
         """Dialog Open/double-click: hand the selected row's id to the manager."""

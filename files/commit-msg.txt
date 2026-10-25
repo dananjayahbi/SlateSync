@@ -1,0 +1,32 @@
+﻿Round 12 (part 2): PC-side OCR backend
+
+Adds the PC half of issue 09: the tablet asks, the PC computes.
+
+Engine choice is measured, not assumed. Tesseract was rejected on evidence
+(handwriting app, print-tuned models). `onnxruntime-gpu` 1.31 loads but its
+CUDA provider refuses to initialise here -- it demands cuDNN 9 and CUDA 13,
+and the box has CUDA 12.4 with no cuDNN. Worse, ORT then silently falls back
+to CPU, which looks like it works and is just slow. `onnxruntime-directml`
+1.24.4 binds to the GTX 1660 Ti successfully, verified by reading back the
+active provider list rather than trusting the request.
+
+Model: PP-OCRv6 small/en. On a realistic hand-print sample `medium` was
+*worse* (0.64-0.79 confidence) and 28x slower on first run, so small/en wins
+on both axes. 3/3 lines exact at 0.994-0.998, 2.06s, peak VRAM ~1.9GB of 6GB.
+
+- pc_agent/ocr/ocr_engine.py: lazy, GPU-backed, releasable; reports the
+  provider it actually got so a CPU fallback is never silent.
+- pc_agent/ocr/region_mask.py: free-drawn polygon -> white-paper mask. Grows
+  the outline by a stroke radius and pastes onto white (not transparency),
+  because the recogniser expects paper.
+- pc_agent/ocr/ocr_coordinator.py: submit/progress/result/cancel, modelled on
+  ExportCoordinator. Whole-canvas scans are refused on infinite canvases.
+- TiledRasterExporter.export gains an `extent=` override so OCR reuses the
+  strip renderer instead of duplicating it.
+
+Contract updated in lockstep across all five sites, including the Doc 02
+embedded schema body that a test pins byte-for-byte.
+
+73 new PC tests; ruff clean; full suite green.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

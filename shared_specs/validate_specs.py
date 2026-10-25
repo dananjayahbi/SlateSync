@@ -48,7 +48,14 @@ WS_PATH = "/ws"
 WS_URL_TEMPLATE = "ws://<ipv4>:50606/ws?token=<session_token>"
 WS_CLOSE_CODE = 4001
 RAW_CAP_BYTES_PER_CHUNK = 262144
-RPC_TYPES = ["CANVAS_LIFECYCLE", "ELEMENT_COMMIT", "ARTBOARD_RESIZE", "ASSET_UPLOAD", "EXPORT_JOB"]
+RPC_TYPES = [
+    "CANVAS_LIFECYCLE",
+    "ELEMENT_COMMIT",
+    "ARTBOARD_RESIZE",
+    "ASSET_UPLOAD",
+    "EXPORT_JOB",
+    "OCR_JOB",
+]
 # Doc 02 round 4 (§8): the expected action set is DERIVED from ws_rpc_schema.json
 # itself — envelope.action.enum must exactly equal the union of the type_actions
 # groups (disjoint, unique, non-empty). No hardcoded action names or counts here;

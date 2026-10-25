@@ -287,6 +287,16 @@ class CanvasSyncManager:
         except Exception:  # never let a push failure poison the bus chain
             logger.exception("hub CANVAS_LIST push failed")
 
+    def refresh_local_list(self) -> None:
+        """Round-12 issue 08 — re-emit the local gallery rows after a PC save.
+
+        ``broadcast_hub_list`` only tells DEVICES about a change. The PC's own
+        gallery listens for ``CANVAS_LIST_UPDATED``, so a canvas saved on the PC
+        never refreshed its thumbnail (or its title) until some unrelated event
+        emitted a list. This is the local counterpart.
+        """
+        self._emit_list()
+
     def shutdown(self) -> None:
         """Unsubscribe both bus handlers and cancel the pull drain; idempotent
         (EventBus.off is a no-op)."""

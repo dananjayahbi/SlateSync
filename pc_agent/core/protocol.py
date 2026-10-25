@@ -23,6 +23,7 @@ RPC_TYPES: Final = frozenset(
         "ARTBOARD_RESIZE",
         "ASSET_UPLOAD",
         "EXPORT_JOB",
+        "OCR_JOB",
     }
 )
 
@@ -51,6 +52,11 @@ RPC_ACTIONS: Final = frozenset(
         "CANVAS_PULL",
         # Doc 02 §10.1 — Round-6 clear (20 actions).
         "CLEAR_CANVAS",
+        # Doc 02 §11.1 — Round-12 OCR job (24 actions).
+        "START_OCR",
+        "CANCEL_OCR",
+        "OCR_PROGRESS",
+        "OCR_RESULT",
     }
 )
 

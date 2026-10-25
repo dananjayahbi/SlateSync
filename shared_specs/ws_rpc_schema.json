@@ -9,12 +9,13 @@
     "canvas_id": {"type": "string", "format": "uuid-v4"},
     "timestamp": {"type": "integer", "unit": "unix_seconds"},
     "payload": {"type": "object", "description": "shape defined by (type, action); element commits carry the overview §4.3 element object"},
-    "type": {"enum": ["CANVAS_LIFECYCLE", "ELEMENT_COMMIT", "ARTBOARD_RESIZE", "ASSET_UPLOAD", "EXPORT_JOB"]},
+    "type": {"enum": ["CANVAS_LIFECYCLE", "ELEMENT_COMMIT", "ARTBOARD_RESIZE", "ASSET_UPLOAD", "EXPORT_JOB", "OCR_JOB"]},
     "action": {"enum": ["OPEN_CANVAS", "ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE",
       "DELETE_NODE", "UPGRADE_SIZE", "START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS",
       "EXPORT_FINISHED", "ASSET_START", "ASSET_CHUNK", "ASSET_DONE",
       "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
-      "CANVAS_PUT", "CANVAS_PULL", "CLEAR_CANVAS"]}
+      "CANVAS_PUT", "CANVAS_PULL", "CLEAR_CANVAS",
+      "START_OCR", "CANCEL_OCR", "OCR_PROGRESS", "OCR_RESULT"]}
   },
   "type_actions": {
     "CANVAS_LIFECYCLE": ["OPEN_CANVAS", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
@@ -23,7 +24,8 @@
       "CLEAR_CANVAS"],
     "ARTBOARD_RESIZE": ["UPGRADE_SIZE"],
     "ASSET_UPLOAD": ["ASSET_START", "ASSET_CHUNK", "ASSET_DONE"],
-    "EXPORT_JOB": ["START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS", "EXPORT_FINISHED"]
+    "EXPORT_JOB": ["START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS", "EXPORT_FINISHED"],
+    "OCR_JOB": ["START_OCR", "CANCEL_OCR", "OCR_PROGRESS", "OCR_RESULT"]
   },
   "payload_schemas": {
     "OPEN_CANVAS": {
@@ -114,6 +116,81 @@
       "required": [],
       "properties": {},
       "description": "EMPTY payload {} (Doc 02 §10.1) — the target document is the envelope's canvas_id; the receiver wipes ALL elements of its open document (artboard/background/title preserved), bumps updated_at, persists (LWW), refreshes lists"
+    },
+    "START_OCR": {
+      "direction": "tablet_to_pc",
+      "type": "object",
+      "required": ["job_id", "scope"],
+      "properties": {
+        "job_id": {"type": "string"},
+        "scope": {"type": "string", "enum": ["region", "canvas"]},
+        "path": {
+          "type": "array",
+          "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+          "description": "scope=region: free-drawn polygon vertices in WORLD units. Not a rectangle — the user circles the area. Fewer than 3 usable points is an error"
+        },
+        "bbox": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 4,
+          "maxItems": 4,
+          "description": "optional [x,y,w,h] world hint; only used to size the raster when `path` is absent"
+        },
+        "padding": {"type": "number", "description": "extra world units to grow the selection before masking; default 6"}
+      },
+      "description": "Doc 02 §11.1 (Round 12) — PC-side OCR job. scope=canvas scans the entire artboard and MUST be refused when the canvas is infinite (no bounded area). scope=region masks to `path`"
+    },
+    "CANCEL_OCR": {
+      "direction": "tablet_to_pc",
+      "type": "object",
+      "required": ["job_id"],
+      "properties": {"job_id": {"type": "string"}},
+      "description": "Doc 02 §11.1 — ask the PC to abandon an in-flight OCR job; the PC answers OCR_RESULT with `error` set"
+    },
+    "OCR_PROGRESS": {
+      "direction": "pc_to_tablet",
+      "type": "object",
+      "required": ["job_id", "stage", "percent"],
+      "properties": {
+        "job_id": {"type": "string"},
+        "stage": {"type": "string", "enum": ["QUEUED", "RASTERISING", "RECOGNISING", "DONE", "ERROR"]},
+        "percent": {"type": "integer", "minimum": 0, "maximum": 100}
+      },
+      "description": "Doc 02 §11.1 — throttled to <=10 Hz; the terminal OCR_RESULT always follows"
+    },
+    "OCR_RESULT": {
+      "direction": "pc_to_tablet",
+      "type": "object",
+      "required": ["job_id", "text"],
+      "properties": {
+        "job_id": {"type": "string"},
+        "text": {"type": "string", "description": "recognised lines joined with \\n; empty on failure"},
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["text", "box"],
+            "properties": {
+              "text": {"type": "string"},
+              "score": {"type": "number"},
+              "box": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4}
+            }
+          }
+        },
+        "origin": {
+          "type": "array",
+          "items": {"type": "number"},
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "world-space top-left of the raster crop, so per-line pixel boxes map back onto the canvas"
+        },
+        "provider": {"type": "string", "description": "ONNX Runtime provider actually used, e.g. DmlExecutionProvider"},
+        "width": {"type": "integer"},
+        "height": {"type": "integer"},
+        "elapsed_ms": {"type": "integer"},
+        "error": {"type": "string", "description": "set only on failure; `text` is then empty"}
+      },
+      "description": "Doc 02 §11.1 — terminal result. The tablet inserts `text` as an editable text-box node"
     }
   },
   "asset_upload": {
