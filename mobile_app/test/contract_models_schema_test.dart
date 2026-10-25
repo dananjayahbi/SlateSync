@@ -232,8 +232,15 @@ void main() {
 
     // --- presets: dims from x_presets, INFINITE ⇒ null dims ---------------
     final String preset = artboard['preset'] as String;
-    final Map<String, dynamic> dims =
-        Map<String, dynamic>.from(xPresets[preset] as Map);
+    // IMAGE is a marker preset with no x_presets entry: a gallery canvas is
+    // sized to the source image's own pixel rectangle, so the document's dims
+    // are authoritative rather than a paper size in the table.
+    final Map<String, dynamic> dims = preset == 'IMAGE'
+        ? <String, dynamic>{
+            'width': artboard['width'],
+            'height': artboard['height'],
+          }
+        : Map<String, dynamic>.from(xPresets[preset] as Map);
     if (preset == 'INFINITE') {
       expect(artboard['width'], isNull, reason: '$label INFINITE width');
       expect(artboard['height'], isNull, reason: '$label INFINITE height');
@@ -402,13 +409,21 @@ void main() {
       final List<String> backgrounds = (defs['Artboard']
               ['properties']['background_style']['enum'] as List)
           .cast<String>();
-      expect(presets.toSet(), equals(<String>{'A5', 'A4', 'LETTER', 'INFINITE'}),
-          reason: 'schema preset enum must cover all four artboards');
+      expect(
+          presets.toSet(),
+          equals(<String>{'A5', 'A4', 'LETTER', 'BOOK', 'INFINITE', 'IMAGE'}),
+          reason: 'schema preset enum must cover every artboard the app writes '
+              '(round 13 added the bounded BOOK preset and the gallery IMAGE '
+              'marker)');
 
       for (int i = 0; i < presets.length; i++) {
         final String preset = presets[i];
-        final Map<String, dynamic> dims =
-            Map<String, dynamic>.from(xPresets[preset] as Map);
+        // IMAGE is a marker, not a paper size: a canvas using it is sized to
+        // the source image's own pixel rect, so it deliberately has no
+        // x_presets entry and its dims come from the document.
+        final Map<String, dynamic> dims = preset == 'IMAGE'
+            ? <String, dynamic>{'width': 1080.0, 'height': 1920.0}
+            : Map<String, dynamic>.from(xPresets[preset] as Map);
         final CanvasDocumentModel doc = CanvasDocumentModel(
           canvasId: 'preset-$preset-0000-4000-8000-000000000000',
           title: 'Preset $preset',

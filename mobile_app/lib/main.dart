@@ -8,12 +8,17 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
 import 'core/models/canvas_models.dart';
+import 'core/storage/local_db.dart';
 import 'core/theme/studio_theme.dart';
 import 'features/canvas/canvas_studio_page.dart';
+import 'features/gallery/gallery_client.dart';
+import 'features/gallery/gallery_screen.dart';
+import 'features/gallery/use_as_canvas.dart';
 import 'features/home/home_canvas_dashboard.dart';
 import 'features/pairing/pairing_screen.dart';
 import 'features/pairing/pairing_session_controller.dart';
@@ -193,8 +198,72 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
     );
   }
 
-  /// Doc 02 §8.3.3 — a PC-initiated open arrives through
-  /// [CanvasSyncBridge.remoteOpen] (single-shot; cleared after consume).
+  /// Round-13 §03 — opens the image library and hands the chosen image back.
+  ///
+  /// Pushed on top of home (not replacing it) so dismissing the gallery returns
+  /// to the canvas grid; "use as canvas" then goes through [_openCanvas], which
+  /// keeps the single-studio invariant.
+  void _openGallery() {
+    final NavigatorState? navigator = _navigatorKey.currentState;
+    if (navigator == null) {
+      return;
+    }
+    final GalleryClient gallery = GalleryClient(client: _client);
+    unawaited(
+      navigator
+          .push(
+            MaterialPageRoute<void>(
+              builder: (BuildContext context) => GalleryScreen.fromClient(
+                client: gallery,
+                onUseAsCanvas: (LibraryImage image, String path) {
+                  // Close the gallery before the studio replaces the stack, so
+                  // Back from the studio lands on home rather than on a stale
+                  // library of the previous image.
+                  navigator.pop();
+                  _openGalleryCanvas(image, path);
+                },
+              ),
+            ),
+          )
+          .then((_) => gallery.dispose()),
+    );
+  }
+
+  /// Builds the exact-pixel document for [image] and opens it.
+  ///
+  /// The bytes are already on disk ([path]) because the gallery fetched them
+  /// before handing the image over, so the studio's asset priming resolves the
+  /// `asset_ref` from `<base>/assets/<canvasId>/` exactly as it does for any
+  /// opened canvas.
+  void _openGalleryCanvas(LibraryImage image, String path) {
+    final CanvasDocumentModel doc = buildCanvasFromGalleryImage(image: image);
+    unawaited(_seedGalleryAsset(doc, path));
+    _openCanvas(doc);
+  }
+
+  /// Copies the library bytes into the new canvas's asset folder.
+  ///
+  /// Done before the studio mounts so its `_primeArchivedAssets` pass finds a
+  /// real file; a copy failure is not fatal — the studio simply paints the
+  /// placeholder and the canvas can still be drawn on.
+  Future<void> _seedGalleryAsset(CanvasDocumentModel doc, String path) async {
+    if (path.isEmpty) {
+      return;
+    }
+    try {
+      final String target = await canvasAssetPath(
+        doc.canvasId,
+        doc.elements.first.geometry.assetRef ?? '',
+      );
+      final File file = File(target);
+      await file.parent.create(recursive: true);
+      await File(path).copy(target);
+    } catch (_) {
+      // Best effort: a missing asset must not block opening the canvas.
+    }
+  }
+
+  /// Doc 02 §8.3.3 — a PC-initiated open arrives through  /// [CanvasSyncBridge.remoteOpen] (single-shot; cleared after consume).
   ///
   /// Navigation uses the `navigatorKey`'s Navigator (never
   /// `Navigator.of(this.context)` — that context sits above `MaterialApp`,
@@ -239,6 +308,8 @@ class _SlateSyncAppState extends State<SlateSyncApp> {
       home: HomeCanvasDashboard(
         onOpenDocument: _openCanvas,
         client: _client,
+        // Round-13 §03 — image library entry point.
+        onOpenGallery: _openGallery,
         // Doc 02 §8.1 — create/rename/delete pushes a fresh CANVAS_LIST.
         onListChanged: _bridge.publishList,
         // Doc 02 §9 (round 5): hub store mutations (bridge.hubChanged) plus

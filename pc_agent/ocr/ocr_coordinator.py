@@ -31,7 +31,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Sequence
 from uuid import uuid4
 
-from pc_agent.core.events import RPC_MESSAGE, EventBus
+from pc_agent.core.events import (
+    OCR_JOB_FINISHED,
+    OCR_JOB_PROGRESS,
+    OCR_JOB_STARTED,
+    RPC_MESSAGE,
+    EventBus,
+)
 from pc_agent.ocr.ocr_engine import (
     OcrEngineError,
     OcrEngineUnavailable,
@@ -119,18 +125,26 @@ class OcrCoordinator:
 
     # ------------------------------------------------------------- RPC ingest
 
-    def _on_rpc(self, message: Any = None, **kwargs: Any) -> None:
-        """Handle `START_OCR` / `CANCEL_OCR` off the bus."""
-        envelope = message if isinstance(message, dict) else kwargs.get("envelope")
-        if not isinstance(envelope, dict):
+    def _on_rpc(self, msg: Any = None, **_extra: Any) -> None:
+        """Handle `START_OCR` / `CANCEL_OCR` off the bus.
+
+        The signature is `(self, msg=None, **_extra)` **on purpose**: the bus
+        dispatches with `handler(**payload)` and the WebSocket server emits
+        `bus.emit(RPC_MESSAGE, msg=envelope)`. Every other subscriber is
+        declared the same way. A parameter named anything else simply never
+        receives the envelope, and because `EventBus.emit` swallows handler
+        exceptions the failure is completely silent — which is exactly how
+        OCR shipped with every request dropped on the floor.
+        """
+        if not isinstance(msg, dict):
             return
-        if envelope.get("type") != "OCR_JOB":
+        if msg.get("type") != "OCR_JOB":
             return
-        action = envelope.get("action")
-        payload = envelope.get("payload") or {}
+        action = msg.get("action")
+        payload = msg.get("payload") or {}
         if not isinstance(payload, dict):
             return
-        canvas_id = str(envelope.get("canvas_id") or payload.get("canvas_id") or "")
+        canvas_id = str(msg.get("canvas_id") or payload.get("canvas_id") or "")
 
         if action == "CANCEL_OCR":
             job_id = str(payload.get("job_id") or "")
@@ -145,7 +159,19 @@ class OcrCoordinator:
         job_id = str(payload.get("job_id") or "").strip() or str(uuid4())
         request = dict(payload)
         request["canvas_id"] = canvas_id or payload.get("canvas_id")
-        self.submit(job_id=job_id, request=request)
+        try:
+            self.submit(job_id=job_id, request=request)
+        except OcrJobError as exc:
+            # A rejected request MUST still answer the tablet. Letting the
+            # exception escape would hand it to `EventBus.emit`, which logs and
+            # swallows it — and the tablet would wait out its whole timeout for
+            # a job that was never queued.
+            logger.info("OCR request %s rejected: %s", job_id, exc)
+            self._fail(job_id, canvas_id, str(exc))
+        except RuntimeError as exc:
+            # Executor already shut down (app closing mid-request).
+            logger.warning("OCR request %s not scheduled: %s", job_id, exc)
+            self._fail(job_id, canvas_id, "The PC is shutting down.")
 
     # ------------------------------------------------------------------ §API
 
@@ -174,6 +200,12 @@ class OcrCoordinator:
             }
 
         self._emit_progress(job_id, 0.0, "QUEUED")
+        self._emit_event(
+            OCR_JOB_STARTED,
+            job_id=job_id,
+            scope=scope,
+            canvas_id=str(request.get("canvas_id") or ""),
+        )
         try:
             self._executor.submit(self._run_job, job_id, request)
         except RuntimeError:
@@ -407,6 +439,13 @@ class OcrCoordinator:
                 {"job_id": job_id, "stage": stage, "percent": int(round(value))},
             )
         )
+        self._emit_event(
+            OCR_JOB_PROGRESS,
+            job_id=job_id,
+            stage=stage,
+            percent=value,
+            canvas_id=canvas_id,
+        )
 
     def _fail(self, job_id: str, canvas_id: str, reason: str) -> None:
         with self._lock:
@@ -427,6 +466,13 @@ class OcrCoordinator:
                 {"job_id": job_id, "text": "", "error": reason or "OCR failed"},
             )
         )
+        self._emit_event(
+            OCR_JOB_FINISHED,
+            job_id=job_id,
+            ok=False,
+            reason=reason or "OCR failed",
+            canvas_id=canvas_id,
+        )
 
     def _emit_result(
         self,
@@ -440,6 +486,25 @@ class OcrCoordinator:
         payload["job_id"] = job_id
         payload["origin"] = [round(float(origin[0]), 2), round(float(origin[1]), 2)]
         self._push(self._envelope("OCR_RESULT", canvas_id, payload))
+        self._emit_event(
+            OCR_JOB_FINISHED,
+            job_id=job_id,
+            ok=True,
+            reason="",
+            canvas_id=canvas_id,
+            lines=len(result.lines),
+            provider=result.provider,
+            elapsed_ms=result.elapsed_ms,
+        )
+
+    def _emit_event(self, event: str, **payload: Any) -> None:
+        """Bus notify for the PC panel; a missing/failing bus is not fatal."""
+        if self._bus is None:
+            return
+        try:
+            self._bus.emit(event, **payload)
+        except Exception:  # pragma: no cover - the panel must never break a job
+            logger.debug("OCR: bus emit %s failed", event, exc_info=True)
 
     @staticmethod
     def _envelope(action: str, canvas_id: str, payload: dict) -> dict:

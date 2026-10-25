@@ -470,11 +470,20 @@ class TestRpcIngest:
         coord._on_rpc(self._envelope("EXPORT_PROGRESS", {}))
         assert not coord._jobs
 
-    def test_start_ocr_without_a_path_is_refused_and_emits_nothing(self, tmp_path):
+    def test_start_ocr_without_a_path_is_refused_and_answers_with_an_error(
+        self, tmp_path
+    ):
+        """Round-13: a refused request must ANSWER, not raise.
+
+        Raising would hand the exception to `EventBus.emit`, which logs and
+        swallows it — leaving the tablet waiting out its full timeout for a job
+        that was never queued.
+        """
         coord, pushes = _make(tmp_path)
-        with pytest.raises(OcrJobError):
-            coord._on_rpc(self._envelope("START_OCR", {"scope": SCOPE_REGION}))
-        assert pushes == []
+        coord._on_rpc(self._envelope("START_OCR", {"scope": SCOPE_REGION}))
+        assert [p["action"] for p in pushes] == ["OCR_PROGRESS", "OCR_RESULT"]
+        assert pushes[-1]["payload"]["error"]
+        assert pushes[-1]["payload"]["text"] == ""
 
     def test_cancel_ocr_of_an_unknown_job_is_harmless(self, tmp_path):
         coord, _ = _make(tmp_path)
@@ -487,8 +496,10 @@ class TestRpcIngest:
         coord._on_rpc({"type": "OCR_JOB"})
 
     def test_canvas_id_falls_back_to_the_payload(self, tmp_path):
-        coord, _ = _make(tmp_path)
+        coord, pushes = _make(tmp_path)
         env = self._envelope("START_OCR", {"scope": "bogus", "canvas_id": "from-payload"})
         env["canvas_id"] = ""
-        with pytest.raises(OcrJobError):
-            coord._on_rpc(env)
+        # Refused (bad scope) but answered, and the reply carries the canvas id
+        # recovered from the payload so the tablet can route it.
+        coord._on_rpc(env)
+        assert pushes[-1]["canvas_id"] == "from-payload"

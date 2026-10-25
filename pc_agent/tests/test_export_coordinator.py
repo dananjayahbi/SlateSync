@@ -40,6 +40,7 @@ ACTIONS_19 = [
     "ASSET_DONE", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
     "CANVAS_PUT", "CANVAS_PULL", "CLEAR_CANVAS",
     "START_OCR", "CANCEL_OCR", "OCR_PROGRESS", "OCR_RESULT",
+    "GALLERY_LIST_REQUEST", "GALLERY_LIST", "GALLERY_ADD", "GALLERY_SAVE",
 ]
 ENVELOPE_KEYS = {"id", "type", "action", "canvas_id", "payload", "timestamp"}
 
@@ -301,7 +302,7 @@ def test_envelope_schema_matches_doc02(build) -> None:
     spec_path = Path(__file__).resolve().parents[2] / "shared_specs" / "ws_rpc_schema.json"
     spec = json.loads(spec_path.read_text(encoding="utf-8"))
     assert spec["envelope"]["action"]["enum"] == ACTIONS_19
-    assert len(ACTIONS_19) == 24 and "EXPORT_FINISHED" in ACTIONS_19
+    assert len(ACTIONS_19) == 28 and "EXPORT_FINISHED" in ACTIONS_19
     assert spec["envelope"]["required"] == ["id", "type", "action", "canvas_id", "payload",
                                             "timestamp"]
 

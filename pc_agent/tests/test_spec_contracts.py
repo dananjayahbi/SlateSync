@@ -55,10 +55,11 @@ def test_real_schema_validates_clean() -> None:
     assert _VALIDATOR.main([str(_SCHEMA_PATH.parent)]) == 0
 
 
-def test_twenty_four_actions_in_enum_and_canvas_lifecycle_group(schema: dict) -> None:
+def test_twenty_eight_actions_in_enum_and_canvas_lifecycle_group(schema: dict) -> None:
     actions = schema["envelope"]["action"]["enum"]
-    # Round 12 ?11.1 added the four OCR actions (20 -> 24).
-    assert len(actions) == 24
+    # Round 12 §11.1 added the four OCR actions (20 -> 24); round 13 §13.1 the
+    # four gallery actions (24 -> 28).
+    assert len(actions) == 28
     assert set(actions) == set(RPC_ACTIONS)
     canvas_actions = set(schema["type_actions"]["CANVAS_LIFECYCLE"])
     assert canvas_actions == {
@@ -112,6 +113,11 @@ def test_payload_schemas_cover_the_canvas_sync_actions(schema: dict) -> None:
         "CANCEL_OCR",
         "OCR_PROGRESS",
         "OCR_RESULT",
+        # Doc 02 §13.1 — round 13 image library.
+        "GALLERY_LIST_REQUEST",
+        "GALLERY_LIST",
+        "GALLERY_ADD",
+        "GALLERY_SAVE",
     }
     open_canvas = schemas["OPEN_CANVAS"]
     assert open_canvas["discriminator"] == "canvas"
@@ -264,10 +270,10 @@ def test_doc02_step5_body_is_byte_identical_to_schema_file() -> None:
     )
 
 
-def test_doc02_embedded_body_parses_and_carries_the_24_actions() -> None:
+def test_doc02_embedded_body_parses_and_carries_the_28_actions() -> None:
     embedded = json.loads(_embedded_body())
     assert embedded == json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
-    assert len(embedded["envelope"]["action"]["enum"]) == 24
+    assert len(embedded["envelope"]["action"]["enum"]) == 28
     assert set(embedded["type_actions"]["CANVAS_LIFECYCLE"]) >= {
         "CANVAS_PUT",
         "CANVAS_PULL",

@@ -38,15 +38,36 @@ from pc_agent.core.events import (
     RPC_MESSAGE,
     EventBus,
 )
+from pc_agent.engine.book_model import (
+    BOOK_PRESET,
+    BookLayout,
+    BookPage,
+    node_page_id,
+    normalize_pages,
+    pages_to_json,
+    set_node_page_id,
+)
 from pc_agent.engine.scene_graph import CanvasNode, NodeGeometry, NodeStyle, SceneGraph
 
 logger = logging.getLogger("slatesync.store")
 
+
+def book_layout_seed() -> list[BookPage]:
+    """One empty first page — the seed a new ``BOOK`` document starts with.
+
+    A book with no pages would have nothing to draw on and no page the page
+    strip could select, so "empty book" is not a representable state.
+    """
+    return list(BookLayout.seeded().pages)
+
 #: §3 artboard preset table (300-DPI world units); INFINITE keeps width/height None.
+#: Round 13 adds BOOK (multi-page): bounded exactly like a page, seeded at the
+#: default page size — a book is never an infinite canvas.
 _PRESETS: dict[str, tuple[float | None, float | None]] = {
     "A5": (1748.0, 2480.0),
     "A4": (2480.0, 3508.0),
     "LETTER": (2550.0, 3300.0),
+    "BOOK": (2480.0, 3508.0),
     "INFINITE": (None, None),
 }
 
@@ -96,6 +117,15 @@ class CanvasDocument:
     #: a document that never used the selector's lock, so every pre-round-9
     #: archive loads and re-saves byte-identically.
     groups: dict[str, list[str]] = field(default_factory=dict)
+    #: Round-13 issue 04 — ordered book pages. Empty for every non-book
+    #: document, so ``pages`` is omitted on the wire and those documents keep
+    #: round-tripping byte-identically.
+    pages: list[BookPage] = field(default_factory=list)
+
+    @property
+    def is_book(self) -> bool:
+        """True for a multi-page book (``artboard.preset == "BOOK"``)."""
+        return self.artboard.preset == BOOK_PRESET
 
 
 @dataclass
@@ -258,7 +288,7 @@ def _geometry_from_json(data: dict | None) -> NodeGeometry:
 
 
 def _node_to_json(node: CanvasNode) -> dict:
-    return {
+    data = {
         "node_id": node.node_id,
         "kind": node.kind,
         "layer": node.layer,
@@ -266,13 +296,19 @@ def _node_to_json(node: CanvasNode) -> dict:
         "style": _style_to_json(node.style),
         "geometry": _geometry_to_json(node.geometry),
     }
+    # Round-13: emitted ONLY for elements that name a page, so every non-book
+    # document (and every page-1 element of a book) keeps its frozen key list.
+    page_id = node_page_id(node)
+    if page_id:
+        data["page_id"] = page_id
+    return data
 
 
 def _node_from_json(data: dict) -> CanvasNode:
     bbox = tuple(float(v) for v in data["bbox"])
     if len(bbox) != 4:
         raise ValueError(f"bbox must have 4 numbers, got {data['bbox']!r}")
-    return CanvasNode(
+    node = CanvasNode(
         node_id=data["node_id"],
         kind=data["kind"],
         layer=int(data.get("layer", 0)),
@@ -280,6 +316,10 @@ def _node_from_json(data: dict) -> CanvasNode:
         style=_style_from_json(data.get("style")),
         geometry=_geometry_from_json(data.get("geometry")),
     )
+    # ``CanvasNode`` is frozen (Doc 09) and gains no field: the page address is
+    # an attribute the book filter reads through ``book_model.node_page_id``.
+    set_node_page_id(node, data.get("page_id"))
+    return node
 
 
 def _doc_to_json(doc: CanvasDocument) -> dict:
@@ -298,6 +338,11 @@ def _doc_to_json(doc: CanvasDocument) -> dict:
     groups = _groups_to_json(doc)
     if groups:
         data["groups"] = groups
+    # Round-13 issue 04 — same rule for the book page list: a non-book
+    # document never grows a `pages` key.
+    pages = pages_to_json(getattr(doc, "pages", None) or [])
+    if pages:
+        data["pages"] = pages
     return data
 
 
@@ -347,6 +392,7 @@ def _doc_from_json(data: dict) -> CanvasDocument:
             content_bounds={k: float(data["content_bounds"][k]) for k in _BOUND_KEYS},
             elements=[_node_from_json(e) for e in data["elements"]],
             groups=_groups_from_json(data.get("groups")),
+            pages=normalize_pages(data.get("pages")),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid document.json: {exc}") from exc
@@ -378,7 +424,12 @@ class DocumentStore:
     # Frozen API (template §4)
     # ------------------------------------------------------------------
     def new(self, preset: str, title: str) -> CanvasDocument:
-        """Seed a document from Doc 03 defaults; resets the scene graph."""
+        """Seed a document from Doc 03 defaults; resets the scene graph.
+
+        Round 13: ``BOOK`` also seeds one page, so a new book always has
+        somewhere to draw (the page strip's "can't delete the last page" rule
+        then matches the document it is showing).
+        """
         if preset not in _PRESETS:
             raise ValueError(f"unknown artboard preset: {preset!r}")
         width, height = _PRESETS[preset]
@@ -393,6 +444,7 @@ class DocumentStore:
             ),
             content_bounds=dict(_ZERO_BOUNDS),
             elements=[],
+            pages=book_layout_seed() if preset == BOOK_PRESET else [],
         )
         self._scene.replace_all([])
         self._scene.set_artboard(doc.artboard)

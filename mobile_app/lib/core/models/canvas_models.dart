@@ -102,7 +102,28 @@ class Presets {
   static const a5 = (w: 1748.0, h: 2480.0);
   static const a4 = (2480.0, 3508.0);
   static const letter = (2550.0, 3300.0);
+
+  /// Round-13 issue 04 — a book is a bounded multi-page canvas sized at one of
+  /// [kBookPageSizes]. These are its DEFAULT page dims (A4), kept in the same
+  /// record shape so every bounded code path treats a book like a page.
+  static const book = (w: 2480.0, h: 3508.0);
 }
+
+/// Book preset key (bounded; never INFINITE).
+const String kBookPreset = 'BOOK';
+
+/// Page sizes a book may be created at — deliberately no `INFINITE` entry:
+/// an unbounded book has no pages to turn.
+const List<String> kBookPageSizes = <String>['A4', 'A5', 'LETTER'];
+
+/// Default book page size.
+const String kDefaultBookPageSize = 'A4';
+
+/// Reserved `page_id` carrying the cover image ([BookPage]s never use it).
+///
+/// The cover is an ordinary IMAGE element with this page address, so it rides
+/// the existing asset-embedding save path instead of needing new plumbing.
+const String kBookCoverPageId = '__cover__';
 
 /// Background styles (round-9: `DOT_GRID` / `ISO_GRID` retired in favour of
 /// `SQUARE_GRID`). Legacy documents that still carry a retired style are
@@ -301,6 +322,13 @@ class CanvasNodeModel {
   NodeStyleModel style;
   NodeGeometryModel geometry;
 
+  /// Round-13 issue 04 — page address inside a BOOK.
+  ///
+  /// `null` means the FIRST page, which is what an element of a pre-round-13
+  /// document means, so no migration is needed. Emitted only when set, so
+  /// every existing document keeps its frozen key list.
+  String? pageId;
+
   CanvasNodeModel({
     required this.nodeId,
     required this.kind,
@@ -308,6 +336,7 @@ class CanvasNodeModel {
     required this.bbox,
     required this.style,
     required this.geometry,
+    this.pageId,
   });
 
   factory CanvasNodeModel.fromJson(Map<String, dynamic> json) =>
@@ -320,6 +349,7 @@ class CanvasNodeModel {
         geometry: NodeGeometryModel.fromJson(
           json['geometry'] as Map<String, dynamic>,
         ),
+        pageId: normalizePageId(json['page_id']),
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -329,7 +359,52 @@ class CanvasNodeModel {
         'bbox': bbox,
         'style': style.toJson(),
         'geometry': geometry.toJson(),
+        if (pageId != null) 'page_id': pageId,
       };
+}
+
+/// A trimmed, non-empty page id, or `null` (= the first page).
+String? normalizePageId(Object? value) {
+  if (value is! String) {
+    return null;
+  }
+  final String token = value.trim();
+  return token.isEmpty ? null : token;
+}
+
+/// One entry of a book's ordered `pages` list (round-13 issue 04).
+///
+/// Pure data: ordering/mutation invariants live in `BookController` so this
+/// stays a faithful mirror of the wire shape (`page_id`/`index`/`title`).
+class BookPageModel {
+  BookPageModel({
+    required this.pageId,
+    required this.index,
+    required this.title,
+  });
+
+  String pageId;
+  int index;
+  String title;
+
+  factory BookPageModel.fromJson(Map<String, dynamic> json) => BookPageModel(
+        pageId: json['page_id'] as String,
+        index: json['index'] as int,
+        title: json['title'] as String,
+      );
+
+  Map<String, dynamic> toJson() => <String, dynamic>{
+        'page_id': pageId,
+        'index': index,
+        'title': title,
+      };
+
+  BookPageModel copyWith({String? pageId, int? index, String? title}) =>
+      BookPageModel(
+        pageId: pageId ?? this.pageId,
+        index: index ?? this.index,
+        title: title ?? this.title,
+      );
 }
 
 class CanvasDocumentModel {
@@ -353,6 +428,12 @@ class CanvasDocumentModel {
   /// member selects the whole group and transforms apply to every member.
   Map<String, List<String>> groups;
 
+  /// Round-13 issue 04 — ordered book pages; empty for a non-book document.
+  ///
+  /// Omitted from the wire when empty (never emitted as `[]`), so every
+  /// pre-round-13 document round-trips byte-identically.
+  List<BookPageModel> pages;
+
   CanvasDocumentModel({
     required this.canvasId,
     required this.title,
@@ -362,7 +443,12 @@ class CanvasDocumentModel {
     required this.contentBounds,
     required this.elements,
     Map<String, List<String>>? groups,
-  }) : groups = groups ?? <String, List<String>>{};
+    List<BookPageModel>? pages,
+  })  : groups = groups ?? <String, List<String>>{},
+        pages = pages ?? <BookPageModel>[];
+
+  /// True for a multi-page book (`artboard.preset == 'BOOK'`).
+  bool get isBook => artboard.preset == kBookPreset;
 
   factory CanvasDocumentModel.fromJson(Map<String, dynamic> json) =>
       CanvasDocumentModel(
@@ -378,6 +464,7 @@ class CanvasDocumentModel {
             .map((e) => CanvasNodeModel.fromJson(e as Map<String, dynamic>))
             .toList(),
         groups: _groupsFromJson(json['groups']),
+        pages: _pagesFromJson(json['pages']),
       );
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -389,6 +476,8 @@ class CanvasDocumentModel {
         'content_bounds': contentBounds,
         'elements': elements.map((e) => e.toJson()).toList(),
         if (groups.isNotEmpty) 'groups': groups,
+        if (pages.isNotEmpty)
+          'pages': pages.map((p) => p.toJson()).toList(),
       };
 
   /// The group [nodeId] belongs to, or `null` when it is free.
@@ -419,6 +508,56 @@ Map<String, double> _boundsFromJson(Map<String, dynamic> json) =>
       'max_x': (json['max_x'] as num).toDouble(),
       'max_y': (json['max_y'] as num).toDouble(),
     };
+
+/// Tolerant `pages` reader (round-13): orders by `index`, drops entries with
+/// no usable id, skips the reserved cover id and reindexes densely.
+///
+/// A hand-edited or future document must never fail to open, and two pages
+/// sharing an id would make their elements indistinguishable — so the first
+/// occurrence wins rather than raising.
+List<BookPageModel> _pagesFromJson(Object? value) {
+  if (value is! List) {
+    return <BookPageModel>[];
+  }
+  final List<({int index, int order, BookPageModel page})> entries =
+      <({int index, int order, BookPageModel page})>[];
+  final Set<String> seen = <String>{};
+  for (int order = 0; order < value.length; order++) {
+    final Object? raw = value[order];
+    if (raw is! Map) {
+      continue;
+    }
+    final String? pageId = normalizePageId(raw['page_id']);
+    if (pageId == null || pageId == kBookCoverPageId || !seen.add(pageId)) {
+      continue;
+    }
+    final Object? rawIndex = raw['index'];
+    final int index = rawIndex is int ? rawIndex : order;
+    final Object? rawTitle = raw['title'];
+    entries.add((
+      index: index < 0 ? 0 : index,
+      order: order,
+      page: BookPageModel(
+        pageId: pageId,
+        index: index < 0 ? 0 : index,
+        title: rawTitle is String && rawTitle.isNotEmpty
+            ? rawTitle
+            : bookPageTitle(index),
+      ),
+    ));
+  }
+  entries.sort((a, b) {
+    final int byIndex = a.index.compareTo(b.index);
+    return byIndex != 0 ? byIndex : a.order.compareTo(b.order);
+  });
+  return <BookPageModel>[
+    for (int i = 0; i < entries.length; i++)
+      entries[i].page.copyWith(index: i),
+  ];
+}
+
+/// `Page 1`-style default title for the page at 0-based [index].
+String bookPageTitle(int index) => 'Page ${(index < 0 ? 0 : index) + 1}';
 
 /// Tolerant `groups` reader: unknown shapes are dropped rather than fatal, so
 /// a hand-edited or future document still opens.

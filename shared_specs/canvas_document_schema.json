@@ -15,7 +15,10 @@
     "elements": {"type": "array", "items": {"$ref": "#/$defs/Element"}},
     "groups": {"type": "object",
       "description": "Round-9 issue 05: OPTIONAL lock-group map, group_id -> [node_id, ...]. A locked group behaves as ONE object in the selector until unlocked. Omitted when empty so pre-round-9 documents round-trip byte-identically. NodeStyle is frozen, so a per-node flag cannot express this and the relation is document-level anyway (a node belongs to at most one group).",
-      "additionalProperties": {"type": "array", "items": {"type": "string"}, "minItems": 1}}
+      "additionalProperties": {"type": "array", "items": {"type": "string"}, "minItems": 1}},
+    "pages": {"type": "array",
+      "description": "Round-13 issue 04: OPTIONAL ordered page list of a BOOK (artboard.preset == 'BOOK'). Omitted (never empty-and-present) for a non-book document so it round-trips byte-identically. Elements address their page through Element.page_id; an element with no page_id belongs to the FIRST page, which is what every pre-round-13 document means.",
+      "items": {"$ref": "#/$defs/BookPage"}}
   },
   "$defs": {
     "Artboard": {
@@ -23,9 +26,9 @@
       "type": "object",
       "required": ["preset", "width", "height", "is_infinite", "background_style", "background_color", "background_spacing"],
       "properties": {
-        "preset": {"enum": ["A5", "A4", "LETTER", "INFINITE"]},
-        "width": {"type": ["number", "null"], "description": "A5 1748.0 | A4 2480.0 | LETTER 2550.0 | null if INFINITE"},
-        "height": {"type": ["number", "null"], "description": "A5 2480.0 | A4 3508.0 | LETTER 3300.0 | null if INFINITE"},
+        "preset": {"enum": ["A5", "A4", "LETTER", "BOOK", "INFINITE", "IMAGE"]},
+        "width": {"type": ["number", "null"], "description": "A5 1748.0 | A4 2480.0 | LETTER 2550.0 | BOOK = the selected page size (default A4 2480.0) | IMAGE = the source image's exact pixel width (round-13 gallery) | null if INFINITE"},
+        "height": {"type": ["number", "null"], "description": "A5 2480.0 | A4 3508.0 | LETTER 3300.0 | BOOK = the selected page size (default A4 3508.0) | IMAGE = the source image's exact pixel height (round-13 gallery) | null if INFINITE"},
         "is_infinite": {"type": "boolean"},
         "background_style": {"enum": ["BLANK", "RULED", "SQUARE_GRID"]},
         "background_color": {"type": "string", "pattern": "^#[0-9A-Fa-f]{6}$"},
@@ -89,13 +92,30 @@
         "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
                  "description": "[min_x, min_y, max_x, max_y] world units"},
         "style": {"$ref": "#/$defs/NodeStyle"},
-        "geometry": {"$ref": "#/$defs/NodeGeometry"}
+        "geometry": {"$ref": "#/$defs/NodeGeometry"},
+        "page_id": {"type": ["string", "null"],
+          "description": "Round-13 issue 04: OPTIONAL page address inside a BOOK. Absent/null means the FIRST page, so every pre-round-13 document (and every page-1 element of a book) keeps its frozen key list. One element list serves every page: 'which page am I on' is a filter, never a second storage path."}
+      }
+    },
+    "BookPage": {
+      "description": "Round-13 issue 04: one entry of a BOOK's ordered `pages` list. `index` is the 0-based reading position and MUST be dense (0..n-1) — every writer reindexes after a mutation, so a reordered list can never carry stale positions.",
+      "type": "object",
+      "required": ["page_id", "index", "title"],
+      "properties": {
+        "page_id": {"type": "string", "minLength": 1,
+          "description": "uuid-v4 (or any non-empty stable token); the value Element.page_id refers to. '__cover__' is reserved for the cover image and is never a real page."},
+        "index": {"type": "integer", "minimum": 0,
+          "description": "0-based reading position; dense after every mutation"},
+        "title": {"type": "string", "description": "page label shown in the page strip"}
       }
     }
   },
   "x_presets": {"origin": "top_left_0_0", "units": "world_units_at_300_dpi",
     "A5": {"width": 1748.0, "height": 2480.0}, "A4": {"width": 2480.0, "height": 3508.0},
-    "LETTER": {"width": 2550.0, "height": 3300.0}, "INFINITE": {"width": null, "height": null}},
+    "LETTER": {"width": 2550.0, "height": 3300.0},
+    "BOOK": {"width": 2480.0, "height": 3508.0,
+             "description": "Round 13: bounded multi-page book. The dims are the DEFAULT page size (A4); a book's real page size is the artboard width/height chosen at creation (A4 / A5 / LETTER only — an infinite book is deliberately unrepresentable)."},
+    "INFINITE": {"width": null, "height": null}},
   "x_upgrade_rule": "ALLOW = (target == \"INFINITE\") OR (content_bounds.min_x >= 0 AND content_bounds.min_y >= 0 AND content_bounds.max_x <= target.width AND content_bounds.max_y <= target.height)",
   "x_content_bounds_rule": "union of element bboxes after every mutation; empty document => {min_x:0,min_y:0,max_x:0,max_y:0}",
   "x_container": ".slatesync = ZIP: document.json (this schema) + assets/*"

@@ -233,7 +233,11 @@ class OcrClient {
 
   StreamSubscription<SyncEvent>? _sub;
   String? _jobId;
-  final Completer<OcrOutcome> _done = Completer<OcrOutcome>();
+
+  /// Re-created per job. A [Completer] can only be completed once, so a single
+  /// long-lived instance would leave every scan after the first cancel or
+  /// timeout waiting on a future that had already been finished.
+  Completer<OcrOutcome> _done = Completer<OcrOutcome>();
   final StreamController<OcrProgress> _progress =
       StreamController<OcrProgress>.broadcast();
   Timer? _timer;
@@ -269,9 +273,11 @@ class OcrClient {
 
     final String jobId = uuidV4();
     _jobId = jobId;
+    _done = Completer<OcrOutcome>();
     _sub = client.events.listen(_onEvent);
     _timer = Timer(timeout, () {
       if (!_done.isCompleted) {
+        _done.future.ignore(); // see cancel(): avoid an unhandled async error
         _done.completeError(
           TimeoutException('The PC did not answer the scan request.', timeout),
         );
@@ -296,11 +302,24 @@ class OcrClient {
     return _done.future;
   }
 
-  /// Asks the PC to abandon the job. Safe to call when nothing is running.
+  /// Asks the PC to abandon the job and resolves the pending [scan].
+  ///
+  /// The pending future MUST be resolved here. Cancelling only the local
+  /// subscription would leave the caller awaiting a future nothing can ever
+  /// complete — the UI would sit on "scanning" forever even though the PC had
+  /// stopped, which is exactly how a cancel that "does nothing" feels.
   Future<void> cancel() async {
     final String? jobId = _jobId;
     if (jobId == null) {
       return;
+    }
+    if (!_done.isCompleted) {
+      // Attach a sink BEFORE completing: `completeError` on a future with no
+      // listener is an unhandled async error, which crashes tests and would
+      // surface as a console error in release builds. The caller still sees the
+      // error through its own await.
+      _done.future.ignore();
+      _done.completeError(const OcrRequestError('Scan cancelled.'));
     }
     try {
       await client.sendRpc(
@@ -316,17 +335,25 @@ class OcrClient {
   /// Releases the subscription and timer. Call from `dispose`.
   Future<void> dispose() async {
     await _finish();
-  }
-
-  Future<void> _finish() async {
-    _timer?.cancel();
-    _timer = null;
-    await _sub?.cancel();
-    _sub = null;
-    _jobId = null;
+    // Closed only on real disposal: `_finish()` runs between jobs too, and
+    // closing the shared controller there would silently drop the next job's
+    // progress events.
     if (!_progress.isClosed) {
       await _progress.close();
     }
+  }
+
+  Future<void> _finish() async {
+    // Clear every field that `scan()` checks BEFORE the first `await`. Teardown
+    // parks on a microtask; if `_jobId` were still set when control returned,
+    // an immediate retry (the normal case after a timeout) would be rejected
+    // with "A scan is already running."
+    _timer?.cancel();
+    _timer = null;
+    _jobId = null;
+    final StreamSubscription<SyncEvent>? sub = _sub;
+    _sub = null;
+    await sub?.cancel();
   }
 
   void _onEvent(SyncEvent event) {

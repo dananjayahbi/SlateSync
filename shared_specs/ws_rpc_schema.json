@@ -9,13 +9,14 @@
     "canvas_id": {"type": "string", "format": "uuid-v4"},
     "timestamp": {"type": "integer", "unit": "unix_seconds"},
     "payload": {"type": "object", "description": "shape defined by (type, action); element commits carry the overview §4.3 element object"},
-    "type": {"enum": ["CANVAS_LIFECYCLE", "ELEMENT_COMMIT", "ARTBOARD_RESIZE", "ASSET_UPLOAD", "EXPORT_JOB", "OCR_JOB"]},
+    "type": {"enum": ["CANVAS_LIFECYCLE", "ELEMENT_COMMIT", "ARTBOARD_RESIZE", "ASSET_UPLOAD", "EXPORT_JOB", "OCR_JOB", "GALLERY"]},
     "action": {"enum": ["OPEN_CANVAS", "ADD_STROKE", "ADD_GRAPH", "ADD_SHAPE", "ADD_IMAGE",
       "DELETE_NODE", "UPGRADE_SIZE", "START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS",
       "EXPORT_FINISHED", "ASSET_START", "ASSET_CHUNK", "ASSET_DONE",
       "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
       "CANVAS_PUT", "CANVAS_PULL", "CLEAR_CANVAS",
-      "START_OCR", "CANCEL_OCR", "OCR_PROGRESS", "OCR_RESULT"]}
+      "START_OCR", "CANCEL_OCR", "OCR_PROGRESS", "OCR_RESULT",
+      "GALLERY_LIST_REQUEST", "GALLERY_LIST", "GALLERY_ADD", "GALLERY_SAVE"]}
   },
   "type_actions": {
     "CANVAS_LIFECYCLE": ["OPEN_CANVAS", "CANVAS_LIST_REQUEST", "CANVAS_LIST", "CANVAS_OPEN_REQUEST",
@@ -25,7 +26,8 @@
     "ARTBOARD_RESIZE": ["UPGRADE_SIZE"],
     "ASSET_UPLOAD": ["ASSET_START", "ASSET_CHUNK", "ASSET_DONE"],
     "EXPORT_JOB": ["START_EXPORT", "CANCEL_EXPORT", "EXPORT_PROGRESS", "EXPORT_FINISHED"],
-    "OCR_JOB": ["START_OCR", "CANCEL_OCR", "OCR_PROGRESS", "OCR_RESULT"]
+    "OCR_JOB": ["START_OCR", "CANCEL_OCR", "OCR_PROGRESS", "OCR_RESULT"],
+    "GALLERY": ["GALLERY_LIST_REQUEST", "GALLERY_LIST", "GALLERY_ADD", "GALLERY_SAVE"]
   },
   "payload_schemas": {
     "OPEN_CANVAS": {
@@ -191,6 +193,72 @@
         "error": {"type": "string", "description": "set only on failure; `text` is then empty"}
       },
       "description": "Doc 02 §11.1 — terminal result. The tablet inserts `text` as an editable text-box node"
+    },
+    "GALLERY_LIST_REQUEST": {
+      "direction": "tablet_to_pc",
+      "type": "object",
+      "required": [],
+      "properties": {},
+      "description": "Doc 02 §13.1 — ask the PC for its image-library index (empty payload; canvas_id is the empty string because the library is app-wide, not per canvas)"
+    },
+    "GALLERY_LIST": {
+      "direction": "pc_to_tablet",
+      "type": "object",
+      "required": ["images"],
+      "properties": {
+        "images": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["image_id", "title", "width", "height", "source", "created_at",
+                         "updated_at", "mime", "filename"],
+            "properties": {
+              "image_id": {"type": "string"},
+              "title": {"type": "string"},
+              "width": {"type": "integer", "minimum": 1},
+              "height": {"type": "integer", "minimum": 1},
+              "source": {"type": "string", "enum": ["PASTE", "DROP", "CANVAS"]},
+              "created_at": {"type": "integer", "unit": "unix_seconds"},
+              "updated_at": {"type": "integer", "unit": "unix_seconds"},
+              "mime": {"type": "string"},
+              "filename": {"type": "string"}
+            }
+          },
+          "description": "may be EMPTY; sorted updated_at DESC (newest first); sent unsolicited after GALLERY_ADD/GALLERY_SAVE commits and in reply to GALLERY_LIST_REQUEST"
+        }
+      }
+    },
+    "GALLERY_ADD": {
+      "direction": "any_to_any",
+      "type": "object",
+      "required": ["image_id", "title", "width", "height", "source", "filename", "mime"],
+      "properties": {
+        "image_id": {"type": "string", "description": "uuid-v4 chosen by the sender; the PC writes <appdata>/gallery/<image_id>.<ext>"},
+        "title": {"type": "string"},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "source": {"type": "string", "enum": ["PASTE", "DROP", "CANVAS"]},
+        "filename": {"type": "string", "description": "original display name"},
+        "mime": {"type": "string"},
+        "bytes_b64": {"type": "string", "description": "OPTIONAL legacy spelling for a small inline image; production senders stream the bytes with the existing ASSET_START/ASSET_CHUNK/ASSET_DONE transfer keyed by image_id as transfer_id"}
+      },
+      "description": "Doc 02 §13.1 — register a library image. Bytes ALWAYS arrive by the existing ASSET_* chunked transfer (never a new carrier); the payload describes what the finished transfer is. Re-adding an existing image_id replaces it and bumps updated_at"
+    },
+    "GALLERY_SAVE": {
+      "direction": "tablet_to_pc",
+      "type": "object",
+      "required": ["image_id", "title", "width", "height", "filename", "mime"],
+      "properties": {
+        "image_id": {"type": "string"},
+        "title": {"type": "string"},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "filename": {"type": "string"},
+        "mime": {"type": "string"},
+        "mode": {"type": "string", "enum": ["REPLACE", "COPY"],
+                 "description": "REPLACE keeps image_id (bumps updated_at); COPY always mints a new image_id on the PC when the chosen one already holds a different image"}
+      },
+      "description": "Doc 02 §13.1 — upload a rendered canvas back into the library (source is always CANVAS). Bytes travel by the existing ASSET_* transfer keyed by image_id as transfer_id"
     }
   },
   "asset_upload": {

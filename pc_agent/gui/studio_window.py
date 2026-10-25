@@ -47,6 +47,7 @@ from pc_agent.core.events import (
 )
 from pc_agent.gui import dialog_utils, pairing_status
 from pc_agent.gui.canvas_gallery_panel import CanvasGalleryPanel
+from pc_agent.gui.ocr_jobs_panel import OcrJobsPanel
 from pc_agent.gui.settings_panel import SettingsPanel
 
 if TYPE_CHECKING:  # Doc 06 GLCanvasHost — consumed, never redefined
@@ -158,6 +159,7 @@ class StudioWindow:
         select_mirror: Callable[[str | None], object] | None = None,
         rotate_pairing: Callable[[], object] | None = None,
         set_export_dir: Callable[[Path], object] | None = None,
+        ocr_cancel: Callable[[str], object] | None = None,
     ) -> None:
         """``open_request`` (round 4, optional): injected File → "Open synced
         canvas…" callback wired by main.py to
@@ -174,6 +176,7 @@ class StudioWindow:
         self._bus = bus
         self._gl_host = gl_host
         self._export_submit = export_submit
+        self._ocr_cancel_hook = ocr_cancel
         self._open_request = open_request
         self._thumbnail_fn = thumbnail_fn
         self._thumbs_dir = thumbs_dir
@@ -184,6 +187,10 @@ class StudioWindow:
         self._rotate_pairing = rotate_pairing
         self._set_export_dir = set_export_dir
         self._settings: SettingsPanel | None = None
+        self._ocr_jobs: OcrJobsPanel | None = None
+        # Injected by main.py so this window never imports the OCR package
+        # (keeps the GUI free of the model/runtime dependency).
+        self._ocr_cancel_hook: Callable[[str], object] | None = None
         self._device_rows: list[dict] = []
         self._mirrored_canvas_id: str | None = None
 
@@ -610,6 +617,8 @@ class StudioWindow:
         # Round 7: Settings lives on the menu bar so the device roster and the
         # export folder are always reachable (issue 03/04/05/07).
         edit_menu.add_command(label="Settings…", command=self._menu_settings)
+        # Round-13 issue 02 — make the OCR queue observable from the PC itself.
+        edit_menu.add_command(label="OCR Jobs…", command=self.open_ocr_jobs)
         menubar.insert_cascade(1, label="Tools", menu=edit_menu)
         self._root.configure(menu=menubar)
         self._menubar = menubar
@@ -785,6 +794,43 @@ class StudioWindow:
 
     def _menu_settings(self) -> None:
         self.open_settings()
+
+    # ------------------------------------------------------------------
+    # Round-13 issue 02 — OCR jobs window
+    # ------------------------------------------------------------------
+    def open_ocr_jobs(self) -> None:
+        """Open (or raise) the OCR jobs window.
+
+        Non-modal by design: an operator must be able to watch the agent while a
+        scan runs, and a stuck job has to be cancellable from the machine that is
+        actually doing the work.
+        """
+        panel = self._ocr_jobs
+        if panel is not None and panel.exists():
+            panel.show()
+            return
+        root = self._root
+        if root is None:
+            return
+        self._ocr_jobs = OcrJobsPanel(
+            root,
+            self._bus,
+            cancel=self._ocr_cancel,
+            on_close=self._on_ocr_jobs_closed,
+        )
+
+    def _on_ocr_jobs_closed(self) -> None:
+        self._ocr_jobs = None
+
+    def _ocr_cancel(self, job_id: str) -> None:
+        """Cancel an OCR job from the PC side.
+
+        Emits the same bus message the tablet's CANCEL_OCR produces, so there is
+        exactly one cancellation path to reason about.
+        """
+        cancel = self._ocr_cancel_hook
+        if cancel is not None:
+            cancel(job_id)
 
     # ------------------------------------------------------------------
     # Issue 02/03-PC pairing affordances

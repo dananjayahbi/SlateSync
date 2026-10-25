@@ -17,6 +17,12 @@ ARTBOARD_CHANGED = "ARTBOARD_CHANGED"
 EXPORT_STARTED = "EXPORT_STARTED"
 EXPORT_PROGRESS = "EXPORT_PROGRESS"
 EXPORT_FINISHED = "EXPORT_FINISHED"
+# Round-13 issue 02 — OCR job lifecycle for the PC jobs panel. Separate from the
+# wire envelopes on purpose: the panel must show work the tablet may never see
+# (e.g. a job that failed before any reply could be sent).
+OCR_JOB_STARTED = "OCR_JOB_STARTED"
+OCR_JOB_PROGRESS = "OCR_JOB_PROGRESS"
+OCR_JOB_FINISHED = "OCR_JOB_FINISHED"
 PAIRING_INFO = "PAIRING_INFO"
 #: Round 4/5 (Doc 02 §8.1/§9) — merged canvas cache + live device count.
 #: Frozen payload shape (round 5): ``{canvases: [{id, title, preset,

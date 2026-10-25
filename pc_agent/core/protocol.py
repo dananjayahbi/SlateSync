@@ -24,6 +24,7 @@ RPC_TYPES: Final = frozenset(
         "ASSET_UPLOAD",
         "EXPORT_JOB",
         "OCR_JOB",
+        "GALLERY",
     }
 )
 
@@ -57,6 +58,11 @@ RPC_ACTIONS: Final = frozenset(
         "CANCEL_OCR",
         "OCR_PROGRESS",
         "OCR_RESULT",
+        # Doc 02 §13.1 — Round-13 image library (28 actions).
+        "GALLERY_LIST_REQUEST",
+        "GALLERY_LIST",
+        "GALLERY_ADD",
+        "GALLERY_SAVE",
     }
 )
 

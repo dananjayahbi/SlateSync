@@ -384,11 +384,96 @@ void main() {
       await fake.close();
     });
 
+    test('cancel resolves the pending scan instead of leaving it hanging',
+        () async {
+      final _FakeClient fake = _FakeClient();
+      final OcrClient ocr = OcrClient(client: fake, canvasId: 'c-1');
+      final Future<OcrOutcome> pending = ocr.scan(scope: OcrScope.canvas);
+      await Future<void>.delayed(Duration.zero);
+      await ocr.cancel();
+      // Without this the UI sits on "scanning" forever.
+      await expectLater(pending, throwsA(isA<OcrRequestError>()));
+      await fake.close();
+    });
+
+    test('a scan works again after a cancel', () async {
+      // The round-13 regression: a COMPLETED Completer can never be reused, so a
+      // single long-lived one left every later scan awaiting a finished future.
+      final _FakeClient fake = _FakeClient();
+      final OcrClient ocr = OcrClient(client: fake, canvasId: 'c-1');
+      unawaited(ocr.scan(scope: OcrScope.canvas));
+      await Future<void>.delayed(Duration.zero);
+      await ocr.cancel();
+
+      final Future<OcrOutcome> second = ocr.scan(scope: OcrScope.canvas);
+      await Future<void>.delayed(Duration.zero);
+      final String jobId = (fake.sent.last['payload']
+          as Map<String, dynamic>)['job_id'] as String;
+      fake.emit(_result(jobId, text: 'second scan'));
+      expect((await second).text, 'second scan');
+      await fake.close();
+    });
+
+    test('a scan works again after a timeout', () async {
+      final _FakeClient fake = _FakeClient();
+      final OcrClient ocr = OcrClient(client: fake, canvasId: 'c-1');
+      await expectLater(
+        ocr.scan(
+          scope: OcrScope.canvas,
+          timeout: const Duration(milliseconds: 20),
+        ),
+        throwsA(isA<TimeoutException>()),
+      );
+
+      final Future<OcrOutcome> second = ocr.scan(scope: OcrScope.canvas);
+      await Future<void>.delayed(Duration.zero);
+      final String jobId = (fake.sent.last['payload']
+          as Map<String, dynamic>)['job_id'] as String;
+      fake.emit(_result(jobId, text: 'recovered'));
+      expect((await second).text, 'recovered');
+      await fake.close();
+    });
+
+    test('cancelling twice is harmless', () async {
+      final _FakeClient fake = _FakeClient();
+      final OcrClient ocr = OcrClient(client: fake, canvasId: 'c-1');
+      unawaited(ocr.scan(scope: OcrScope.canvas));
+      await Future<void>.delayed(Duration.zero);
+      await ocr.cancel();
+      await ocr.cancel(); // second call has no job to cancel
+      await fake.close();
+    });
+
     test('cancel with nothing running is a no-op', () async {
       final _FakeClient fake = _FakeClient();
       final OcrClient ocr = OcrClient(client: fake, canvasId: 'c-1');
       await ocr.cancel();
       expect(fake.sent, isEmpty);
+      await fake.close();
+    });
+
+    test('progress still streams on the scan after a cancel', () async {
+      // `_finish()` runs between jobs; if it closed the shared progress
+      // controller, the second job's progress would be silently dropped.
+      final _FakeClient fake = _FakeClient();
+      final OcrClient ocr = OcrClient(client: fake, canvasId: 'c-1');
+      final List<OcrProgress> seen = <OcrProgress>[];
+      ocr.progress.listen(seen.add);
+
+      unawaited(ocr.scan(scope: OcrScope.canvas));
+      await Future<void>.delayed(Duration.zero);
+      await ocr.cancel();
+
+      final Future<OcrOutcome> second = ocr.scan(scope: OcrScope.canvas);
+      await Future<void>.delayed(Duration.zero);
+      final String jobId = (fake.sent.last['payload']
+          as Map<String, dynamic>)['job_id'] as String;
+      fake.emit(_progress(jobId, 'RECOGNISING', 60));
+      await Future<void>.delayed(Duration.zero);
+      fake.emit(_result(jobId, text: 'ok'));
+      await second;
+      expect(seen.map((OcrProgress p) => p.percent), contains(60.0));
+      await ocr.dispose();
       await fake.close();
     });
 

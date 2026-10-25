@@ -35,6 +35,7 @@ from pathlib import Path
 
 import cairo
 
+from pc_agent.engine.book_model import thumbnail_elements as _book_thumbnail_elements
 from pc_agent.engine.document_store import (
     CanvasDocument,
     DocumentStore,
@@ -64,6 +65,18 @@ _FALLBACK_VIEW: tuple[float, float, float, float] = (-500.0, -500.0, 500.0, 500.
 _MAX_GRAPH_LINES = 4096
 
 
+def _thumbnail_elements(document: CanvasDocument) -> list[CanvasNode]:
+    """Elements a gallery thumbnail shows.
+
+    A book shows its cover when it has one, else its first page — otherwise the
+    card would advertise page 1 forever and the cover the reader chose would
+    never appear. Any other document shows everything, unchanged.
+    """
+    if not getattr(document, "pages", None):
+        return list(document.elements)
+    return list(_book_thumbnail_elements(document.elements, document.pages))
+
+
 def render_thumbnail(doc, out_path: Path, size: int = 192) -> Path:
     """§10.6 frozen signature — render ``doc`` to a ≤192² PNG at ``out_path``.
 
@@ -89,7 +102,7 @@ def render_thumbnail(doc, out_path: Path, size: int = 192) -> Path:
     ctx.translate(-view[0], -view[1])
     _draw_paper(ctx, document.artboard, view, scale)
     assets_root = _assets_root(document.canvas_id)
-    for node in sorted(document.elements, key=lambda n: n.layer):
+    for node in sorted(_thumbnail_elements(document), key=lambda n: n.layer):
         try:
             _draw_node(ctx, node, assets_root, scale)
         except Exception:  # noqa: BLE001 — one bad element must not kill the gallery

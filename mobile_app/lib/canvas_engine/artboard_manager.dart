@@ -38,6 +38,39 @@ class UpgradeResult {
 class ArtboardManager {
   ArtboardManager({required String preset}) : _current = _initialFor(preset);
 
+  ArtboardManager._adopting(Artboard artboard) : _current = artboard;
+
+  /// Round-13: adopt the dimensions a document actually carries.
+  ///
+  /// Marker presets (`IMAGE`, and any future one) are not in [_dimsFor] — a
+  /// gallery image's page is a device-pixel rectangle, not a 300-DPI paper
+  /// size. Freezing such a document to a table size would silently letterbox
+  /// or crop it, so the document's own dims win there. Known presets still
+  /// resolve through the table, which keeps the Doc 23 upgrade matrix exactly
+  /// as it was; an unknown preset with no usable dims still throws.
+  factory ArtboardManager.forDocument(Artboard artboard) {
+    if (_dimsFor(artboard.preset) != null || artboard.preset == 'INFINITE') {
+      return ArtboardManager(preset: artboard.preset);
+    }
+    final double? w = artboard.width;
+    final double? h = artboard.height;
+    final bool usable = w != null && h != null && w > 0 && h > 0;
+    if (usable && !artboard.isInfinite) {
+      return ArtboardManager._adopting(
+        Artboard(
+          preset: artboard.preset,
+          width: w,
+          height: h,
+          isInfinite: false,
+          backgroundStyle: artboard.backgroundStyle,
+          backgroundColor: artboard.backgroundColor,
+          backgroundSpacing: artboard.backgroundSpacing,
+        ),
+      );
+    }
+    return ArtboardManager(preset: artboard.preset);
+  }
+
   /// Valid upgrade targets (template §3 preset matrix, verbatim).
   static const Set<String> _validTargets = {'A5', 'A4', 'LETTER', 'INFINITE'};
 
@@ -130,12 +163,19 @@ class ArtboardManager {
   }
 
   /// Preset dimension table (template §3, 300-DPI world units); `null` for
-  /// anything outside the three bounded presets. (`Presets.a5` is a named
+  /// anything outside the bounded presets. (`Presets.a5` is a named
   /// record while `a4`/`letter` are positional — normalized to named here.)
+  ///
+  /// `BOOK` lives here so opening a book never depends on the document's own
+  /// dims: a book's artboard is its page size, and the table is what the
+  /// round-13 New Canvas modal seeds from. Without this entry constructing the
+  /// manager for a book raised `ArgumentError` and the studio could not open
+  /// one at all.
   static ({double w, double h})? _dimsFor(String preset) => switch (preset) {
         'A5' => (w: Presets.a5.w, h: Presets.a5.h),
         'A4' => (w: Presets.a4.$1, h: Presets.a4.$2),
         'LETTER' => (w: Presets.letter.$1, h: Presets.letter.$2),
+        'BOOK' => (w: Presets.book.w, h: Presets.book.h),
         _ => null,
       };
 
@@ -147,7 +187,7 @@ class ArtboardManager {
         (throw ArgumentError.value(
           preset,
           'preset',
-          'Unknown artboard preset (expected A5, A4, LETTER or INFINITE)',
+          'Unknown artboard preset (expected A5, A4, LETTER, BOOK or INFINITE)',
         ));
     return Artboard(
       preset: preset,

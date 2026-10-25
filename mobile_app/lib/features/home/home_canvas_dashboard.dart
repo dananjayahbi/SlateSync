@@ -18,8 +18,14 @@ import 'package:mobile_app/canvas_engine/artboard_manager.dart'; // Doc 23
 import 'package:mobile_app/core/models/canvas_models.dart'; // Doc 05
 import 'package:mobile_app/core/storage/local_db.dart';
 import 'package:mobile_app/core/theme/studio_theme.dart'; // Doc 05
+import 'package:mobile_app/features/book/book_controller.dart'
+    show bookPageDims; // round-13 issue 04
+import 'package:mobile_app/features/canvas/image_source_popup.dart'
+    show ImageSource, ImageSourcePickFn, defaultPickImageFromSource;
 import 'package:mobile_app/features/home/thumbnail_cache.dart'; // round-12 issue 08
 import 'package:mobile_app/features/pairing/pairing_screen.dart'; // Issue 03
+import 'package:mobile_app/features/tools/tool_palette_dock.dart'
+    show PickedImage; // Doc 24
 import 'package:mobile_app/network/vector_sync_client.dart'
     show VectorSyncClient, uuidV4; // Doc 25
 
@@ -30,9 +36,10 @@ import 'package:mobile_app/network/vector_sync_client.dart'
 /// Empty-gallery copy (Doc 26 §5.4), shared by widget and test.
 const String kEmptyGalleryMessage = 'No canvases yet — tap + to start';
 
-/// Card/menu chip labels: `A5 / A4 / Letter / Infinite` (Doc 26 §5.4).
+/// Card/menu chip labels: `A5 / A4 / Letter / Book / Infinite` (Doc 26 §5.4).
 String presetLabel(String preset) => switch (preset) {
       'LETTER' => 'Letter',
+      'BOOK' => 'Book',
       'INFINITE' => 'Infinite',
       _ => preset,
     };
@@ -42,6 +49,9 @@ Color presetTint(String preset) => switch (preset) {
       'A5' => const Color(0xFF4F8EF7),
       'A4' => const Color(0xFF7C5CFC),
       'LETTER' => const Color(0xFF4FBF8D),
+      // Rose: distinct from every page size, since a book is a different thing
+      // rather than a different size.
+      'BOOK' => const Color(0xFFE4577A),
       'INFINITE' => const Color(0xFFF2A93B),
       _ => StudioTheme.accent,
     };
@@ -54,27 +64,36 @@ Color presetBadgeColor(String preset) => switch (preset) {
       'A5' => const Color(0xFF1D4ED8), // blue-700
       'A4' => const Color(0xFF6D28D9), // violet-700
       'LETTER' => const Color(0xFF047857), // emerald-700
+      'BOOK' => const Color(0xFFBE123C), // rose-700
       'INFINITE' => const Color(0xFFB45309), // amber-700
       _ => const Color(0xFF3F4654), // neutral slate
     };
 
 /// Preset dimension table (template §3, 300-DPI world units). INFINITE ⇒
-/// null dims + `infinite: true`. Unknown preset ⇒ [ArgumentError].
+/// null dims + `infinite: true`. BOOK is BOUNDED and defaults to A4 — a book
+/// page is paper, so it can never be unbounded. Unknown preset ⇒
+/// [ArgumentError].
 ({double? w, double? h, bool infinite}) presetDims(String preset) =>
     switch (preset) {
       'A5' => (w: Presets.a5.w, h: Presets.a5.h, infinite: false),
       'A4' => (w: Presets.a4.$1, h: Presets.a4.$2, infinite: false),
       'LETTER' => (w: Presets.letter.$1, h: Presets.letter.$2, infinite: false),
+      'BOOK' => (w: Presets.book.w, h: Presets.book.h, infinite: false),
       'INFINITE' => (w: null, h: null, infinite: true),
       _ => throw ArgumentError.value(
           preset,
           'preset',
-          'Unknown artboard preset (expected A5, A4, LETTER or INFINITE)',
+          'Unknown artboard preset (expected A5, A4, LETTER, BOOK or INFINITE)',
         ),
     };
 
-/// Human dims label: `1748 × 2480` … `Unbounded` for INFINITE.
+/// Human dims label: `1748 × 2480` … `Unbounded` for INFINITE. A book is
+/// labelled by the page size it was created at, since its artboard dims are
+/// only that size's default.
 String presetDimsLabel(String preset) {
+  if (preset == kBookPreset) {
+    return 'Multi-page';
+  }
   final ({double? w, double? h, bool infinite}) dims = presetDims(preset);
   if (dims.infinite) {
     return 'Unbounded';
@@ -110,6 +129,11 @@ String relativeTime(int now, int updatedAt) {
 /// Build the seed document for the New Canvas flow (Doc 26 §5.5): Doc 05
 /// defaults (`content_bounds` zeros, `elements: []`,
 /// `background_color: #FFFFFF`), uuid via Doc 25 `uuidV4()`.
+///
+/// A book (round-13 issue 04) is the same document plus `pages`; its artboard
+/// is BOUNDED at [pageSize], so a book can never be created infinite. The
+/// optional cover becomes an IMAGE element carrying [kBookCoverPageId], which
+/// is why no extra document key is needed.
 CanvasDocumentModel buildNewCanvasDocument({
   required String title,
   required String preset,
@@ -117,9 +141,22 @@ CanvasDocumentModel buildNewCanvasDocument({
   double backgroundSpacing = kDefaultBackgroundSpacing,
   String? canvasId,
   int? now,
+  String? pageSize,
+  String? coverAssetRef,
+  List<double>? coverBbox,
 }) {
-  final ({double? w, double? h, bool infinite}) dims = presetDims(preset);
+  final bool isBook = preset == kBookPreset;
+  final ({double w, double h})? bookDims =
+      isBook ? bookPageDims(pageSize ?? kDefaultBookPageSize) : null;
+  final ({double? w, double? h, bool infinite}) dims = bookDims != null
+      ? (w: bookDims.w, h: bookDims.h, infinite: false)
+      : presetDims(preset);
   final int ts = now ?? unixNowSeconds();
+  final List<CanvasNodeModel> elements = <CanvasNodeModel>[];
+  final String? cover = normalizePageId(coverAssetRef);
+  if (isBook && cover != null) {
+    elements.add(_seedCoverElement(cover, bookDims ?? Presets.book, coverBbox));
+  }
   return CanvasDocumentModel(
     canvasId: canvasId ?? uuidV4(),
     title: title,
@@ -140,7 +177,36 @@ CanvasDocumentModel buildNewCanvasDocument({
       'max_x': 0,
       'max_y': 0,
     },
-    elements: <CanvasNodeModel>[],
+    elements: elements,
+    pages: isBook
+        ? <BookPageModel>[
+            BookPageModel(pageId: uuidV4(), index: 0, title: bookPageTitle(0)),
+          ]
+        : <BookPageModel>[],
+  );
+}
+
+/// Cover element for a new book: one IMAGE filling the page by default.
+CanvasNodeModel _seedCoverElement(
+  String assetRef,
+  ({double w, double h}) page,
+  List<double>? bbox,
+) {
+  final List<double> rect =
+      bbox ?? <double>[0, 0, page.w, page.h];
+  return CanvasNodeModel(
+    nodeId: uuidV4(),
+    kind: 'IMAGE',
+    layer: 0,
+    bbox: rect,
+    style: NodeStyleModel(
+      color: '#000000',
+      strokeWidth: 0,
+      opacity: 1,
+      blendMode: 'SRC_OVER',
+    ),
+    geometry: NodeGeometryModel(pts: const <List<double>>[], assetRef: assetRef),
+    pageId: kBookCoverPageId,
   );
 }
 
@@ -211,6 +277,7 @@ class HomeCanvasDashboard extends StatefulWidget {
     this.onListChanged,
     this.refreshListenable,
     this.thumbGenerator,
+    this.onOpenGallery,
   });
 
   /// Canvas route hand-off (Doc 26 §4, wired in Wave 3.A).
@@ -245,6 +312,11 @@ class HomeCanvasDashboard extends StatefulWidget {
   /// `saveDocument` on create/rename/upgrade and to the lazy gallery
   /// backfill. `null` ⇒ the frozen `saveDocThumbnail` renderer.
   final ThumbGenerator? thumbGenerator;
+
+  /// Round-13 §03 additive hook: when provided, the app bar shows the image
+  /// library entry point. `null` ⇒ no button, so existing callers and tests
+  /// compile and render exactly as before.
+  final VoidCallback? onOpenGallery;
 
   @override
   State<HomeCanvasDashboard> createState() => _HomeCanvasDashboardState();
@@ -479,7 +551,10 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
     );
   }
 
-  Future<void> _createDocument(CanvasDocumentModel doc) async {
+  Future<void> _createDocument(
+    CanvasDocumentModel doc, {
+    Map<String, List<int>>? assets,
+  }) async {
     final LocalDb? db = _db;
     if (db == null) {
       throw StateError('LocalDb is not ready yet');
@@ -489,6 +564,7 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
     final String path = await saveDocument(
       doc,
       baseDir: widget.baseDir,
+      assets: assets,
       thumbGenerator: widget.thumbGenerator,
     );
     final String thumbPath = await thumbFilePath(
@@ -711,6 +787,16 @@ class _HomeCanvasDashboardState extends State<HomeCanvasDashboard> {
               tooltip: 'Connect to SlateSync PC',
               onPressed: _openPairing,
               icon: const Icon(Icons.link),
+            ),
+          // Round-13 §03 — the image library lives on the PC, but it is a
+          // first-class place to start a canvas from, so its entry point sits
+          // with the other top-level actions rather than behind a menu.
+          if (widget.onOpenGallery != null)
+            IconButton(
+              key: const Key('home-open-gallery'),
+              tooltip: 'Image library',
+              onPressed: widget.onOpenGallery,
+              icon: const Icon(Icons.photo_library_outlined),
             ),
         ],
       ),
@@ -1045,13 +1131,28 @@ class _RenameDialogState extends State<_RenameDialog> {
   }
 }
 
-/// Preset cards (A5/A4/Letter/Infinite) + four background mini previews;
+/// Receives the seeded document, plus any asset bytes it references so the
+/// archive can embed them (a book's cover is chosen before the document exists,
+/// so its bytes cannot be re-read from disk yet).
+typedef NewCanvasCreate = Future<void> Function(
+  CanvasDocumentModel doc, {
+  Map<String, List<int>>? assets,
+});
+
+/// Preset cards (A5/A4/Letter/Book/Infinite) + three background mini previews;
 /// Create builds the seed document and hands it to [onCreate].
 class NewCanvasModal extends StatefulWidget {
-  const NewCanvasModal({super.key, required this.onCreate});
+  const NewCanvasModal({
+    super.key,
+    required this.onCreate,
+    this.coverPicker,
+  });
 
   /// Save + insert + refresh (dashboard) — awaited before the modal closes.
-  final Future<void> Function(CanvasDocumentModel doc) onCreate;
+  final NewCanvasCreate onCreate;
+
+  /// Injectable cover picker (tests); `null` ⇒ the real gallery picker.
+  final ImageSourcePickFn? coverPicker;
 
   @override
   State<NewCanvasModal> createState() => _NewCanvasModalState();
@@ -1062,6 +1163,7 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
     'A5',
     'A4',
     'LETTER',
+    kBookPreset,
     'INFINITE',
   ];
   static const List<String> _backgrounds = kBackgroundStyles;
@@ -1069,14 +1171,44 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
   String _preset = 'A4';
   String _background = kBackgroundBlank;
   double _spacing = kDefaultBackgroundSpacing;
+  String _pageSize = kDefaultBookPageSize;
+
+  /// Chosen cover, held as bytes until the document exists to attach it to.
+  PickedImage? _cover;
+
   final TextEditingController _title = TextEditingController(text: 'Untitled');
   bool _busy = false;
   String? _error;
+
+  bool get _isBook => _preset == kBookPreset;
+
+  /// `assets/cover.<ext>` — the ref the cover element points at, matching the
+  /// `assets/*` convention `saveDocument` embeds.
+  String? get _coverRef {
+    final PickedImage? cover = _cover;
+    if (cover == null) {
+      return null;
+    }
+    final String name = cover.filename.toLowerCase();
+    final int dot = name.lastIndexOf('.');
+    final String ext = dot > 0 ? name.substring(dot + 1) : 'png';
+    return 'assets/cover.$ext';
+  }
 
   @override
   void dispose() {
     _title.dispose();
     super.dispose();
+  }
+
+  Future<void> _pickCover() async {
+    final ImageSourcePickFn pick =
+        widget.coverPicker ?? defaultPickImageFromSource;
+    final PickedImage? picked = await pick(ImageSource.gallery);
+    if (picked == null || !mounted) {
+      return;
+    }
+    setState(() => _cover = picked);
   }
 
   Future<void> _create() async {
@@ -1086,13 +1218,18 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
       preset: _preset,
       background: _background,
       backgroundSpacing: _spacing,
+      pageSize: _isBook ? _pageSize : null,
+      coverAssetRef: _isBook ? _coverRef : null,
     );
+    final Map<String, List<int>>? assets = _coverRef == null
+        ? null
+        : <String, List<int>>{_coverRef!: _cover!.bytes};
     setState(() {
       _busy = true;
       _error = null;
     });
     try {
-      await widget.onCreate(doc);
+      await widget.onCreate(doc, assets: assets);
     } catch (e) {
       if (mounted) {
         setState(() {
@@ -1134,16 +1271,82 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
               ),
               const SizedBox(height: 8),
               Wrap(
-                spacing: 8,
-                runSpacing: 8,
+                spacing: 6,
+                runSpacing: 6,
                 children: <Widget>[
                   for (final String preset in _presets) _presetCard(preset),
                 ],
               ),
+              if (_isBook) ...<Widget>[
+                const SizedBox(height: 16),
+                const Text(
+                  'Page size',
+                  style: TextStyle(
+                    color: StudioTheme.text,
+                    fontSize: StudioTheme.captionSize,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: <Widget>[
+                    for (final String size in kBookPageSizes)
+                      _pageSizeChip(size),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: <Widget>[
+                    OutlinedButton.icon(
+                      key: const Key('new_book_cover'),
+                      onPressed: _busy ? null : _pickCover,
+                      icon: const Icon(Icons.image_outlined, size: 18),
+                      label: Text(
+                        _cover == null ? 'Add cover image' : 'Change cover',
+                      ),
+                    ),
+                    if (_cover != null) ...<Widget>[
+                      const SizedBox(width: 8),
+                      Flexible(
+                        child: Text(
+                          _cover!.filename,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: StudioTheme.subText,
+                            fontSize: StudioTheme.captionSize,
+                          ),
+                        ),
+                      ),
+                      IconButton(
+                        key: const Key('new_book_cover_clear'),
+                        tooltip: 'Remove cover',
+                        icon: const Icon(Icons.close, size: 18),
+                        onPressed: _busy
+                            ? null
+                            : () => setState(() => _cover = null),
+                      ),
+                    ],
+                  ],
+                ),
+                const Padding(
+                  padding: EdgeInsets.only(top: 6),
+                  child: Text(
+                    'The cover is the gallery thumbnail; without one the '
+                    'first page is shown.',
+                    style: TextStyle(
+                      color: StudioTheme.subText,
+                      fontSize: StudioTheme.captionSize,
+                    ),
+                  ),
+                ),
+              ],
               const SizedBox(height: 16),
-              const Text(
-                'Background',
-                style: TextStyle(
+              Text(
+                _isBook ? 'Page background' : 'Background',
+                style: const TextStyle(
                   color: StudioTheme.text,
                   fontSize: StudioTheme.captionSize,
                   fontWeight: FontWeight.w700,
@@ -1220,8 +1423,8 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
       borderRadius: BorderRadius.circular(StudioTheme.radiusSmall),
       onTap: () => setState(() => _preset = preset),
       child: Container(
-        width: 96,
-        padding: const EdgeInsets.all(8),
+        width: 76,
+        padding: const EdgeInsets.all(6),
         decoration: BoxDecoration(
           color: selected ? tint.withValues(alpha: 0.18) : StudioTheme.surface,
           borderRadius: BorderRadius.circular(StudioTheme.radiusSmall),
@@ -1235,6 +1438,8 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
           children: <Widget>[
             Text(
               presetLabel(preset),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: const TextStyle(
                 color: StudioTheme.text,
                 fontSize: StudioTheme.bodySize,
@@ -1244,6 +1449,8 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
             const SizedBox(height: 2),
             Text(
               presetDimsLabel(preset),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 color: StudioTheme.text.withValues(alpha: 0.6),
                 fontSize: StudioTheme.captionSize,
@@ -1296,6 +1503,52 @@ class _NewCanvasModalState extends State<NewCanvasModal> {
                     : StudioTheme.text.withValues(alpha: 0.7),
               ),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _pageSizeChip(String size) {
+    final bool selected = size == _pageSize;
+    final ({double w, double h})? dims = bookPageDims(size);
+    return InkWell(
+      key: Key('new_book_page_size_$size'),
+      borderRadius: BorderRadius.circular(StudioTheme.radiusSmall),
+      onTap: () => setState(() => _pageSize = size),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        decoration: BoxDecoration(
+          color: selected ? StudioTheme.accent.withValues(alpha: 0.18) : null,
+          borderRadius: BorderRadius.circular(StudioTheme.radiusSmall),
+          border: Border.all(
+            color: selected
+                ? StudioTheme.accent
+                : StudioTheme.text.withValues(alpha: 0.2),
+            width: selected ? 2 : 1,
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: <Widget>[
+            Text(
+              presetLabel(size),
+              style: TextStyle(
+                fontSize: StudioTheme.bodySize,
+                fontWeight: selected ? FontWeight.w700 : FontWeight.w400,
+                color: selected
+                    ? StudioTheme.accent
+                    : StudioTheme.text.withValues(alpha: 0.8),
+              ),
+            ),
+            if (dims != null)
+              Text(
+                '${dims.w.round()} × ${dims.h.round()}',
+                style: const TextStyle(
+                  fontSize: 10,
+                  color: StudioTheme.subText,
+                ),
+              ),
           ],
         ),
       ),

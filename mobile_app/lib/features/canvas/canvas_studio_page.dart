@@ -228,7 +228,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     _doc = widget.document;
     _camera = CameraController();
     _engine = TiledCanvasEngine(camera: _camera);
-    _artboard = ArtboardManager(preset: _doc.artboard.preset);
+    _artboard = ArtboardManager.forDocument(_doc.artboard);
     // Issue 02: the studio never rendered page backgrounds before — adopt the
     // document's saved background so RULED/DOT_GRID/ISO_GRID docs paint their
     // pattern (the manager seeds BLANK/#FFFFFF on construction).

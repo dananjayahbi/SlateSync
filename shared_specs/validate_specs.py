@@ -55,6 +55,7 @@ RPC_TYPES = [
     "ASSET_UPLOAD",
     "EXPORT_JOB",
     "OCR_JOB",
+    "GALLERY",
 ]
 # Doc 02 round 4 (§8): the expected action set is DERIVED from ws_rpc_schema.json
 # itself — envelope.action.enum must exactly equal the union of the type_actions
@@ -110,8 +111,21 @@ PRESETS = {
     "A5": (1748.0, 2480.0),
     "A4": (2480.0, 3508.0),
     "LETTER": (2550.0, 3300.0),
+    # Round-13 issue 04: BOOK is bounded and seeded at the default page size
+    # (A4). An infinite book is deliberately unrepresentable.
+    "BOOK": (2480.0, 3508.0),
     "INFINITE": (None, None),
 }
+#: Round-13: presets whose dims a BOOK may actually use (no INFINITE).
+BOOK_PAGE_SIZES = ("A4", "A5", "LETTER")
+
+#: Round-13 issue 03 — the gallery's "use image as canvas" marker. A canvas
+#: carrying this preset is sized to the source image's exact pixel rectangle, so
+#: it has NO table dimensions: `width`/`height` are authoritative and always
+#: present. It is listed in the Artboard enum so the published contract matches
+#: what the app actually writes, and it is deliberately absent from PRESETS so
+#: no code path can mistake it for a paper size.
+IMAGE_PRESET = "IMAGE"
 PRESET_ORIGIN = "top_left_0_0"
 BACKGROUND_STYLES = ["BLANK", "RULED", "SQUARE_GRID"]
 #: Round-9: legacy styles removed from the enum but still accepted on LOAD
@@ -438,6 +452,101 @@ def validate_canvas_document(spec: dict) -> list[str]:
         errors.append(f"x_upgrade_rule: expected non-empty expression got {rule!r}")
     elif "INFINITE" not in rule:
         errors.append(f"x_upgrade_rule: expression must cover the INFINITE case got {rule!r}")
+
+    errors.extend(_validate_book_extensions(spec))
+    return errors
+
+
+def _validate_book_extensions(spec: dict) -> list[str]:
+    """Round-13 issue 04 — books must stay ADDITIVE and bounded.
+
+    Three properties are load-bearing and are all cheap to assert:
+
+    * ``pages`` (root) and ``Element.page_id`` are DECLARED but never REQUIRED,
+      so a non-book document emits neither and every pre-round-13 archive keeps
+      its frozen key list;
+    * the BOOK preset is bounded (non-null dims) — an infinite book is
+      deliberately unrepresentable;
+    * ``$defs/BookPage`` carries exactly ``page_id``/``index``/``title``, which
+      is the whole page entry contract the page strip and the exporter read.
+    """
+    errors: list[str] = []
+
+    root_required = _dig(spec, "required")
+    if isinstance(root_required, list):
+        if "pages" in root_required:
+            errors.append("required: 'pages' must stay OPTIONAL (non-book documents omit it)")
+    pages_prop = _dig(spec, "properties", "pages")
+    if pages_prop is _MISSING:
+        errors.append("properties.pages: missing (round-13 BOOK page list)")
+    elif not isinstance(pages_prop, dict):
+        errors.append(f"properties.pages: expected object got {pages_prop!r}")
+    else:
+        items = pages_prop.get("items", _MISSING)
+        if not isinstance(items, dict):
+            errors.append(f"properties.pages.items: expected object got {items!r}")
+        else:
+            _eq(errors, "properties.pages.items.$ref", "#/$defs/BookPage",
+                items.get("$ref", _MISSING))
+
+    element_prop = _dig(spec, "$defs", "Element", "properties")
+    element_required = _dig(spec, "$defs", "Element", "required")
+    if isinstance(element_prop, dict) and "page_id" not in element_prop:
+        errors.append("$defs.Element.properties.page_id: missing (round-13 page address)")
+    if isinstance(element_required, list) and "page_id" in element_required:
+        errors.append("$defs.Element.required: 'page_id' must stay OPTIONAL")
+
+    page_def = _dig(spec, "$defs", "BookPage")
+    if page_def is _MISSING:
+        errors.append("$defs.BookPage: missing (round-13 page entry)")
+    elif not isinstance(page_def, dict):
+        errors.append(f"$defs.BookPage: expected object got {page_def!r}")
+    else:
+        _eq(errors, "$defs.BookPage.required",
+            ["page_id", "index", "title"], page_def.get("required", _MISSING))
+        keys = sorted((page_def.get("properties") or {}).keys())
+        _eq(errors, "$defs.BookPage.properties", ["index", "page_id", "title"], keys)
+
+    book = _dig(spec, "x_presets", "BOOK")
+    if book is _MISSING:
+        errors.append("x_presets.BOOK: missing (round-13 bounded book preset)")
+    elif not isinstance(book, dict):
+        errors.append(f"x_presets.BOOK: expected object got {book!r}")
+    else:
+        for axis in ("width", "height"):
+            value = book.get(axis, _MISSING)
+            if value is _MISSING:
+                errors.append(f"x_presets.BOOK.{axis}: expected a number got <missing>")
+            elif not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+                errors.append(
+                    f"x_presets.BOOK.{axis}: expected a positive number (bounded) got {value!r}"
+                )
+
+    for size in BOOK_PAGE_SIZES:
+        if size not in PRESETS:
+            errors.append(f"BOOK_PAGE_SIZES: {size!r} is not an artboard preset")
+    if "INFINITE" in BOOK_PAGE_SIZES:
+        errors.append("BOOK_PAGE_SIZES: INFINITE must not be offered for a book")
+
+    # Round-13 issue 03: the Artboard preset enum must describe every preset the
+    # app can write — the paper table plus the IMAGE marker. This check exists
+    # because the gallery shipped writing `preset: "IMAGE"` while the published
+    # enum still listed only the five table presets; nothing caught it until a
+    # document was hand-validated.
+    preset_enum = _dig(spec, "$defs", "Artboard", "properties", "preset", "enum")
+    if preset_enum is _MISSING:
+        errors.append("$defs.Artboard.properties.preset.enum: missing")
+    elif not isinstance(preset_enum, list):
+        errors.append(
+            f"$defs.Artboard.properties.preset.enum: expected list got {preset_enum!r}"
+        )
+    else:
+        expected = [*PRESETS, IMAGE_PRESET]
+        _eq(errors, "$defs.Artboard.properties.preset.enum", expected, preset_enum)
+        if IMAGE_PRESET in PRESETS:
+            errors.append(
+                "PRESETS: IMAGE must not carry table dims (sized by the document)"
+            )
     return errors
 
 

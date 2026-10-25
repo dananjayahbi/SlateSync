@@ -101,9 +101,14 @@ def test_rpc_actions_mirror_doc02_exactly() -> None:
         "CANCEL_OCR",
         "OCR_PROGRESS",
         "OCR_RESULT",
+        # Doc 02 §13.1 — Round-13 image library (28 actions).
+        "GALLERY_LIST_REQUEST",
+        "GALLERY_LIST",
+        "GALLERY_ADD",
+        "GALLERY_SAVE",
     }
     assert RPC_ACTIONS == frozenset(expected)
-    assert len(RPC_ACTIONS) == 24
+    assert len(RPC_ACTIONS) == 28
 
 
 def test_rpc_types_mirror_doc02_exactly() -> None:
@@ -114,6 +119,7 @@ def test_rpc_types_mirror_doc02_exactly() -> None:
         "ASSET_UPLOAD",
         "EXPORT_JOB",
         "OCR_JOB",
+        "GALLERY",
     }
     assert RPC_TYPES == frozenset(expected)
-    assert len(RPC_TYPES) == 6
+    assert len(RPC_TYPES) == 7

@@ -193,6 +193,18 @@ def run_full() -> int:
 
     # --- 3. scene graph + document store (both self-subscribe RPC_MESSAGE) ---
     scene_graph = SceneGraph(bus)
+
+    # --- 3a-pre. Round-13 image library (Doc 02 §13.1) ----------------------
+    # Constructed BEFORE DocumentStore on purpose: the store claims every
+    # ASSET_* envelope for the open canvas's asset folder, so the library has to
+    # register first to claim the transfers a GALLERY_ADD/GALLERY_SAVE declared.
+    # Transfers it never announced are ignored here and handled by the store.
+    from pc_agent.gallery.library_store import LibraryStore
+    from pc_agent.network.gallery_sync import GallerySync
+
+    gallery_store = LibraryStore(Path(config.appdata_dir) / "gallery")
+    gallery_sync = GallerySync(bus, gallery_store, push=server.broadcast_json)
+
     document_store = DocumentStore(bus, config, scene_graph)
 
     # --- 3a. local canvas index (Doc 02 §9.3): %APPDATA%/SlateSync/canvases
@@ -269,6 +281,26 @@ def run_full() -> int:
     ocr_coordinator.attach_document_loader(document_for_export)
     current_host["ocr"] = ocr_coordinator
 
+    # Round-13 issue 02 — make the OCR provider visible in the log at startup.
+    #
+    # ONNX Runtime demotes an unavailable provider to CPU WITHOUT raising, so a
+    # silent CPU fallback is the default failure mode and looks identical to
+    # success except for speed. Warming the engine here is cheap (it is lazy and
+    # idempotent) and turns "is the GPU being used?" into something the log
+    # answers instead of something the user has to guess.
+    try:
+        import onnxruntime
+
+        available = onnxruntime.get_available_providers()
+        logger.info("OCR runtime %s providers: %s", onnxruntime.__version__, available)
+        if "DmlExecutionProvider" not in available:
+            logger.warning(
+                "OCR: DirectML is unavailable — scans will run on the CPU. "
+                "Reinstall the SlateSync agent to restore GPU support."
+            )
+    except Exception:
+        logger.exception("OCR: could not query the ONNX Runtime providers")
+
     # --- 5. Tk root → StudioWindow → GL host (Doc 16 layout) ----------------
     root = tk.Tk()  # visible at launch (withdrawn=False)
     gl_host = GLCanvasHost(root, config, bus)
@@ -288,8 +320,47 @@ def run_full() -> int:
         select_mirror=canvas_sync.select_mirror,
         rotate_pairing=pairing.rotate_token,
         set_export_dir=manager.set_export_dir,
+        # Round-13 issue 02 — the PC's own Cancel path for an OCR job.
+        ocr_cancel=ocr_coordinator.cancel,
     )
     window.build(root)  # gridded layout; build() mounts the GL host (Doc 16 §5.4)
+
+    # --- 5a. Round-13 image library window (Doc 02 §13.1) ------------------
+    # Opened with Ctrl+Shift+G from anywhere in the app. It is deliberately a
+    # SEPARATE non-modal toplevel that can be used with no canvas open, and
+    # closing it must not end the session — so it owns its own instance slot and
+    # its own WM_DELETE_WINDOW handler (see gui/gallery_window.py).
+    from pc_agent.gui.gallery_window import GalleryWindow
+
+    gallery_state: dict[str, GalleryWindow | None] = {"window": None}
+
+    def open_gallery(_event: object = None) -> None:
+        existing = gallery_state["window"]
+        if existing is not None and existing.exists():
+            existing.show()
+            return
+        gallery_state["window"] = GalleryWindow(
+            root,
+            bus,
+            gallery_store,
+            on_close=lambda: gallery_state.update(window=None),
+            # The window is created withdrawn (dialog_utils.make_toplevel keeps
+            # it hidden so it can be positioned before mapping), so opening it
+            # must ask for it to be shown.
+            auto_show=True,
+        )
+
+    def close_gallery() -> None:
+        existing = gallery_state["window"]
+        if existing is not None:
+            existing.close()
+
+    for sequence in ("<Control-Shift-G>", "<Control-Shift-g>"):
+        try:
+            root.bind_all(sequence, open_gallery)
+        except tk.TclError:  # pragma: no cover - binding unavailable
+            logger.debug("gallery hotkey bind failed", exc_info=True)
+
     if pairing_info:  # replay the pre-GUI PAIRING_INFO for the window
         bus.emit(PAIRING_INFO, **pairing_info)
     # Round 5: seed the gallery/HUD with the persisted hub store (§9.2) — the
@@ -383,6 +454,8 @@ def run_full() -> int:
         tray.stop()  # skips its own thread when called from pystray (Doc 17)
         canvas_sync.shutdown()  # symmetric with its constructor subscription
         ocr_coordinator.shutdown()  # drop any in-flight scan + its VRAM
+        gallery_sync.shutdown()  # drop unfinished library uploads
+        close_gallery()
         server.stop()
         pairing.stop()
         if threading.current_thread() is threading.main_thread():
