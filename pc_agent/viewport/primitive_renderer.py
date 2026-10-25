@@ -26,6 +26,11 @@ from PIL import Image, ImageDraw, ImageFont
 
 from pc_agent.viewport.shape_fill import shape_is_filled
 from pc_agent.viewport.stroke_fill import stroke_fill_polygon_of
+from pc_agent.viewport.text_renderer import (
+    is_text_shape,
+    rasterise_text,
+    text_config,
+)
 from pc_agent.viewport.vector_geometry import (
     outline_segments,
     points_of,
@@ -736,6 +741,8 @@ class PrimitiveRenderer:
         self._missing_reported: set[str] = set()
         self._glyph_tex: moderngl.Texture | None = None
         self._placeholder_tex: moderngl.Texture | None = None
+        #: Round-12 issue 05 — baked TEXT rasters, keyed on text + style + box.
+        self._text_cache: dict[tuple[object, ...], moderngl.Texture] = {}
         self.applied_scissor: tuple[int, int, int, int] | None = None
         self.scissor_enabled: bool = False
         # Doc 06 stems — ProgramRegistry pairs <stem>.vert + <stem>.frag itself.
@@ -794,6 +801,7 @@ class PrimitiveRenderer:
             or _stroke_fill_interior(node) is not None
         ]
         graphs = [node for node in ordered if getattr(node, "kind", "") == "GRAPH_AXES"]
+        texts = [node for node in ordered if _is_text_node(node)]
         # Frozen phase order (Doc 08 §4): background → shadow → images → shapes → graphs.
         self._draw_background(artboard, cam, view_w, view_h)
         # Background clipping stays a phase-1 concern (the grid shader keeps its
@@ -805,6 +813,10 @@ class PrimitiveRenderer:
         self._draw_images(images, cam, view_w, view_h)
         self._draw_shapes(shapes, cam, view_w, view_h)
         self._draw_graphs(graphs, cam, view_w, view_h)
+        # Round-12 issue 05 — glyphs ride the texture stream (the primitive
+        # shader has no font sampler), so they are a separate appended pass
+        # rather than part of the shape batch above.
+        self._draw_texts(texts, cam, view_w, view_h)
         self._restore_state()
 
     def release(self) -> None:
@@ -1147,6 +1159,17 @@ class PrimitiveRenderer:
                 fill_rgba,
                 rgba,
             )
+        elif is_text_shape(shape_type):
+            # Round-12 issue 05 — a text box is a SHAPE with its content in
+            # graph_config, so this pass only paints the interior; the glyphs
+            # are a texture (see `_draw_texts`) because the primitive shader
+            # has no way to sample a font. No bbox outline: a rectangle drawn
+            # around body text is not what the user asked for, and the
+            # selector already shows the frame while the node is selected.
+            if fill_rgba or filled:
+                corners = rect_corners(None, bbox)
+                if corners is not None:
+                    _push_tri(fills, rect_triangles(corners), fill_rgba or rgba)
         # Unknown shape_type (incl. graph types on SHAPE nodes) — skipped per Doc 08 §4.
 
     def _tessellate_stroke_fill(self, node: "CanvasNode", fills: list[float]) -> None:
@@ -1260,6 +1283,89 @@ class PrimitiveRenderer:
                     atlas.use(location=0)
                     vao.render(moderngl.TRIANGLES, vertices=tex.vertex_count)
                     tex.clear()
+
+    # ------------------------------------------------------------------
+    # Phase 6 — text boxes (round-12 issue 05)
+    # ------------------------------------------------------------------
+
+    def _draw_texts(
+        self,
+        texts: list["CanvasNode"],
+        camera: tuple[float, float, float],
+        view_w: int,
+        view_h: int,
+    ) -> None:
+        """Paints a TEXT node's glyphs as a tinted quad.
+
+        Text cannot join the primitive batch: the vertex shader carries a flat
+        colour, and a font is a sampled texture. Baking the whole box into one
+        RGBA raster (WHITE + alpha) and tinting it through the existing
+        ``u_tint`` uniform means one cached texture serves every colour and
+        both blend modes, and the batching path stays untouched.
+        """
+        if not texts:
+            return
+        stream = self._tex_stream
+        for node in texts:
+            texture = self._text_texture(node)
+            if texture is None:
+                continue
+            corners = rect_corners(None, getattr(node, "bbox", (0.0, 0.0, 0.0, 0.0)))
+            if corners is None:
+                continue
+            x0, y0, x1, y1 = corners
+            style = getattr(node, "style", None)
+            tint = parse_color(
+                getattr(style, "color", "#1E1E1E"), float(getattr(style, "opacity", 1.0) or 1.0)
+            )
+            stream.extend(
+                [
+                    x0, y0, 0.0, 0.0,
+                    x1, y0, 1.0, 0.0,
+                    x1, y1, 1.0, 1.0,
+                    x0, y0, 0.0, 0.0,
+                    x1, y1, 1.0, 1.0,
+                    x0, y1, 0.0, 1.0,
+                ]
+            )
+            blend = _blend_of(node)
+            vao = stream.upload()
+            if vao is None:
+                continue
+            self._set(self._tex_prog, "u_camera", camera)
+            self._set(self._tex_prog, "u_viewport", (float(view_w), float(view_h)))
+            self._set(self._tex_prog, "u_tint", tint)
+            self._set(self._tex_prog, "u_blendMode", blend)
+            self._set(self._tex_prog, "u_tex", 0)
+            self._apply_blend(blend)
+            texture.use(location=0)
+            vao.render(moderngl.TRIANGLES, vertices=stream.vertex_count)
+            stream.clear()
+
+    def _text_texture(self, node: "CanvasNode") -> "moderngl.Texture | None":
+        """Cached glyph raster for one node; ``None`` when it paints no ink.
+
+        Keyed on everything the raster depends on — the text, its size, its
+        alignment and the box — because re-baking every frame would re-run
+        cairo inside the render loop, which is exactly what the glyph atlas
+        approach exists to avoid.
+        """
+        geometry = getattr(node, "geometry", None)
+        config = text_config(getattr(geometry, "graph_config", None))
+        box = _text_box(getattr(node, "bbox", (0.0, 0.0, 0.0, 0.0)))
+        if config.is_empty or box is None:
+            return None
+        key = (config.text, config.font_size, config.align, *box)
+        cached = self._text_cache.get(key)
+        if cached is not None:
+            return cached
+        image = rasterise_text(config, box)
+        if image is None:
+            return None
+        texture = self._ctx.texture(image.size, 4, image.tobytes())
+        texture.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        self._text_cache[key] = texture
+        return texture
 
     # ------------------------------------------------------------------
     # Emission helpers
@@ -1391,6 +1497,12 @@ class PrimitiveRenderer:
                 logger.debug("image texture release failed", exc_info=True)
         self._image_cache.clear()
         self._missing_reported.clear()
+        for texture in self._text_cache.values():
+            try:
+                texture.release()
+            except Exception:  # pragma: no cover - defensive
+                logger.debug("text texture release failed", exc_info=True)
+        self._text_cache.clear()
         if self._placeholder_tex is not None:
             try:
                 self._placeholder_tex.release()
@@ -1408,6 +1520,30 @@ def _blend_of(node: object) -> int:
     style = getattr(node, "style", None)
     mode = str(getattr(style, "blend_mode", "SRC_OVER") or "SRC_OVER")
     return 1 if mode == "MULTIPLY" else 0
+
+
+def _is_text_node(node: object) -> bool:
+    """``True`` when ``node`` is the round-12 TEXT box shape.
+
+    Checked through ``kind`` as well as ``shape_type``: a text box is a SHAPE,
+    so this must not claim a STROKE that happens to carry a stale shape_type.
+    """
+    if str(getattr(node, "kind", "") or "") != "SHAPE":
+        return False
+    geometry = getattr(node, "geometry", None)
+    return is_text_shape(getattr(geometry, "shape_type", None))
+
+
+def _text_box(bbox: object) -> tuple[float, float, float, float] | None:
+    """Normalised world rect of a TEXT node, or ``None`` when unusable."""
+    try:
+        x0, y0, x1, y1 = (float(value) for value in bbox)  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(value) for value in (x0, y0, x1, y1)):
+        return None
+    return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+
 
 
 def _flat_quad(x0: float, y0: float, x1: float, y1: float) -> list[float]:

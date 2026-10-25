@@ -32,6 +32,7 @@ from pc_agent.core.config_manager import AppConfig
 from pc_agent.engine.document_store import Artboard, CanvasDocument, artboard_is_infinite
 from pc_agent.engine.scene_graph import CanvasNode
 from pc_agent.export.cairo_shapes import apply_fill, apply_stroke_fill, trace_shape
+from pc_agent.viewport.text_renderer import draw_text_box, is_text_shape
 
 #: Export strip size in px (template §3 "Export strips").
 STRIP_PX: int = 2048
@@ -321,6 +322,18 @@ def _draw_shape(ctx: cairo.Context, node: CanvasNode) -> None:
     # TABLE grids all come from the shared cairo helper so this exporter cannot
     # drift from the viewport or the other two exporters.
     apply_fill(ctx, style, shape, box, node.geometry.pts, node.geometry.graph_config)
+    if is_text_shape(shape):
+        # Round-12 issue 05 — a TEXT box has no outline of its own: tracing the
+        # bbox would put a rectangle around body text the user never drew. The
+        # glyph pass owns everything inside the fill.
+        draw_text_box(
+            ctx,
+            node.geometry.graph_config,
+            box,
+            getattr(style, "color", "#1E1E1E"),
+            float(getattr(style, "opacity", 1.0) or 1.0),
+        )
+        return
     _set_color(ctx, style.color, style.opacity)
     ctx.set_line_width(max(0.5, float(style.stroke_width)))
     ctx.set_line_join(cairo.LINE_JOIN_ROUND)

@@ -1,7 +1,21 @@
-﻿Restore test fixtures deleted by flutter test.
+﻿Round 12 (part 4): OCR tool UI
 
-These PNGs are committed fixtures the badge test reads; `flutter test` wipes
-the scratch directory every run, so they disappear from the working tree
-whenever the suite runs. Restoring them so the tree is clean.
+The free-drawn selection is the point of the tool, so it is its own module
+rather than a rectangle special-case: OcrSelectionPath owns the sampling
+(dropping sub-2-unit noise, rejecting non-finite points) and the painter draws
+the loop with a soft wash so the enclosed area is obvious.
+
+OcrPanel encodes the policy that is easy to get wrong:
+
+* the whole-canvas scan is DISABLED on an infinite canvas, because there is no
+  bounded area to rasterise -- better to grey out a control than to accept the
+  tap and fail after the user waits;
+* a zero-percent job shows an INDETERMINATE bar, since rasterising a 300 DPI
+  crop reports nothing for a while and a bar stuck at 0% reads as a hang;
+* a failure says why, and "no text found" is never dressed up as success;
+* the result summary names the provider, which is the only way a user can tell
+  the GPU did the work instead of a silent CPU fallback.
+
+30 tests; flutter analyze clean.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
