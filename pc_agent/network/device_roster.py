@@ -78,6 +78,13 @@ class DeviceRoster:
         self._mirrored: str | None = None
         self._mirrored_title: str = ""
         self._mirror_source: str | None = None  # connection that opened it
+        #: Round-10 issue 02 — an explicit Settings choice wins over the
+        #: automatic "follow the owning device" rule until the user (or a
+        #: canvas deletion) clears it.
+        self._mirror_pinned: bool = False
+        #: Tablet identity behind the mirror (survives a reconnect, which gets
+        #: a fresh ``connection_id``), so the owning device keeps its claim.
+        self._mirror_device_id: str | None = None
 
     # ------------------------------------------------------------------
     # Queries
@@ -188,9 +195,14 @@ class DeviceRoster:
     ) -> bool:
         """Record that a device opened ``canvas_id``.
 
-        Returns ``True`` when this call *selected* the mirror — the first
-        canvas opened after startup (issue 07) or the first one after the
-        previous mirror owner disconnected.
+        Returns ``True`` when this call *selected* (or *moved*) the mirror.
+
+        Round-10 issue 02 — the mirror follows the device that owns it: when
+        the connection already mirrored switches to another canvas, the mirror
+        moves with it (the PC is the orchestrator, so the newest open of the
+        owning device is what every other device sees). A *different* device
+        still cannot steal the mirror (round-7 issue 07), and an explicit
+        Settings choice pins it.
         """
         session = self.get(connection_id)
         if session is not None:
@@ -200,39 +212,81 @@ class DeviceRoster:
                 session.last_seen = time.time()
         if not canvas_id:
             return False
+        target = str(canvas_id)
         with self._lock:
-            if self._mirrored is not None:
+            if self._mirrored is None:
+                self._mirrored = target
+                self._mirrored_title = (title or "") or ""
+                self._mirror_source = str(connection_id) if connection_id else None
+                self._mirror_device_id = getattr(session, "device_id", None)
+                return True
+            if self._mirrored == target:
                 # Adopt the connection that owns the already-mirrored canvas
                 # (the local OPEN_CANVAS handler selects it before the server's
                 # RPC_ORIGIN event names the sender).
-                if (
-                    self._mirror_source is None
-                    and connection_id
-                    and str(self._mirrored) == str(canvas_id)
-                ):
+                if self._mirror_source is None and connection_id:
                     self._mirror_source = str(connection_id)
+                    self._mirror_device_id = getattr(session, "device_id", None)
                 return False
-            self._mirrored = str(canvas_id)
-            self._mirrored_title = (title or "") or ""
-            self._mirror_source = str(connection_id) if connection_id else None
-        return True
+            if not self._mirror_pinned and self._owns_mirror(connection_id, session):
+                # The mirrored device switched canvases — follow it.
+                self._mirrored = target
+                self._mirrored_title = (title or "") or ""
+                self._mirror_source = str(connection_id) if connection_id else None
+                self._mirror_device_id = getattr(session, "device_id", None)
+                return True
+            return False
+
+    def _owns_mirror(
+        self, connection_id: str | None, session: DeviceSession | None
+    ) -> bool:
+        """Whether ``connection_id`` is the device the mirror currently follows.
+
+        A reconnect produces a new ``connection_id`` for the same tablet, so
+        the device id is preferred over the connection key when both sides
+        have one.
+        """
+        if not connection_id:
+            return False
+        if self._mirror_source == str(connection_id):
+            return True
+        device_id = getattr(session, "device_id", None)
+        return bool(
+            self._mirror_source is None
+            and device_id
+            and self._mirror_device_id
+            and str(device_id) == str(self._mirror_device_id)
+        )
+
+    def mirror_source(self) -> str | None:
+        """Connection that owns the mirrored canvas (``None`` when unattributed)."""
+        with self._lock:
+            return self._mirror_source
 
     def select_mirror(
         self, canvas_id: str | None, title: str | None = None
     ) -> bool:
         """Force the mirrored canvas (PC Settings → device/canvas switch).
 
+        A non-``None`` selection PINS the mirror so a device switching its own
+        canvas cannot silently take it back (round-10 issue 02). Clearing the
+        selection releases the pin and lets the next open claim the mirror.
+
         Returns ``True`` when the selection actually changed.
         """
         target = str(canvas_id) if canvas_id else None
         with self._lock:
-            if target == self._mirrored:
+            pinned = target is not None
+            if target == self._mirrored and pinned == self._mirror_pinned:
                 return False
             self._mirrored = target
             self._mirrored_title = (title or "") if target else ""
             self._mirror_source = (
                 self.connection_for_canvas(target) if target else None
             )
+            owner = self._devices.get(self._mirror_source) if self._mirror_source else None
+            self._mirror_device_id = getattr(owner, "device_id", None)
+            self._mirror_pinned = pinned
         return True
 
     def mirrored_title(self) -> str:

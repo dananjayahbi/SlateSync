@@ -26,6 +26,7 @@ import 'package:flutter/material.dart';
 
 import 'package:mobile_app/canvas_engine/artboard_manager.dart'; // Doc 23
 import 'package:mobile_app/canvas_engine/camera_controller.dart'; // Doc 20
+import 'package:mobile_app/canvas_engine/lock_guard.dart'; // round-10 issue 05
 import 'package:mobile_app/canvas_engine/region_fill.dart'; // round-9 issue 04
 import 'package:mobile_app/canvas_engine/selection_groups.dart'; // round-9 issue 05
 import 'package:mobile_app/canvas_engine/selection_transform.dart'; // round-8 issue 07
@@ -458,6 +459,18 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
         return n?.kind ?? '';
       }));
 
+  /// Round-10 issue 05 — a locked selection exposes no transform affordance.
+  ///
+  /// The unlock badge stays visible (that is the ONLY way out of a lock), but
+  /// handles and drag-to-move are withdrawn so "locked" reads the same as it
+  /// behaves: nothing happens until it is unlocked.
+  bool get _selectionEditable =>
+      _selected.isNotEmpty && !anyLocked(_doc, _selected);
+
+  /// True when a gesture on the current selection may start.
+  bool get _selectionCanTransform =>
+      _selectionEditable && _selectionCanScale;
+
   Rect get _selectionRect {
     final List<List<double>> boxes = <List<double>>[
       for (final String id in _selected)
@@ -478,7 +491,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   void _onSelectDown(PointerDownEvent e) {
     final Offset world = _camera.screenToWorld(e.localPosition, _viewport);
     // 1) A resize handle of the current selection wins over everything else.
-    if (_selected.isNotEmpty && _selectionCanScale) {
+    if (_selected.isNotEmpty && _selectionCanTransform) {
       final Rect bounds = _selectionRect;
       final double grab =
           _handleHitPx / math.max(_camera.scale, 1e-6);
@@ -495,7 +508,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       }
     }
     // 2) Tapping inside the current selection starts a MOVE of it.
-    if (_selected.isNotEmpty) {
+    if (_selected.isNotEmpty && _selectionEditable) {
       final Rect bounds = _selectionRect.inflate(_tapSlopPx / math.max(_camera.scale, 1e-6));
       if (bounds.contains(world) && !_hitTopmost(world).belongsToNewNode) {
         _transformStart = world;
@@ -628,8 +641,15 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     required Rect to,
     required bool scale,
   }) {
+    // Round-10 issue 05 — a locked group refuses every tool, transforms
+    // included. All-or-nothing so a mixed selection never tears a group apart.
+    final List<String> movable = unlockedIds(_doc, _selected);
+    if (movable.isEmpty) {
+      _showHint('Locked — unlock the group with the selector tool first.');
+      return;
+    }
     _beginEdit(); // round-9 issue 03 — the whole transform is ONE undo step
-    for (final String id in List<String>.of(_selected)) {
+    for (final String id in movable) {
       final CanvasNodeModel? node = _nodeById(id);
       if (node == null) {
         continue;
@@ -655,6 +675,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
           strokeWidth: node.style.strokeWidth,
           opacity: node.style.opacity,
           blendMode: node.style.blendMode,
+          // Round-10 issue 04 — moving/resizing must not drop the fill the
+          // paint bucket applied; the style is rebuilt field-by-field here.
+          fill: node.style.fill,
         ),
         geometry: NodeGeometryModel(
           pts: pts,
@@ -697,8 +720,16 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     if (_selected.isEmpty) {
       return;
     }
+    // Round-10 issue 05 — a locked group must survive a delete. The group is
+    // removed FIRST so the honest "unlock then delete" path still works while
+    // an ordinary selection that happens to include a group is refused.
+    final List<String> deletable = unlockedIds(_doc, _selected);
+    if (deletable.isEmpty) {
+      _showHint('Locked — unlock the group with the selector tool first.');
+      return;
+    }
     _beginEdit(); // round-9 issue 03 — the whole selection is one undo step
-    for (final String id in List<String>.of(_selected)) {
+    for (final String id in deletable) {
       _deleteNode(id);
     }
     setState(() => _selected.clear());
@@ -723,6 +754,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     );
     if (target == null) {
       _showHint('Tap inside a closed shape to fill it.');
+      return;
+    }
+    // Round-10 issue 05 — the paint bucket must refuse a locked group.
+    if (isNodeLocked(_doc, target.node.nodeId)) {
+      _showHint('Locked — unlock the group with the selector tool first.');
       return;
     }
     final ToolConfig cfg = _toolConfig.value;
@@ -865,9 +901,15 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     if (!_selectionCanRotate) {
       return;
     }
+    // Round-10 issue 05 — locked groups refuse rotation like every other tool.
+    final List<String> rotatable = unlockedIds(_doc, _selected);
+    if (rotatable.isEmpty) {
+      _showHint('Locked — unlock the group with the selector tool first.');
+      return;
+    }
     const double step = math.pi / 12; // 15°
     _beginEdit(); // round-9 issue 03
-    for (final String id in List<String>.of(_selected)) {
+    for (final String id in rotatable) {
       final CanvasNodeModel? node = _nodeById(id);
       if (node == null || node.kind != 'SHAPE') {
         continue;
@@ -911,7 +953,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     }
     final String colour = _toolConfig.value.color;
     _beginEdit(); // round-9 issue 03
-    for (final String id in List<String>.of(_selected)) {
+    final List<String> fillable = unlockedIds(_doc, _selected);
+    for (final String id in fillable) {
       final CanvasNodeModel? node = _nodeById(id);
       if (node == null || !canFill(node)) {
         continue;
@@ -941,6 +984,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   void _growTable({required bool row}) {
     final CanvasNodeModel? table = _selectedTable;
     if (table == null) {
+      return;
+    }
+    // Round-10 issue 05 — the table handles are tool actions too.
+    if (isNodeLocked(_doc, table.nodeId)) {
+      _showHint('Locked — unlock the group with the selector tool first.');
       return;
     }
     final Rect box = _rectOf(table);
@@ -1324,8 +1372,15 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     final Rect probe = Rect.fromCircle(center: world, radius: radius);
     final bool elementMode =
         _toolConfig.value.eraserMode == EraserMode.element;
+    // Round-10 issue 05 — the eraser is a tool, so a locked group must be
+    // immune to it. Filtering the candidates here also keeps `_erasedInDrag`
+    // clean, so a node unlocked mid-gesture is not skipped later.
+    final Set<String> locked = lockedGroupIds(_doc);
     bool changed = false;
     for (final CanvasNodeModel node in _engine.queryVisible(probe)) {
+      if (locked.contains(node.nodeId)) {
+        continue;
+      }
       final EraseOutcome outcome = _strokeEraser.apply(
         node,
         _eraseDiscs,
@@ -1383,6 +1438,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
           strokeWidth: original.style.strokeWidth,
           opacity: original.style.opacity,
           blendMode: original.style.blendMode,
+          // Round-10 issue 04 — an eraser bite must not clear the fill of the
+          // fragments that survive it.
+          fill: original.style.fill,
         ),
         geometry: NodeGeometryModel(
           pts: pts,
@@ -2236,7 +2294,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                     viewMatrix: _camera.viewMatrix,
                     rect: shown,
                     scale: _camera.scale,
-                    showHandles: _selected.isNotEmpty && _selectionCanScale,
+                    showHandles: _selectionCanTransform,
                     marquee: _marquee,
                   );
                 },
@@ -2284,8 +2342,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                         anchor: screenTopLeft,
                         locked: _selectionLocked,
                         canLock: _selected.isNotEmpty,
-                        canRotate: _selectionCanRotate,
-                        canFill: _selectionCanFill,
+                        canRotate: _selectionCanRotate && _selectionEditable,
+                        canFill: _selectionCanFill && _selectionEditable,
                         filled: _selected.any((String id) {
                           final CanvasNodeModel? n = _nodeById(id);
                           return n != null && n.style.fill != null;
@@ -2294,7 +2352,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                         onUnlock: _unlockSelection,
                         onRotate: _rotateSelection,
                         onFill: _fillSelection,
-                        onDelete: _deleteSelection,
+                        onDelete:
+                            _selectionEditable ? _deleteSelection : null,
                       ),
                       // Round-9 issue 06 — rows are added BELOW the table and
                       // columns to its RIGHT, where a spreadsheet puts them.

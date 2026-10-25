@@ -360,6 +360,11 @@ class CanvasSyncManager:
 
         Emitted by the WS server right AFTER ``RPC_MESSAGE``, so the roster
         never gets ahead of the handlers that actually apply the envelope.
+
+        Round-10 issue 02: this is the first point where the *sender* of an
+        ``OPEN_CANVAS`` is known, which is what the mirror-follow rule needs —
+        ``_on_open_canvas`` cannot distinguish "the owned device switched
+        canvases" from "another device opened its own" without it.
         """
         if not isinstance(msg, dict):
             return
@@ -387,8 +392,34 @@ class CanvasSyncManager:
             connection_id, canvas_id, title if isinstance(title, str) else None
         ):
             # Issue 07: the FIRST canvas opened becomes the mirrored one.
+            # Issue 02 (round 10): the OWNING device switching canvases moves
+            # the mirror, so the document has to be loaded here — the
+            # RPC_MESSAGE handler persisted it without switching (§8.2 keeps
+            # a foreign open off the PC viewport). Load BEFORE announcing so
+            # MIRROR_CHANGED listeners already see the new document.
+            self._open_followed_mirror(canvas, canvas_id)
             self._roster.emit_mirror()
         self._roster.emit_devices()
+
+    def _open_followed_mirror(self, canvas: dict, canvas_id: str) -> bool:
+        """Load the canvas the mirror just moved to; ``True`` when it opened.
+
+        ``_on_open_canvas`` already opened a claimable canvas, so this is a
+        no-op unless the mirror followed its device to a canvas that handler
+        only persisted. The payload is preferred over the hub index because it
+        is the newest version the device actually has.
+        """
+        if self._current_open_id() == str(canvas_id):
+            return False
+        try:
+            self._store.open_payload(canvas)
+        except Exception:
+            logger.exception("loading the followed mirror canvas %s failed", canvas_id)
+            return False
+        if self._index is not None:
+            self._emit_list()
+            self.broadcast_hub_list()
+        return True
 
     def _on_canvas_list(self, payload: dict) -> None:
         """Device CANVAS_LIST (v2) → registry + merge → emit → hub list → pulls."""

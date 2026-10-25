@@ -548,3 +548,47 @@ PC: `network/device_roster.py`, `network/pairing_store.py`, `network/discovery_p
 `core/events.py`, `core/config_manager.py`, `main.py` + their tests. Mobile:
 `network/vector_sync_client.dart`, `features/sync/**`, `core/storage/**` + their tests.
 Docs agent: `docs/micro/**` EXCEPT the ยง5 body of Doc 02 (still schema-locked).
+
+## 12. Round-10 Amendment - Mirror Follow, Sealed Loops, Lock Enforcement (NORMATIVE)
+
+Round 10 fixed five mirror/tool defects. Only ง12.1 changes observable
+protocol behaviour; the rest are client-side rules with no new wire fields.
+
+### 12.1 The PC mirror follows the device that owns it
+
+Round 7 (ง11.2, issue 07) pinned the mirror to the FIRST opened canvas so two
+tablets on two canvases could not steal it. That rule also froze the *owning*
+device: a tablet switching from canvas A to canvas B persisted B and left the
+viewport on A, so the mirror kept A's artboard (the round-10 "background does
+not refresh" report - the pattern was stale because the *document* was stale,
+not the shader).
+
+The rule is now three-part and MUST hold together:
+
+| Actor | Result |
+| --- | --- |
+| First `OPEN_CANVAS` after startup | selects the mirror |
+| The **owning** device opens a different canvas | mirror MOVES (document loads, `MIRROR_CHANGED` fires) |
+| A **different** device opens its own canvas | persisted only, mirror untouched (round 7 preserved) |
+| `select_mirror` from Settings | PINS the mirror; the owning device can no longer move it |
+| `select_mirror(None)` | releases the pin; the next open claims the mirror again |
+
+Ownership is tracked by `connection_id` and, across a reconnect (which mints a
+new `connection_id`), by the tablet's announced `device_id`.
+
+`MIRROR_CHANGED` is emitted AFTER the followed document is loaded, so listeners
+that read the open document already see the new canvas.
+
+### 12.2 The IMAGE asset root is re-resolved per mirrored canvas
+
+`PrimitiveRenderer` resolves `geometry.asset_ref` against an injected asset
+root and keeps only the basename (`resolve_asset_path`). The root used to be
+injected from `DOCUMENT_LOADED` alone, so any canvas that became visible
+without that event rendered every IMAGE with `assets_root is None` - the bare
+filename resolved against the process working directory and the quad painted
+the 1x1 magenta placeholder.
+
+`GLCanvasHost.set_assets_root_resolver(canvas_id -> assets_dir)` now lets the
+render pass re-resolve the folder whenever the mirrored canvas id changes.
+`DOCUMENT_LOADED` injection stays (it is the warm path); the resolver is the
+self-healing fallback and MUST NOT be removed.

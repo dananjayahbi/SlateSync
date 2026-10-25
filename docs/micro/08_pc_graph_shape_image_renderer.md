@@ -258,3 +258,33 @@ what legitimately differs — colour and line width (the thumbnail scales the wi
 * `test_primitive_renderer.py::test_module_imports_only_contract_models` now whitelists
   `viewport.vector_geometry` — it is a leaf module (no GL, no engine imports), exactly like
   `shape_fill`.
+
+## 10. Round-10 Amendment - Asset Root Resolution (NORMATIVE)
+
+### 10.1 `assets_root` is resolved per mirrored canvas, not per open event
+
+�5(8) requires `PrimitiveRenderer` to resolve `geometry.asset_ref` against the
+open canvas's `assets_dir`. `resolve_asset_path(root, ref)` deliberately keeps
+only `Path(ref).name`, so the root is the only thing that decides whether an
+IMAGE draws real pixels or the 1x1 magenta placeholder.
+
+The root was previously injected from `DOCUMENT_LOADED` only. Any canvas that
+became visible without that event (a persisted-only open, a restored mirror, a
+reconnect) painted magenta permanently. Round 10 adds:
+
+* `GLCanvasHost.set_assets_root_resolver(resolver)` - injects
+  `canvas_id -> assets_dir` (`document_store.assets_dir` in production).
+* `GLCanvasHost._sync_assets_root()` - called once per render pass; re-resolves
+  and re-injects only when the mirrored canvas id changed.
+
+Both paths are kept: the event injection is the warm path, the resolver is the
+fallback. `set_assets_root` still releases cached textures on a root swap, so a
+same-named asset from another canvas can never reuse a stale texture.
+
+### 10.2 A miss is never cached
+
+Restated from round 9 (issue 07b) because it is load-bearing here: a placeholder
+miss MUST NOT be stored under the asset key. `ASSET_DONE` normally arrives after
+the IMAGE node was committed and drawn, and caching the miss pinned the magenta
+texel for the rest of the session. `invalidate_images()` on `ASSET_UPLOADED` is
+the recovery path and only works if the miss was not cached.

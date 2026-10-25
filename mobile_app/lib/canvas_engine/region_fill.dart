@@ -52,7 +52,17 @@ const double kClosureToleranceMin = 6.0;
 /// The pen samples at pointer-move rate, so "closed" can never be exact. A
 /// relative tolerance means the same gesture works at every zoom: draw a
 /// circle in one motion and the last sample lands near the first.
-bool polylineCloses(List<List<double>> pts) {
+///
+/// Round-10 issue 03 — the user's rule is "if there is no gap to leak the
+/// colour it counts as filled", and the ink has width: two endpoints one
+/// [strokeWidth] apart are sealed by the stroke itself. That width is therefore
+/// part of the tolerance, which is what makes a quick hand-drawn loop fillable.
+///
+/// A loop drawn past its own start (the natural way to close a circle) never
+/// brings the endpoints together at all — the tail crosses the head. That case
+/// is closed when the path crosses itself ([polylineSelfIntersects]), because
+/// the crossing point is a real seal: no gap exists for colour to escape.
+bool polylineCloses(List<List<double>> pts, {double strokeWidth = 0}) {
   if (pts.length < 3) {
     return false;
   }
@@ -61,12 +71,69 @@ bool polylineCloses(List<List<double>> pts) {
   if (first.length < 2 || last.length < 2) {
     return false;
   }
-  double minX = pts.first[0];
-  double maxX = minX;
-  double minY = pts.first[1];
-  double maxY = minY;
+  final double limit = closureLimit(pts, strokeWidth: strokeWidth);
+  final double gap = math.sqrt(
+    (last[0] - first[0]) * (last[0] - first[0]) +
+        (last[1] - first[1]) * (last[1] - first[1]),
+  );
+  if (gap <= limit) {
+    return true;
+  }
+  return polylineSelfIntersects(pts);
+}
+
+/// True when the path crosses itself — the "overshoot the start" loop.
+///
+/// Only the segment pairs the gesture actually swept are tested, and a crossing
+/// counts only when both segments are long enough to be intentional, so a
+/// jittery pen sample cannot fake a closed region.
+bool polylineSelfIntersects(List<List<double>> pts) {
+  if (pts.length < 5) {
+    return false;
+  }
+  final List<Offset> path = _points(pts);
+  final int count = path.length;
+  for (int i = 0; i + 1 < count; i++) {
+    for (int j = i + 2; j + 1 < count; j++) {
+      if (i == 0 && j + 1 == count - 1) {
+        continue; // the closure segment itself — adjacency, not a crossing
+      }
+      if (_segmentsCross(path[i], path[i + 1], path[j], path[j + 1])) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/// Strict segment intersection (shared endpoints do not count).
+bool _segmentsCross(Offset a, Offset b, Offset c, Offset d) {
+  final double d1 = _cross(c, d, a);
+  final double d2 = _cross(c, d, b);
+  final double d3 = _cross(a, b, c);
+  final double d4 = _cross(a, b, d);
+  return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+      ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+
+double _cross(Offset o, Offset a, Offset b) =>
+    (a.dx - o.dx) * (b.dy - o.dy) - (a.dy - o.dy) * (b.dx - o.dx);
+
+/// Distance within which a polyline's two ends count as sealed.
+double closureLimit(List<List<double>> pts, {double strokeWidth = 0}) {
+  double minX = 0;
+  double maxX = 0;
+  double minY = 0;
+  double maxY = 0;
+  bool firstPoint = true;
   for (final List<double> p in pts) {
     if (p.length < 2) {
+      continue;
+    }
+    if (firstPoint) {
+      minX = maxX = p[0];
+      minY = maxY = p[1];
+      firstPoint = false;
       continue;
     }
     if (p[0] < minX) minX = p[0];
@@ -77,12 +144,12 @@ bool polylineCloses(List<List<double>> pts) {
   final double span = math.sqrt(
     (maxX - minX) * (maxX - minX) + (maxY - minY) * (maxY - minY),
   );
-  final double gap = math.sqrt(
-    (last[0] - first[0]) * (last[0] - first[0]) +
-        (last[1] - first[1]) * (last[1] - first[1]),
+  // The stroke is strokeWidth wide, so its own ink bridges half that on each
+  // side — a full width is generous and still far below a real leak.
+  return math.max(
+    math.max(kClosureToleranceMin, span * kClosureToleranceRatio),
+    strokeWidth.abs(),
   );
-  final double limit = math.max(kClosureToleranceMin, span * kClosureToleranceRatio);
-  return gap <= limit;
 }
 
 /// The closed polygon [node] encloses, or `null` when it encloses nothing.
@@ -125,10 +192,14 @@ List<Offset>? closedPolygonFor(CanvasNodeModel node) {
     return pts.length >= 3 ? pts : null;
   }
   // STROKE / HIGHLIGHT: only a deliberately closed loop is a region.
-  if (!polylineCloses(node.geometry.pts)) {
+  //
+  // Round-10 issue 03: "closed" includes a loop whose ends are sealed by the
+  // ink width and one that overshoots its own start — see [polylineCloses].
+  if (!polylineCloses(node.geometry.pts, strokeWidth: node.style.strokeWidth)) {
     return null;
   }
-  return _points(node.geometry.pts);
+  final List<Offset> loop = _points(node.geometry.pts);
+  return loop.length >= 3 ? loop : null;
 }
 
 /// Even-odd ray cast; correct for the concave loops a pen produces.

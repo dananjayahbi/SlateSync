@@ -58,7 +58,9 @@ class SelectionActionBar extends StatelessWidget {
   final VoidCallback onUnlock;
   final VoidCallback onRotate;
   final VoidCallback onFill;
-  final VoidCallback onDelete;
+  /// Round-10 issue 05 — `null` for a locked group, so the delete control is
+  /// visibly disabled rather than silently doing nothing.
+  final VoidCallback? onDelete;
 
   static const double _size = 34;
   static const double _gap = 6;
@@ -132,7 +134,7 @@ class SelectionActionBar extends StatelessWidget {
     required String keyName,
     required IconData icon,
     required String tooltip,
-    required VoidCallback onPressed,
+    required VoidCallback? onPressed,
     Color? tint,
   }) {
     return IconButton(
@@ -142,7 +144,12 @@ class SelectionActionBar extends StatelessWidget {
       iconSize: 18,
       padding: EdgeInsets.zero,
       constraints: const BoxConstraints.tightFor(width: _size, height: _size),
-      icon: Icon(icon, color: tint ?? StudioTheme.text),
+      icon: Icon(
+        icon,
+        color: onPressed == null
+            ? StudioTheme.text.withValues(alpha: 0.35)
+            : (tint ?? StudioTheme.text),
+      ),
     );
   }
 }

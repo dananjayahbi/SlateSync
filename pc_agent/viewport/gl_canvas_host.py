@@ -34,7 +34,7 @@ import time
 import tkinter as tk
 from collections import deque
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping
 
 import moderngl
 from PIL import Image, ImageTk
@@ -381,6 +381,15 @@ class GLCanvasHost:
         #: ``assets_dir``), forwarded to PrimitiveRenderer so mirrored IMAGE
         #: nodes resolve instead of falling back to the magenta placeholder.
         self._assets_root: object = None
+        #: Round-10 issue 06 — resolver injected by ``main.py``
+        #: (``canvas_id -> assets_dir``). ``DOCUMENT_LOADED`` is not the only
+        #: way a canvas becomes visible (a persisted-only open, a restored
+        #: mirror after a reconnect), so the render pass re-asks for the folder
+        #: whenever the mirrored canvas id changes. Without this an IMAGE node
+        #: arriving on a canvas whose ``DOCUMENT_LOADED`` was missed renders
+        #: with ``assets_root is None`` — the pink-block report.
+        self._assets_root_for: Callable[[str], object] | None = None
+        self._assets_root_canvas: str | None = None
         #: Round 7 issue 06 — live element mirror. ``doc.elements`` is only the
         #: snapshot taken when the document was opened; every later
         #: COMMITTED_NODE keeps this registry current so SHAPE/GRAPH_AXES/IMAGE
@@ -592,6 +601,39 @@ class GLCanvasHost:
             setter(root)
         except Exception:
             logger.exception("PrimitiveRenderer.set_assets_root failed (Doc 08)")
+
+    def set_assets_root_resolver(self, resolver: object) -> None:
+        """Round-10 issue 06 — inject ``canvas_id -> assets_dir``.
+
+        ``DOCUMENT_LOADED`` is not the only way a canvas becomes visible, so the
+        render pass re-resolves the folder whenever the mirrored canvas id
+        changes (see :meth:`_sync_assets_root`). ``main.py`` passes
+        ``document_store.assets_dir`` here.
+        """
+        self._assets_root_for = resolver if callable(resolver) else None
+        self._assets_root_canvas = None
+
+    def _sync_assets_root(self) -> None:
+        """Re-point the image root when the mirrored canvas changed (main thread).
+
+        Cheap: one string compare per frame once the id is settled, and it makes
+        a missing ``DOCUMENT_LOADED`` self-healing instead of a permanent pink
+        block over every IMAGE node.
+        """
+        resolver = self._assets_root_for
+        if resolver is None:
+            return
+        canvas_id = self._canvas_id()
+        if not canvas_id or canvas_id == self._assets_root_canvas:
+            return
+        try:
+            root = resolver(canvas_id)
+        except Exception:
+            logger.exception("asset-root resolver failed for %s", canvas_id)
+            return
+        self._assets_root_canvas = canvas_id
+        if root != self._assets_root:
+            self.set_assets_root(root)
 
     def fit_viewport(self) -> None:
         """Doc 02 §10.5 (frozen): zoom-to-fit the open document.
@@ -1245,6 +1287,10 @@ class GLCanvasHost:
         self._ctx.enable(moderngl.BLEND)
         background = _parse_color(self._background_color(), 1.0)
         self._ctx.clear(background[0], background[1], background[2], 1.0)
+        # Round-10 issue 06: mirrored IMAGE nodes need THIS canvas's asset
+        # folder; re-resolve when the mirrored canvas changed so a missed
+        # DOCUMENT_LOADED cannot pin the magenta placeholder forever.
+        self._sync_assets_root()
         # Round 7 issue 06: mirror elements live in ``self._scene`` (refreshed
         # by COMMITTED_NODE) — falling back to ``doc.elements`` only keeps the
         # first frame of a freshly opened document identical to before. An

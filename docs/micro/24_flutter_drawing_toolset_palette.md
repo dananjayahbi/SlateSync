@@ -316,3 +316,52 @@ thinner.
   filled header bands, cairo `apply_fill`/`trace_shape`.
 * `pc_agent/tests/test_document_store.py` â€” `fill`/`groups` are optional, survive a round trip, and a
   malformed value drops rather than failing the load.
+
+## 10. Round-10 Amendment - Sealed Loops, Fill Persistence, Lock Enforcement (NORMATIVE)
+
+### 10.1 Fill: "no leak" includes ink-sealed and self-crossing loops
+
+Round 9 (§9.2) required the object to be *closed*. That was implemented as
+"the polyline's last sample is within tolerance of its first", which rejects the
+two ways people actually close a loop:
+
+* **Under-shoot** - the gesture stops one stroke-width short. The ink is
+  `strokeWidth` wide, so the two ends are already sealed by the stroke itself.
+  `polylineCloses(pts, strokeWidth:)` therefore folds `strokeWidth` into the
+  closure tolerance (`closureLimit`).
+* **Over-shoot** - the tail crosses the head (the natural way to close a
+  circle). The endpoints are far apart but the crossing point is a real seal.
+  `polylineSelfIntersects(pts)` accepts the loop when the path crosses itself.
+
+A genuinely open arc (a half circle) satisfies neither and stays unfillable.
+`closedPolygonFor` passes the node's `style.strokeWidth` through, so the rule is
+per-node. No new wire field: the fill is still `style.fill`.
+
+### 10.2 A fill survives every transform
+
+`NodeStyleModel` is rebuilt field-by-field in the transform/erase paths, so a
+fill was silently dropped by the first move, resize or eraser bite. Every
+rebuild MUST carry `node.style.fill`. The sites are `_applyTransform`,
+`_replaceWithFragments`, `_rotateSelection`, `_growTable` and `_setNodeFill`.
+
+### 10.3 A locked group refuses every tool
+
+Round 9 (§9.4) only made a group *select as one object*; nothing consulted the
+group before mutating. `canvas_engine/lock_guard.dart` is now the single rule:
+
+| Helper | Use |
+| --- | --- |
+| `anyLocked(doc, ids)` | all-or-nothing gesture gate |
+| `unlockedIds(doc, ids)` | the safe subset a gesture may mutate |
+| `unlockedNodes(doc, nodes)` | eraser candidate filter |
+| `gestureRefusal(...)` | hint text for full or partial blocks |
+
+Enforcement points, all of which MUST use the guard: transform start (no
+handles, no drag), `_applyTransform`, `_deleteSelection`, `_rotateSelection`,
+`_fillSelection`, `_fillAt`, `_eraseAt`, `_growTable`. The selector withdraws
+`showHandles` and disables the delete/rotate/fill controls for a locked
+selection; only `selection-unlock` stays live, because unlocking is the sole way
+out of a lock.
+
+An honest "unlock then delete" still works: `_deleteSelection` filters through
+`unlockedIds`, so after the group is removed the members are deletable.

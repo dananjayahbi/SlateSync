@@ -192,6 +192,11 @@ def run_full() -> int:
     root = tk.Tk()  # visible at launch (withdrawn=False)
     gl_host = GLCanvasHost(root, config, bus)
     current_host["host"] = gl_host
+    # Round-10 issue 06: the asset folder is re-resolved from the mirrored
+    # canvas inside the render pass, so an IMAGE node can never be pinned to the
+    # magenta placeholder by a missed DOCUMENT_LOADED (persisted-only open,
+    # restored mirror, reconnected device).
+    gl_host.set_assets_root_resolver(document_store.assets_dir)
     window = StudioWindow(
         config,
         bus,
