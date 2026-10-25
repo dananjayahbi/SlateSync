@@ -189,12 +189,12 @@ Future<void> _settleIo(WidgetTester tester, {int rounds = 32}) async {
 }
 
 /// Round-8 issue 04: a tool's config panel opens by pressing and holding the
-/// rail button for 2000 ms (the expandable column and its toggle are gone).
+/// rail button for 500 ms (the expandable column and its toggle are gone).
 Future<void> _holdTool(WidgetTester tester, String toolKey) async {
   final Finder button = find.byKey(ValueKey<String>(toolKey));
   final TestGesture gesture =
       await tester.startGesture(tester.getCenter(button));
-  await tester.pump(const Duration(milliseconds: 2050));
+  await tester.pump(const Duration(milliseconds: 550));
   await gesture.up();
   await tester.pumpAndSettle();
 }

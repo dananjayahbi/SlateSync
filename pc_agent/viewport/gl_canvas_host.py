@@ -395,6 +395,12 @@ class GLCanvasHost:
         #: COMMITTED_NODE keeps this registry current so SHAPE/GRAPH_AXES/IMAGE
         #: edits from a tablet actually paint in the PC mirror.
         self._scene = MirrorScene()
+        #: Round-12 issue 11 — ``_doc.elements`` is only a fallback for the first
+        #: frame of a freshly opened document. Once the mirror scene has been
+        #: synced (or explicitly cleared) the scene is the single source of
+        #: truth, so an EMPTY scene must render an empty canvas instead of
+        #: resurrecting the stale snapshot.
+        self._scene_authoritative = False
         self._committed: dict[
             str, tuple[TessellatedMesh, tuple[float, float, float, float], int]
         ] = {}
@@ -542,6 +548,7 @@ class GLCanvasHost:
         # Round 7 issue 06: elements come from the LIVE mirror registry, not
         # from the opener's snapshot, so later commits keep painting.
         self._scene.reset(getattr(doc, "elements", None) if doc is not None else None)
+        self._scene_authoritative = doc is not None
         if doc is not None:
             self._artboard = getattr(doc, "artboard", self._artboard)
             bounds = getattr(doc, "content_bounds", None)
@@ -846,6 +853,35 @@ class GLCanvasHost:
     def _on_camera_delta(self, frame: LiveFrame) -> None:
         self.set_camera_live(frame.f1, frame.f2, frame.f3)
 
+    def _reset_renderer_scissor(self) -> None:
+        """Round-12 issue 07 — ask the renderer to forget its artboard scissor."""
+        reset = getattr(self._primitive, "reset_scissor", None)
+        if not callable(reset):
+            return
+        try:
+            reset()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("renderer scissor reset failed")
+
+    def _nodes_to_render(self) -> list[object]:
+        """The node list one frame draws — round-12 issue 11.
+
+        ``self._scene`` is the live mirror and is authoritative as soon as it has
+        been synced from a document (or explicitly cleared). ``doc.elements`` is
+        only a bootstrap fallback for the very first frame of a freshly opened
+        document.
+
+        The bug this fixes: the fallback used to be keyed on the scene being
+        EMPTY, which is indistinguishable from "not synced yet". After a
+        ``CLEAR_CANVAS`` the scene is legitimately empty, so the stale
+        ``doc.elements`` snapshot was drawn straight back over the clear and the
+        mirror never visibly emptied.
+        """
+        nodes = list(self._scene.nodes())
+        if nodes or self._scene_authoritative:
+            return nodes
+        return list(getattr(self._doc, "elements", None) or [])
+
     def _on_document_loaded(self, doc: CanvasDocument) -> None:
         self.set_document(doc)
 
@@ -870,11 +906,26 @@ class GLCanvasHost:
         self.request_redraw()
 
     def _on_canvas_cleared(self, canvas_id=None, **_extra) -> None:
-        """Round 7 issue 06: a CLEAR_CANVAS wipes the mirrored element set too."""
+        """Round 7 issue 06: a CLEAR_CANVAS wipes the mirrored element set too.
+
+        Round-12 issue 11: the scene also becomes authoritative here, and the
+        opened-document snapshot is emptied. Emptiness can then never be read as
+        "not synced yet", which is what made the stale snapshot reappear and the
+        mirror look uncleared.
+        """
         self._scene.clear()
+        self._scene_authoritative = True
         self._committed.clear()
         self._pending_nodes = []
         self._content_bounds = {}
+        doc = self._doc
+        if doc is not None:
+            elements = getattr(doc, "elements", None)
+            if isinstance(elements, list):
+                elements.clear()
+            bounds = getattr(doc, "content_bounds", None)
+            if isinstance(bounds, dict):
+                bounds.clear()
         self.request_redraw()
 
     def _on_asset_uploaded(self, canvas_id=None, filename=None, **_extra) -> None:
@@ -1264,6 +1315,10 @@ class GLCanvasHost:
             self._fbo.use()
         self._sync_pending()
         self._ctx.viewport = (0, 0, width, height)
+        # Round-12 issue 07: after a canvas switch the renderer may still hold a
+        # scissor box measured against the PREVIOUS page. Force a clean slate so
+        # the new artboard's first frame starts unclipped.
+        self._reset_renderer_scissor()
         # Issue 02 round 6 — full-viewport clear with the stale artboard
         # scissor box RESET first:
         #   • PrimitiveRenderer phase 1 stores its artboard box on the bound
@@ -1302,9 +1357,7 @@ class GLCanvasHost:
         if artboard is None and len(self._scene):
             artboard = MirrorArtboard()
         if self._primitive is not None and artboard is not None:
-            nodes = self._scene.nodes()
-            if not nodes:
-                nodes = list(getattr(self._doc, "elements", None) or [])
+            nodes = self._nodes_to_render()
             bounds = self._content_bounds or dict(
                 getattr(self._doc, "content_bounds", None) or {}
             )

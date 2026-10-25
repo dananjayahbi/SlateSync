@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:mobile_app/features/tools/tool_palette_dock.dart';
 
-/// Round-6 (Doc 02 §10.7): the custom 2000 ms hold gesture (Flutter's
+/// Round-6 (Doc 02 §10.7): the custom 500 ms hold gesture (Flutter's
 /// ~500 ms onLongPress is never used), its cancellation rules, and the
 /// Clear-canvas confirmation dialog gating the seeded `onClearRequested`
 /// callback. All timing runs on the widget test's fake async clock.
@@ -40,9 +40,9 @@ void main() {
     );
   }
 
-  group('press-and-hold 2000 ms opens the property panel (Doc 02 §10.7)', () {
+  group('press-and-hold 500 ms opens the property panel (Doc 02 §10.7)', () {
     testWidgets(
-      'hold for exactly 2000 ms opens the panel AND selects the tool; a '
+      'hold for exactly 500 ms opens the panel AND selects the tool; a '
       'quick tap never opens it',
       (WidgetTester tester) async {
         final ValueNotifier<ToolConfig> config = ValueNotifier<ToolConfig>(
@@ -53,21 +53,21 @@ void main() {
         );
         await pumpDock(tester, config: config, tool: tool);
 
-        // Quick tap: selects, and 2100 fake ms later nothing has opened.
+        // Quick tap: selects, and 600 fake ms later nothing has opened.
         await tester.tap(find.byKey(toolHighlighter));
         await tester.pumpAndSettle();
         expect(tool.value, StudioTool.highlighter);
-        await tester.pump(const Duration(milliseconds: 2100));
+        await tester.pump(const Duration(milliseconds: 600));
         expect(find.byKey(overlayPanel), findsNothing);
 
         // Hold pen: still closed one millisecond before the deadline…
         final TestGesture gesture = await tester.startGesture(
           tester.getCenter(find.byKey(toolPen)),
         );
-        await tester.pump(const Duration(milliseconds: 1999));
+        await tester.pump(const Duration(milliseconds: 499));
         expect(find.byKey(overlayPanel), findsNothing);
 
-        // …and open exactly at 2000 ms (custom Timer, not onLongPress).
+        // …and open exactly at 500 ms (custom Timer, not onLongPress).
         // The frame from this pump already includes the fired timer.
         await tester.pump(const Duration(milliseconds: 1));
         expect(find.byKey(overlayPanel), findsOneWidget);
@@ -85,7 +85,7 @@ void main() {
     );
 
     testWidgets(
-      'pointer-up before 2000 ms cancels the pending hold timer',
+      'pointer-up before 500 ms cancels the pending hold timer',
       (WidgetTester tester) async {
         final ValueNotifier<ToolConfig> config = ValueNotifier<ToolConfig>(
           ToolConfig(),
@@ -98,13 +98,13 @@ void main() {
         final TestGesture gesture = await tester.startGesture(
           tester.getCenter(find.byKey(toolRect)),
         );
-        await tester.pump(const Duration(milliseconds: 1500));
+        await tester.pump(const Duration(milliseconds: 300));
         await gesture.up();
         await tester.pump();
 
-        // Well past the original 2000 ms deadline: no panel, and the tap
-        // portion of the gesture still selected the tool.
-        await tester.pump(const Duration(milliseconds: 2600));
+        // Well past the 500 ms deadline: no panel, and the tap portion of the
+        // gesture still selected the tool.
+        await tester.pump(const Duration(milliseconds: 600));
         expect(find.byKey(overlayPanel), findsNothing);
         expect(tool.value, StudioTool.rect);
       },
@@ -125,7 +125,7 @@ void main() {
         final TestGesture gestureA = await tester.startGesture(
           tester.getCenter(find.byKey(toolPen)),
         );
-        await tester.pump(const Duration(milliseconds: 1000));
+        await tester.pump(const Duration(milliseconds: 200));
         final TestGesture gestureB = await tester.startGesture(
           tester.getCenter(find.byKey(toolHighlighter)),
         );
@@ -133,12 +133,12 @@ void main() {
         await tester.pump();
 
         // A's timer was cancelled by B's pointer-down: at A's original
-        // deadline (t = 2000 ms) nothing opens.
-        await tester.pump(const Duration(milliseconds: 1500));
+        // deadline nothing opens.
+        await tester.pump(const Duration(milliseconds: 200));
         expect(find.byKey(overlayPanel), findsNothing);
 
-        // B's own hold completes at its full 2000 ms and opens.
-        await tester.pump(const Duration(milliseconds: 500));
+        // B's own hold completes at its full 500 ms and opens.
+        await tester.pump(const Duration(milliseconds: 400));
         await tester.pump();
         expect(find.byKey(overlayPanel), findsOneWidget);
         expect(tool.value, StudioTool.highlighter);
@@ -162,7 +162,7 @@ void main() {
         final TestGesture first = await tester.startGesture(
           tester.getCenter(find.byKey(toolPen)),
         );
-        await tester.pump(const Duration(milliseconds: 2000));
+        await tester.pump(const Duration(milliseconds: 500));
         await tester.pump();
         expect(find.byKey(overlayPanel), findsOneWidget);
         await first.up();
@@ -195,7 +195,7 @@ void main() {
         final TestGesture gesture = await tester.startGesture(
           tester.getCenter(find.byKey(toolPen)),
         );
-        await tester.pump(const Duration(milliseconds: 2000));
+        await tester.pump(const Duration(milliseconds: 500));
         await tester.pump();
         await gesture.up();
         await tester.pump();

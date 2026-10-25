@@ -19,11 +19,11 @@ void main() {
 
   /// Round-8 issue 04: the expandable side panel and its `dock-toggle` are
   /// gone — a tool's configuration is reached by pressing and holding that
-  /// tool for 2000 ms. Shared by every widget test that needs the panel.
+  /// tool for 500 ms. Shared by every widget test that needs the panel.
   Future<void> openPanel(WidgetTester tester, [StudioTool tool = StudioTool.pen]) async {
     final Finder button = find.byKey(ValueKey<String>('tool-${tool.name}'));
     final TestGesture gesture = await tester.startGesture(tester.getCenter(button));
-    await tester.pump(const Duration(milliseconds: 2050));
+    await tester.pump(const Duration(milliseconds: 550));
     await gesture.up();
     await tester.pumpAndSettle();
   }
@@ -414,7 +414,7 @@ void main() {
       await pumpDock(tester, config: config, tool: tool);
 
       // Round-8 issue 04: there is no expandable sub-panel and no toggle —
-      // the only way in is the 2000 ms press-and-hold on the tool itself.
+      // the only way in is the 500 ms press-and-hold on the tool itself.
       expect(find.byKey(dockPanel), findsNothing);
       expect(find.byKey(const ValueKey<String>('dock-toggle')), findsNothing);
 
@@ -594,10 +594,8 @@ void main() {
       await tester.tap(
         find.byKey(const ValueKey<String>('tool-cartesianGraph')),
       );
-      await tester.pump();
-      await openPanel(tester, StudioTool.cartesianGraph);
-      await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey<String>('open-cartesian')));
+      // Round-12 issue 04: selecting a graph tool opens its builder directly —
+      // the panel → "Open Graph Builder…" detour is no longer required.
       await tester.pumpAndSettle();
       expect(find.text('Cartesian Graph Builder'), findsOneWidget);
 
@@ -652,10 +650,7 @@ void main() {
       );
 
       await tester.tap(find.byKey(const ValueKey<String>('tool-numberLine')));
-      await tester.pump();
-      await openPanel(tester, StudioTool.numberLine);
-      await tester.pumpAndSettle();
-      await tester.tap(find.byKey(const ValueKey<String>('open-numberline')));
+      // Round-12 issue 04: the builder opens straight from selection.
       await tester.pumpAndSettle();
       expect(find.text('Number Line Builder'), findsOneWidget);
 

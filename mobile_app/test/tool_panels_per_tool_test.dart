@@ -29,7 +29,7 @@ void main() {
     );
   }
 
-  /// Press [toolKey], hold for exactly 2000 ms on the fake test clock, and
+  /// Press [toolKey], hold for exactly 500 ms on the fake test clock, and
   /// release — the Doc 02 §10.7 gesture that opens the property overlay.
   Future<TestGesture> holdOpenPanel(
     WidgetTester tester,
@@ -38,7 +38,7 @@ void main() {
     final TestGesture gesture = await tester.startGesture(
       tester.getCenter(find.byKey(toolKey)),
     );
-    await tester.pump(const Duration(milliseconds: 2000));
+    await tester.pump(const Duration(milliseconds: 500));
     await tester.pump(); // build the overlay entry
     await gesture.up();
     await tester.pump();
@@ -149,19 +149,27 @@ void main() {
         expect(config.value.eraserMode, EraserMode.brush);
 
         // Graph tools: accent blue @ 2.0.
+        //
+        // Round-12 issue 04: selecting a graph tool opens its builder dialog,
+        // which is modal and covers the dock — so it must be dismissed before
+        // another tool can be tapped (exactly what a user does).
         await tester.tap(
           find.byKey(const ValueKey<String>('tool-cartesianGraph')),
         );
-        await tester.pump();
+        await tester.pumpAndSettle();
         expect(config.value.color, '#4F8EF7');
         expect(config.value.width, 2.0);
+        await tester.tap(find.byKey(const ValueKey<String>('graph-cancel')));
+        await tester.pumpAndSettle();
 
         await tester.tap(
           find.byKey(const ValueKey<String>('tool-numberLine')),
         );
-        await tester.pump();
+        await tester.pumpAndSettle();
         expect(config.value.color, '#4F8EF7');
         expect(config.value.width, 2.0);
+        await tester.tap(find.byKey(const ValueKey<String>('graph-cancel')));
+        await tester.pumpAndSettle();
 
         // Image: unchanged defaults.
         await tester.tap(find.byKey(const ValueKey<String>('tool-image')));

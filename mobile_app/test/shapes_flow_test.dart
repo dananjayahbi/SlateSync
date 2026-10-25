@@ -98,11 +98,11 @@ Future<void> _pumpStudio(WidgetTester tester, _FakeSyncClient client) async {
 }
 
 /// Round-8 issue 04: the tool's config panel opens by pressing and holding the
-/// rail button for 2000 ms (the expandable column and its toggle are gone).
+/// rail button for 500 ms (the expandable column and its toggle are gone).
 Future<void> _holdTool(WidgetTester tester, String toolKey) async {
   final Finder button = find.byKey(ValueKey<String>(toolKey));
   final TestGesture gesture = await tester.startGesture(tester.getCenter(button));
-  await tester.pump(const Duration(milliseconds: 2050));
+  await tester.pump(const Duration(milliseconds: 550));
   await gesture.up();
   await tester.pumpAndSettle();
 }
@@ -395,9 +395,9 @@ void main() {
     final _FakeSyncClient client = _FakeSyncClient();
     await _pumpStudio(tester, client);
 
-    // Round-8 issue 04: the config panel opens by holding the tool.
-    await _holdTool(tester, 'tool-cartesianGraph');
-    await tester.tap(find.byKey(const ValueKey<String>('open-cartesian')));
+    // Round-12 issue 04: selecting the graph tool opens its builder directly —
+    // the press-and-hold → "Open Graph Builder…" detour is gone.
+    await tester.tap(find.byKey(const ValueKey<String>('tool-cartesianGraph')));
     await tester.pumpAndSettle();
     expect(find.byKey(const ValueKey<String>('graph-confirm')), findsOneWidget);
     await tester.tap(find.byKey(const ValueKey<String>('graph-confirm')));
@@ -443,8 +443,8 @@ void main() {
     final _FakeSyncClient client = _FakeSyncClient();
     await _pumpStudio(tester, client);
 
-    await _holdTool(tester, 'tool-numberLine');
-    await tester.tap(find.byKey(const ValueKey<String>('open-numberline')));
+    // Round-12 issue 04: selecting the graph tool opens its builder directly.
+    await tester.tap(find.byKey(const ValueKey<String>('tool-numberLine')));
     await tester.pumpAndSettle();
     await tester.tap(find.byKey(const ValueKey<String>('graph-confirm')));
     await tester.pumpAndSettle();

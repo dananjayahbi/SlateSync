@@ -133,12 +133,12 @@ Future<void> _selectElementEraser(WidgetTester tester) async {
   await tester.pumpAndSettle();
 }
 
-/// Round-8 issue 04: a tool's config panel opens by holding it for 2000 ms.
+/// Round-8 issue 04: a tool's config panel opens by holding it for 500 ms.
 Future<void> _holdTool(WidgetTester tester, String toolKey) async {
   final Finder button = find.byKey(ValueKey<String>(toolKey));
   final TestGesture gesture =
       await tester.startGesture(tester.getCenter(button));
-  await tester.pump(const Duration(milliseconds: 2050));
+  await tester.pump(const Duration(milliseconds: 550));
   await gesture.up();
   await tester.pumpAndSettle();
 }

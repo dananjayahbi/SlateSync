@@ -256,9 +256,22 @@ class ToolDock extends StatefulWidget {
 class _ToolDockState extends State<ToolDock> {
   static const double _panelWidth = toolPanelWidth;
 
+  /// Round-12 issue 04 — the graph tool whose builder dialog is currently open.
+  ///
+  /// A single tap reaches `_selectTool` twice (pointer-up hold cancel, then
+  /// `IconButton.onPressed`); this makes the second call a no-op instead of
+  /// stacking a duplicate dialog.
+  StudioTool? _builderOpenFor;
+
   /// Doc 02 §10.7: press-and-hold duration. A CUSTOM [Timer] — Flutter's
-  /// ~500 ms `onLongPress` is intentionally never used for this flow.
-  static const Duration _holdDuration = Duration(milliseconds: 2000);
+  /// `onLongPress` is intentionally never used for this flow.
+  ///
+  /// Round 12 issue 02: the 2000 ms hold felt like a dead press, so it is now
+  /// 500 ms. Keeping the custom timer (rather than switching to
+  /// `onLongPress`) matters: the timer is cancelled on pointer-up, on drag
+  /// slop and on any other pointer-down, which is what lets a quick tap still
+  /// select the tool.
+  static const Duration _holdDuration = Duration(milliseconds: 500);
 
   /// Pointer-move slop that reclassifies a press as a scroll/drag and thus
   /// cancels a pending hold.
@@ -342,6 +355,40 @@ class _ToolDockState extends State<ToolDock> {
       _closePropertyPanel();
       _anchorPropertyPanel(next);
     }
+    _openBuilderFor(next);
+  }
+
+  /// Round-12 issue 04 — tools that have NO drag gesture must open their
+  /// builder the moment they are selected.
+  ///
+  /// A graph has no meaningful "drag a box to create it" gesture: its geometry
+  /// comes entirely from a config dialog, and `shape_type` is null for both
+  /// graph tools, so the canvas dispatch deliberately ignores a drag. Before
+  /// this, selecting "Number Line" or "Cartesian Graph" did nothing at all —
+  /// the only way in was a press-and-hold to open the property panel and then
+  /// finding "Open Graph Builder…" inside it, which reads as "the tool is
+  /// broken".
+  ///
+  /// The table already worked this way (its popup opens with the tool).
+  ///
+  /// [_builderOpenFor] guards re-entry: a single tap reaches `_selectTool`
+  /// TWICE (once from the pointer-up hold cancel and once from
+  /// `IconButton.onPressed`), which would otherwise stack two dialogs and make
+  /// every key inside them ambiguous.
+  void _openBuilderFor(StudioTool tool) {
+    if (!mounted || _builderOpenFor == tool) {
+      return;
+    }
+    switch (tool) {
+      case StudioTool.cartesianGraph:
+        _builderOpenFor = tool;
+        _showCartesianDialog();
+      case StudioTool.numberLine:
+        _builderOpenFor = tool;
+        _showNumberLineDialog();
+      default:
+        break;
+    }
   }
 
   /// Compact rail buttons: 15×40 dp + divider + the clear button must fit a
@@ -360,10 +407,10 @@ class _ToolDockState extends State<ToolDock> {
 
   // ---------------------------------------------------------------------
   // Round-6 (Doc 02 §10.7): tap = select instantly; press-and-hold for
-  // exactly 2000 ms (custom Timer armed on pointer-down — NOT Flutter's
-  // ~500 ms onLongPress) opens that tool's property panel. The timer is
-  // cancelled on pointer-up/cancel, on drag-slop, on any other pointer-down
-  // inside the dock rail, on toggle, and on dispose.
+  // 500 ms (custom Timer armed on pointer-down — NOT Flutter's onLongPress)
+  // opens that tool's property panel. The timer is cancelled on
+  // pointer-up/cancel, on drag-slop, on any other pointer-down inside the
+  // dock rail, on toggle, and on dispose.
   // ---------------------------------------------------------------------
 
   void _startHold(StudioTool tool, Offset position) {
@@ -375,7 +422,7 @@ class _ToolDockState extends State<ToolDock> {
     }
     _holdPendingTool = tool;
     _holdStart = position;
-    setState(() => _pressingTool = tool); // subtle 2 s press affordance
+    setState(() => _pressingTool = tool); // subtle press affordance
     _holdTimer = Timer(_holdDuration, () {
       _holdTimer = null;
       if (!mounted || _holdPendingTool != tool) {
@@ -392,10 +439,10 @@ class _ToolDockState extends State<ToolDock> {
     // finger lifting must not abort an in-flight hold elsewhere.
     if (_holdPendingTool == tool) {
       _cancelHold();
-      // Release before 2000 ms resolves as a tap-select. The InkWell tap
-      // alone is not enough: after ~500 ms the button tooltip's long-press
-      // recognizer claims the gesture arena and sacrifices the tap, so the
-      // aborted hold must select explicitly to keep "tap = select" intact.
+      // Release before the hold deadline resolves as a tap-select. The InkWell
+      // tap alone is not enough: the button tooltip's long-press recognizer
+      // claims the gesture arena and sacrifices the tap, so the aborted hold
+      // must select explicitly to keep "tap = select" intact.
       _selectTool(tool);
     }
     if (_pressingTool == tool && mounted) {
@@ -425,7 +472,7 @@ class _ToolDockState extends State<ToolDock> {
     }
   }
 
-  /// Doc 02 §10.7 design choice (documented): the 2000 ms hold ALSO SELECTS
+  /// Doc 02 §10.7 design choice (documented): the press-and-hold ALSO SELECTS
   /// the held tool first, then opens its property panel — so the overlay
   /// can never show one tool's rows against another tool's config.
   void _openPropertyPanel(StudioTool tool) {
@@ -619,7 +666,7 @@ class _ToolDockState extends State<ToolDock> {
         onConfirm: (Map<String, dynamic> config) =>
             widget.onGraphCommitted?.call('CARTESIAN_2D', config),
       ),
-    );
+    ).whenComplete(_clearBuilderGuard);
   }
 
   void _showNumberLineDialog() {
@@ -630,7 +677,13 @@ class _ToolDockState extends State<ToolDock> {
         onConfirm: (Map<String, dynamic> config) =>
             widget.onGraphCommitted?.call('NUMBER_LINE', config),
       ),
-    );
+    ).whenComplete(_clearBuilderGuard);
+  }
+
+  /// Releases [_builderOpenFor] once the builder dialog is gone, so selecting
+  /// the same graph tool again opens a fresh dialog.
+  void _clearBuilderGuard() {
+    _builderOpenFor = null;
   }
 
   Future<void> _pickAndDeliverImage() async {
@@ -955,6 +1008,7 @@ class _CartesianGraphDialogState extends State<_CartesianGraphDialog> {
       ),
       actions: <Widget>[
         TextButton(
+          key: const ValueKey<String>('graph-cancel'),
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),
@@ -1045,6 +1099,7 @@ class _NumberLineDialogState extends State<_NumberLineDialog> {
       ),
       actions: <Widget>[
         TextButton(
+          key: const ValueKey<String>('graph-cancel'),
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
         ),

@@ -8,6 +8,7 @@ Doc 04 §5 step 7 (wired in Wave 3.A).
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -73,7 +74,6 @@ def run_full() -> int:
     network (Doc 04 §5). Bus→Tk hops go only through StudioWindow/GLCanvasHost's
     internal marshalling — nothing here touches Tk off the Tk thread.
     """
-    import logging
     import threading
     import tkinter as tk
 
@@ -106,6 +106,15 @@ def run_full() -> int:
     manager.load()  # load-on-init is idempotent; explicit per Doc 04 step 7
     config = manager.config
     logging.basicConfig(level=config.log_level)
+    # Round-12 issue 07: install the last-resort handlers as early as possible.
+    # The reported failure was "the agent closes" with no traceback — a native
+    # GL fault leaves nothing behind unless faulthandler is armed first.
+    from pc_agent.core import crash_log
+
+    try:
+        crash_log.install(config.appdata_dir)
+    except Exception:  # pragma: no cover - diagnostics must never block startup
+        logging.getLogger(__name__).exception("crash logging unavailable")
     bus = EventBus()
 
     # PAIRING_INFO is emitted exactly once, inside DiscoveryPairing.start()

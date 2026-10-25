@@ -823,6 +823,45 @@ class PrimitiveRenderer:
     # Phase 1 — background (fullscreen grid program)
     # ------------------------------------------------------------------
 
+    def reset_scissor(self) -> None:
+        """Round-12 issue 07 — drop any artboard scissor before the next frame.
+
+        Called by ``GLCanvasHost.set_document`` when the mirrored canvas
+        changes. A canvas SWITCH replaces the artboard wholesale (new preset,
+        new size, new ``background_spacing``), so a scissor box computed for the
+        previous page must never survive into the first frame of the new one.
+        """
+        self.applied_scissor = None
+        self.scissor_enabled = False
+        self._release_scissor()
+
+    def _apply_scissor(self, box: tuple[int, int, int, int]) -> None:
+        """Assign a validated scissor box, never letting a bad rect escape.
+
+        moderngl raises ``Error`` for a rect outside the framebuffer, and a
+        driver may fault outright. The box is already clamped by
+        ``_artboard_scissor_box``; this is the last line of defence so a render
+        pass can never take the process down over a transient geometry state
+        (round-12 issue 07: the agent closed when switching to a canvas with a
+        different background).
+        """
+        try:
+            self._ctx.scissor = box
+            self._ctx.enable_direct(_GL_SCISSOR_TEST)
+        except Exception:  # pragma: no cover - driver/moderngl dependent
+            logger.exception("scissor %r rejected; drawing unclipped", box)
+            self._release_scissor()
+
+    def _release_scissor(self) -> None:
+        try:
+            self._ctx.scissor = None
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("scissor reset failed")
+        try:
+            self._ctx.disable_direct(_GL_SCISSOR_TEST)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("scissor disable failed")
+
     def _draw_background(
         self, artboard: "Artboard", camera: tuple[float, float, float], view_w: int, view_h: int
     ) -> None:
@@ -849,8 +888,7 @@ class PrimitiveRenderer:
             self._set(program, "u_scissorEnabled", 1)
             box = _artboard_scissor_box(width, height, camera, view_w, view_h)
             if box is not None:
-                self._ctx.scissor = box
-                self._ctx.enable_direct(_GL_SCISSOR_TEST)
+                self._apply_scissor(box)
             self.applied_scissor = box
             self.scissor_enabled = True
         else:
@@ -1528,8 +1566,22 @@ def _artboard_scissor_box(
     view_h: int,
 ) -> tuple[int, int, int, int] | None:
     """GL scissor (bottom-left origin) for the artboard's screen rect, or None off-screen."""
+    # Round-12 issue 07: this runs on the first frame after a canvas SWITCH,
+    # when the artboard, the camera and the viewport can transiently disagree.
+    # A non-finite or non-positive input used to flow into int() and produce a
+    # nonsense rect; moderngl rejects an out-of-range scissor, and on some
+    # drivers that path terminates the process instead of raising (which is
+    # exactly the "the agent just closes" report). Validate before doing math.
+    if not all(math.isfinite(v) for v in (width, height, camera[0], camera[1], camera[2])):
+        return None
+    if width <= 0.0 or height <= 0.0 or view_w <= 0 or view_h <= 0:
+        return None
+    if camera[0] <= 0.0:
+        return None
     x0, y0 = world_to_screen((0.0, 0.0), camera, (view_w, view_h))
     x1, y1 = world_to_screen((width, height), camera, (view_w, view_h))
+    if not all(math.isfinite(v) for v in (x0, y0, x1, y1)):
+        return None
     left, right = min(x0, x1), max(x0, x1)
     top, bottom = min(y0, y1), max(y0, y1)
     left, right = max(0.0, left), min(float(view_w), right)
