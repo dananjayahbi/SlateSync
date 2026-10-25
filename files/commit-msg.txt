@@ -1,26 +1,7 @@
-﻿Round 12 (part 3): focus mode + tablet OCR client
+﻿Restore test fixtures deleted by flutter test.
 
-Issue 03 — focus mode. A header toggle hides the app bar, banner, hint and
-tool dock so continuous note-taking gets the whole screen. Two decisions worth
-recording: focus mode is not persisted (reopening into a "where did everything
-go?" screen is worse than re-entering by hand), and the exit button is the one
-thing that never hides, because an inescapable UI is a bug, not a feature.
-
-Adding the toggle also exposed a genuine layout bug rather than merely moving
-pixels: the header Row could not fit its actions on a narrow viewport and
-overflowed by 4.4px in fit_open_test. The title is now horizontally scrollable,
-so every action stays reachable at any width instead of the last one being
-silently clipped.
-
-Issue 09 (tablet half) — ocr_client.dart builds START_OCR/CANCEL_OCR envelopes,
-correlates OCR_PROGRESS/OCR_RESULT back to its own job id, ignores replies for
-other jobs, and surfaces a PC-side failure as an error instead of an empty
-success. It refuses locally when the PC is disconnected or the selection is too
-small, so useless work is never sent.
-
-Contract updated for the four OCR actions across the Dart side too.
-
-20 focus-mode tests, 22 OCR-client tests; flutter analyze clean; full mobile
-suite 544 green.
+These PNGs are committed fixtures the badge test reads; `flutter test` wipes
+the scratch directory every run, so they disappear from the working tree
+whenever the suite runs. Restoring them so the tree is clean.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
