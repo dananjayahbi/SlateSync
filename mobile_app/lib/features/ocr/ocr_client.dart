@@ -50,8 +50,7 @@ Map<String, dynamic> buildStartOcr({
   }
   if (padding != null && padding.isFinite && padding >= 0) {
     payload['padding'] = padding;
-  }
-  return <String, dynamic>{
+  }  return <String, dynamic>{
     'id': id ?? uuidV4(),
     'type': 'OCR_JOB',
     'action': 'START_OCR',

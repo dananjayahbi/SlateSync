@@ -357,3 +357,49 @@ every `_addActionForKind` / `_DEFAULT_KINDS` / exporter branch to grow a case fo
   OPTIONAL (`NodeStyle.required` must not list it).
 * `pc_agent/tests/test_document_store.py` â€” `fill`/`groups` optional, round-tripped, and a hostile
   value never fails a load.
+
+---
+
+## 9. Round-12 Amendment — `TEXT` (NORMATIVE)
+
+Round 12 issue 05 adds two drawing tools. Only one of them touches the schema.
+
+### 9.1 `shape_type` gains `TEXT`
+
+```json
+"shape_type": {"enum": ["RECT","CIRCLE","TRIANGLE","ARROW","CARTESIAN_2D","NUMBER_LINE","PATH","TABLE","TEXT", null]}
+```
+
+A text box reuses `SHAPE` exactly as `TABLE` does: the rect is the node `bbox` and the content rides in
+`graph_config`. `NodeStyle` could not grow (frozen, and `fill` is already optional so pre-round-9
+documents round-trip byte-identically) and `geometry.pts` is numeric-only, so `graph_config` is the only
+route that does not add a second source of truth.
+
+### 9.2 `graph_config` for a TEXT node
+
+| key | type | meaning |
+|---|---|---|
+| `text` | string | the string to draw; `\n` is a hard line break |
+| `font_size` | number | world units, clamped to **6..400** by every renderer |
+| `align` | `"left" \| "center" \| "right"` | horizontal alignment inside the bbox |
+
+All three keys are OPTIONAL with the defaults `""`, `24.0`, `"left"`. A missing, non-string `text`, a
+non-numeric or non-finite `font_size`, and an unknown `align` each degrade individually — a corrupt text
+node renders as an empty box, never as a failed load. `pts` is empty for a TEXT node (the bbox is the
+geometry), which is the same convention `IMAGE` uses.
+
+### 9.3 The polygon tool needs no schema change
+
+A polygon is `SHAPE` with `shape_type: "PATH"` and its vertices in `pts` — `PATH` already means "closed
+polygon" since round 9 (rotation output and pen-loop fills). The tablet emits a regular N-gon inscribed
+in the drag bbox (`mobile_app/lib/canvas_engine/polygon_geometry.dart`), top vertex first, with N
+clamped to 3..64.
+
+### 9.4 Acceptance
+
+* `shared_specs/validate_specs.py` `SHAPE_TYPES` carries `TEXT`; the enum comparison stays exact.
+* `pc_agent/tests/test_round12_polygon_text.py` — regular-polygon fill/stroke at several N, degenerate
+  vertex lists, wrapping/alignment/font-size clamping, `graph_config` round-trip, and ink coverage from
+  the cairo glyph pass (viewport, raster, PDF and thumbnail exporters).
+* `mobile_app/test/round12_polygon_text_test.dart` — the same wrap and clamp rules through an injected
+  measurer, so the two sides cannot disagree about where a line breaks.

@@ -1,21 +1,27 @@
-﻿Round 12 (part 4): OCR tool UI
+﻿Round 12 (part 6): polygon and text box models, plus PC text rendering
 
-The free-drawn selection is the point of the tool, so it is its own module
-rather than a rectangle special-case: OcrSelectionPath owns the sampling
-(dropping sub-2-unit noise, rejecting non-finite points) and the painter draws
-the loop with a soft wash so the enclosed area is obvious.
+Issue 05. Two design decisions were forced by the existing schema and are
+worth recording, because the obvious alternatives do not work:
 
-OcrPanel encodes the policy that is easy to get wrong:
+* POLYGON reuses SHAPE + shape_type PATH with its vertices in geometry.pts.
+  No schema change, and both painters already render PATH -- a separate
+  POLYGON shape type would have meant touching every renderer to draw
+  something they can already draw.
+* TEXT travels in graph_config ({"text", "font_size", "align"}), exactly as
+  TABLE stores its grid. NodeStyle is frozen and geometry.pts is numeric
+  only, so there is nowhere else for a string to live without unfreezing the
+  node model.
 
-* the whole-canvas scan is DISABLED on an infinite canvas, because there is no
-  bounded area to rasterise -- better to grey out a control than to accept the
-  tap and fail after the user waits;
-* a zero-percent job shows an INDETERMINATE bar, since rasterising a 300 DPI
-  crop reports nothing for a while and a bar stuck at 0% reads as a hang;
-* a failure says why, and "no text found" is never dressed up as success;
-* the result summary names the provider, which is the only way a user can tell
-  the GPU did the work instead of a silent CPU fallback.
+Text needed attention beyond the obvious path: once TEXT became a reachable
+shape_type, the PDF exporter and the thumbnail renderer would have drawn a
+frame around the box (they outline every shape). Both now delegate TEXT, so
+the box looks the same everywhere rather than being framed in three of four
+renderers.
 
-30 tests; flutter analyze clean.
+Polygon hit-testing is boundary-inclusive on purpose: tapping exactly on an
+edge should select the polygon, not miss it.
+
+62 Dart tests, 105 Python tests (including real GL read-back), ruff clean,
+full PC suite 955 green, flutter analyze clean, full mobile suite 636 green.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

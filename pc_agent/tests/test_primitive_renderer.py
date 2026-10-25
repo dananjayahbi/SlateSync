@@ -317,6 +317,9 @@ def test_render_phases_execute_in_frozen_order() -> None:
         "self._draw_images(",
         "self._draw_shapes(",
         "self._draw_graphs(",
+        # Round-12 issue 05: text rides the texture stream, so it must land
+        # after every primitive phase or it would be overdrawn by them.
+        "self._draw_texts(",
     ]
     positions = [source.index(token) for token in order]
     assert positions == sorted(positions), "frozen phase order violated"
@@ -363,6 +366,14 @@ def test_module_imports_only_contract_models() -> None:
             "polyline_closes",
             "stroke_fill_polygon",
             "stroke_fill_polygon_of",
+        },
+        # Round-12 issue 05: TEXT layout/wrapping + rasterisation, shared by the
+        # viewport text pass and the cairo exporters. Leaf module (cairo + PIL
+        # only, no GL, no engine imports) like the three above.
+        "pc_agent.viewport.text_renderer": {
+            "is_text_shape",
+            "rasterise_text",
+            "text_config",
         },
     }
     pc_modules = {module for module in imported if module.startswith("pc_agent")}

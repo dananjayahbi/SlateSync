@@ -73,7 +73,8 @@ class NodeGeometry:
     pts: list[list[float]] = field(default_factory=list)
     #: RECT|CIRCLE|TRIANGLE|ARROW|CARTESIAN_2D|NUMBER_LINE plus the round-9
     #: PATH (closed polygon: rotation output and pen-loop fills) and TABLE
-    #: (grid described by ``graph_config``).
+    #: (grid described by ``graph_config``) and the round-12 TEXT (a text box
+    #: whose content lives in ``graph_config``).
     shape_type: str | None = None
     graph_config: dict | None = None
     asset_ref: str | None = None

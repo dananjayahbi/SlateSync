@@ -112,6 +112,11 @@ def sanitise_text(value: object) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n")
 
 
+#: Alias kept for the Dart twin's spelling (`normaliseText`), so a reader
+#: diffing the two files finds the same name on both sides.
+normalise_text = sanitise_text
+
+
 def text_config(graph_config: object) -> TextConfig:
     """Reads a TEXT node's ``graph_config``, tolerating a corrupt map.
 
@@ -178,7 +183,9 @@ def wrap_lines(
     into one character per line.
     """
     usable = sanitise_text(text)
-    if not usable:
+    if not usable.strip():
+        # A whitespace-only box paints no ink, and the glyph passes would
+        # otherwise lay down a blank line and report "drew something".
         return []
     paragraphs = usable.split("\n")
     try:
@@ -519,6 +526,7 @@ __all__ = [
     "line_origins",
     "normalise_align",
     "normalise_box",
+    "normalise_text",
     "parse_hex_rgb",
     "rasterise_text",
     "sanitise_text",

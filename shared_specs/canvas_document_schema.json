@@ -60,8 +60,8 @@
       "properties": {
         "pts": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
                 "description": "world-space points/Bézier controls; empty for IMAGE elements"},
-        "shape_type": {"enum": ["RECT", "CIRCLE", "TRIANGLE", "ARROW", "CARTESIAN_2D", "NUMBER_LINE", "PATH", "TABLE", null],
-                       "description": "set for SHAPE/GRAPH_AXES, else null; PATH = closed polygon filled when stroke_width == 0 (round-9 region fill / rotated shapes), TABLE = grid described by graph_config (round-9)"},
+        "shape_type": {"enum": ["RECT", "CIRCLE", "TRIANGLE", "ARROW", "CARTESIAN_2D", "NUMBER_LINE", "PATH", "TABLE", "TEXT", null],
+                       "description": "set for SHAPE/GRAPH_AXES, else null; PATH = closed polygon filled when stroke_width == 0 (round-9 region fill / rotated shapes), TABLE = grid described by graph_config (round-9), TEXT = text box whose content lives in graph_config (round-12)"},
         "graph_config": {"type": ["object", "null"],
           "properties": {"origin": {"type": "array", "items": {"type": "number"}},
                          "x_range": {"type": "array", "items": {"type": "number"}},
@@ -70,7 +70,10 @@
                          "rows": {"type": "integer", "minimum": 1, "description": "TABLE body rows, excluding the header row"},
                          "cols": {"type": "integer", "minimum": 1, "description": "TABLE columns"},
                          "header_row": {"type": "boolean", "description": "TABLE: first row is a header band"},
-                         "header_col": {"type": "boolean", "description": "TABLE: first column is a header band"}}},
+                         "header_col": {"type": "boolean", "description": "TABLE: first column is a header band"},
+                         "text": {"type": "string", "description": "TEXT: the string to draw (newlines are hard breaks)"},
+                         "font_size": {"type": "number", "minimum": 1, "description": "TEXT: font size in world units, clamped to 6..400 by every renderer"},
+                         "align": {"enum": ["left", "center", "right"], "description": "TEXT: horizontal alignment inside the node bbox"}}},
         "asset_ref": {"type": ["string", "null"], "pattern": "^assets/",
                       "description": "ZIP entry path of the attached file, e.g. assets/img_9921.png"}
       }

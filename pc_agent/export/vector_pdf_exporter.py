@@ -30,6 +30,7 @@ from pc_agent.core.config_manager import AppConfig
 from pc_agent.engine.document_store import Artboard, CanvasDocument, artboard_is_infinite
 from pc_agent.engine.scene_graph import CanvasNode
 from pc_agent.export.cairo_shapes import apply_fill, apply_stroke_fill, trace_shape
+from pc_agent.viewport.text_renderer import draw_text_box, is_text_shape
 
 #: Points = world_units × 72/300 (template §3).
 UNIT_TO_PT: float = 72 / 300
@@ -308,6 +309,16 @@ def _draw_shape(ctx: cairo.Context, node: CanvasNode) -> None:
     # Round-9 issues 04/05/06 — shared with the raster/thumbnail exporters so
     # the vector output cannot drift (fill, rotated PATH, TABLE grid).
     apply_fill(ctx, style, shape, box, node.geometry.pts, node.geometry.graph_config)
+    if is_text_shape(shape):
+        # Round-12 issue 05 — glyphs instead of a bbox outline (see trace_shape).
+        draw_text_box(
+            ctx,
+            node.geometry.graph_config,
+            box,
+            getattr(style, "color", "#1E1E1E"),
+            float(getattr(style, "opacity", 1.0) or 1.0),
+        )
+        return
     _set_color(ctx, style.color, style.opacity)
     ctx.set_line_width(max(0.5, float(style.stroke_width)))
     ctx.set_line_join(cairo.LINE_JOIN_ROUND)

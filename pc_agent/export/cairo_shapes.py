@@ -24,6 +24,7 @@ import math
 import cairo
 
 from pc_agent.viewport.stroke_fill import stroke_fill_polygon
+from pc_agent.viewport.text_renderer import is_text_shape
 from pc_agent.viewport.vector_geometry import (
     outline_segments,
     points_of,
@@ -220,6 +221,11 @@ def trace_shape(
     pts = getattr(geometry, "pts", None) or []
     style = getattr(node, "style", None)
     bx0, by0, bx1, by1 = box
+    if is_text_shape(shape):
+        # Round-12 issue 05 — a TEXT box has no outline of its own; the bbox
+        # rectangle would put a frame around body text. The exporters draw the
+        # glyphs instead (see `draw_text_box`), so tracing nothing is correct.
+        return
     if shape == "CIRCLE":
         ellipse_path(ctx, box)
         return

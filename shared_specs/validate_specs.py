@@ -123,6 +123,7 @@ BLEND_MODES = ["SRC_OVER", "MULTIPLY"]
 ELEMENT_KINDS = ["STROKE", "HIGHLIGHT", "LINE", "SHAPE", "GRAPH_AXES", "IMAGE"]
 #: Round-9: PATH (closed polygon — rotation output and pen-loop fills) and
 #: TABLE (grid described by graph_config) joined the shape_type enum.
+#: Round-12: TEXT (a text box whose content lives in graph_config) joined it.
 SHAPE_TYPES = [
     "RECT",
     "CIRCLE",
@@ -132,6 +133,7 @@ SHAPE_TYPES = [
     "NUMBER_LINE",
     "PATH",
     "TABLE",
+    "TEXT",
 ]
 
 SPEC_CHECKS = (
@@ -406,9 +408,9 @@ def validate_canvas_document(spec: dict) -> list[str]:
         "kind",
         "enum",
     )
-    # Round-9: PATH and TABLE joined the shape_type enum. The enum also carries
-    # a null member (shape_type is null for stroke/image/line nodes), so the
-    # comparison drops it on both sides.
+    # Round-9: PATH and TABLE joined the shape_type enum. Round-12 added TEXT.
+    # The enum also carries a null member (shape_type is null for
+    # stroke/image/line nodes), so the comparison drops it on both sides.
     shape_enum = _dig(
         spec, "$defs", "NodeGeometry", "properties", "shape_type", "enum"
     )

@@ -237,7 +237,7 @@ def test_fill_colour_rejects_malformed_values() -> None:
     assert fill_colour(NodeStyle()) is None
 
 
-@pytest.mark.parametrize("shape", ["RECT", "CIRCLE", "TRIANGLE", "PATH", "TABLE"])
+@pytest.mark.parametrize("shape", ["RECT", "CIRCLE", "TRIANGLE", "PATH", "TABLE", "TEXT"])
 def test_apply_fill_covers_every_fillable_shape(shape: str) -> None:
     from pc_agent.export.cairo_shapes import apply_fill
 

@@ -13,7 +13,8 @@ exporter.py``):
   polyline — chains are never re-fitted as anchors.
 * Strokes/HIGHLIGHTS honour colour/opacity/blend (multiply), with the line
   width floored at ``max(1 px, stroke_width * scale)``.
-* Shapes (RECT/CIRCLE/TRIANGLE/ARROW) and graphs (CARTESIAN_2D/NUMBER_LINE)
+* Shapes (RECT/CIRCLE/TRIANGLE/ARROW/PATH/TABLE/TEXT) and graphs
+  (CARTESIAN_2D/NUMBER_LINE)
   follow the exporter's geometry; graph labels are omitted (thumbnails may
   approximate — §10.3).  Images resolve through the Doc 10 assets layout and
   degrade to a neutral placeholder when missing/undecodable.
@@ -41,6 +42,7 @@ from pc_agent.engine.document_store import (
 )
 from pc_agent.engine.scene_graph import CanvasNode
 from pc_agent.export.cairo_shapes import apply_fill, apply_stroke_fill, trace_shape
+from pc_agent.viewport.text_renderer import draw_text_box, is_text_shape
 
 logger = logging.getLogger("slatesync.thumbnail")
 
@@ -341,6 +343,18 @@ def _draw_shape(ctx: cairo.Context, node: CanvasNode, scale: float) -> None:
     # Round-9 issues 04/05/06 — shared with the raster/PDF exporters so the
     # thumbnail cannot drift (fill, rotated PATH, TABLE grid).
     apply_fill(ctx, style, shape, box, node.geometry.pts, node.geometry.graph_config)
+    if is_text_shape(shape):
+        # Round-12 issue 05 — glyphs instead of a bbox outline (see trace_shape);
+        # the text is drawn at world size and the thumbnail's own context scale
+        # shrinks it with everything else, so it stays proportional.
+        draw_text_box(
+            ctx,
+            node.geometry.graph_config,
+            box,
+            getattr(style, "color", "#1E1E1E"),
+            float(getattr(style, "opacity", 1.0) or 1.0),
+        )
+        return
     _set_color(ctx, style.color, style.opacity)
     ctx.set_line_width(_line_w(scale, style.stroke_width))
     ctx.set_line_join(cairo.LINE_JOIN_ROUND)

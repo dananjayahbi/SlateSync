@@ -79,7 +79,7 @@ Map<String, dynamic> _result(
   'payload': <String, dynamic>{
     'job_id': jobId,
     'text': text,
-    if (error != null) 'error': error,
+    'error': ?error,
     'provider': 'DmlExecutionProvider',
     'width': 400,
     'height': 200,

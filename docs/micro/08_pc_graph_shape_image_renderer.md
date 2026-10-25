@@ -314,3 +314,52 @@ module, no GL and no engine imports) and MUST stay identical to
 
 An OPEN stroke encloses nothing and MUST NOT be filled - filling it would flood
 the whole page.
+---
+
+## 11. Round-12 Amendment — `TEXT` and the polygon tool (NORMATIVE)
+
+### 11.1 `TEXT` — glyphs as a texture on the mirror
+
+The primitive shader carries a flat per-vertex colour and cannot sample a font, and the round-8 glyph
+atlas only holds `0123456789-+.`. A text box is therefore baked into ONE RGBA raster (white + alpha
+ramp) and drawn as a tinted quad through the existing `texture` program, so `u_tint` supplies
+`style.color` x `style.opacity` and both blend modes keep working without touching the batch path.
+
+`PrimitiveRenderer.render` gains a final `_draw_texts` phase AFTER `_draw_graphs`: text rides the
+texture stream, so a primitive phase drawn later would overdraw it. Rasters are cached on
+`(text, font_size, align, box)` and released with the image textures; re-baking per frame would run
+cairo inside the render loop, which is the cost the glyph atlas exists to avoid.
+
+Layout (wrapping, alignment, font-size clamping) lives in the pure leaf module
+`pc_agent/viewport/text_renderer.py` and MUST stay identical to
+`mobile_app/lib/canvas_engine/text_box_model.dart`:
+
+* greedy word wrap; runs of spaces collapse to one; `\n` always breaks;
+* a word wider than the line is hard-split at the longest prefix that fits, minimum one character;
+* an unusable width (zero, negative, non-finite) leaves paragraphs unbroken;
+* line box = `1.25 x font_size`, inset `4` world units from the bbox, top-aligned.
+
+### 11.2 A text box has no bbox outline
+
+`trace_shape` traces NOTHING for `TEXT` (and `_tessellate_shape` emits no outline triangles). Tracing
+the bbox would put a rectangle around body text the user never drew. An explicit `style.fill` still
+paints the box background, exactly as it does for every other shape.
+
+All four cairo consumers (`tiled_raster_exporter`, `vector_pdf_exporter`, `thumbnail_renderer`,
+`cairo_shapes.trace_shape`) read the same helper, so the exports cannot drift from the mirror.
+
+### 11.3 The polygon tool is an existing code path
+
+A polygon arrives as `PATH`, which round 9 already traced and filled (ear-clipping
+`triangulate`, full outline stroked). No renderer change was needed — only the tablet-side vertex
+builder — and `test_round12_polygon_text.py` pins that a 3..12-gon fills, strokes, keeps fill and
+outline colours distinct, and that a 2-point PATH still degrades to a segment rather than vanishing.
+
+### 11.4 Acceptance
+
+* `pc_agent/tests/test_round12_polygon_text.py` — polygon fill/stroke, text wrapping/alignment/clamps,
+  `graph_config` round-trip, ink coverage from the cairo pass in all three exporters, and (when GL is
+  available) a read-back proving the text reaches the framebuffer and that the raster is cached.
+* `test_primitive_renderer.py::test_module_imports_only_contract_models` whitelists
+  `viewport.text_renderer` (leaf: cairo + PIL, no GL, no engine imports) and
+  `test_render_phases_execute_in_frozen_order` now ends at `_draw_texts`.
