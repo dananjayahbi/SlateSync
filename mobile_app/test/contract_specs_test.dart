@@ -8,7 +8,7 @@
 ///  * `type`/`action` strings emitted by the `hub_sync` envelope builders and
 ///    by every known sender literal in `lib/` ⊆ the `ws_rpc_schema.json`
 ///    enums; the action enum size is checked dynamically (no hardcoded JSON
-///    count) against the normative 20-name list.
+///    count) against the normative 24-name list.
 ///  * `type_actions` self-consistency from the Dart side: every action listed
 ///    under a type is in the master enum (and every master action is grouped).
 ///
@@ -24,7 +24,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:mobile_app/core/models/canvas_models.dart';
 import 'package:mobile_app/features/sync/hub_sync.dart';
 
-/// Normative action list (Doc 02 §4.2 + §8.1 + §9.1 + §10.1 — 20 actions).
+/// Normative action list (Doc 02 §4.2 + §8.1 + §9.1 + §10.1 + §11.1 — 24
+/// actions).
 const List<String> _normativeActions = <String>[
   'OPEN_CANVAS',
   'ADD_STROKE',
@@ -46,6 +47,10 @@ const List<String> _normativeActions = <String>[
   'CANVAS_PUT',
   'CANVAS_PULL',
   'CLEAR_CANVAS',
+  'START_OCR',
+  'CANCEL_OCR',
+  'OCR_PROGRESS',
+  'OCR_RESULT',
 ];
 
 /// Known Dart sender literals (hub_sync builders, bridge, studio page, export
@@ -378,7 +383,7 @@ void main() {
   group('TEST 1.5 ws_rpc_schema.json self-consistency (Dart side)', () {
     test('action enum size == normative list, loaded dynamically', () {
       // No hardcoded JSON count: equality with the named normative list
-      // proves both "exact size" and "includes all 20".
+      // proves both "exact size" and "includes all 24".
       expect(actionEnum.toSet(), equals(_normativeActions.toSet()));
       expect(actionEnum.toSet().length, _normativeActions.length);
       expect(actionEnum.length, actionEnum.toSet().length,
@@ -401,6 +406,7 @@ void main() {
         'ARTBOARD_RESIZE',
         'ASSET_UPLOAD',
         'EXPORT_JOB',
+        'OCR_JOB',
       }));
       expect(typeActions.keys.toSet(), containsAll(typeEnum),
           reason: 'every schema type must have a type_actions group');

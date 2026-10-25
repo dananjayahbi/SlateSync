@@ -43,6 +43,8 @@ import 'package:mobile_app/features/canvas/canvas_history_controller.dart'; // r
 import 'package:mobile_app/features/canvas/canvas_history_sync.dart'; // round-11 issue 02
 import 'package:mobile_app/features/canvas/canvas_publish.dart'; // round-9 issue 08
 import 'package:mobile_app/features/canvas/canvas_shape_conventions.dart';
+import 'package:mobile_app/features/canvas/focus_mode_controller.dart'; // round-12 issue 03
+import 'package:mobile_app/features/canvas/focus_toggle_button.dart'; // round-12 issue 03
 import 'package:mobile_app/features/canvas/image_source_popup.dart';
 import 'package:mobile_app/features/canvas/remote_mutation_applier.dart';
 import 'package:mobile_app/features/canvas/selection_actions.dart'; // round-9 05/06
@@ -74,7 +76,8 @@ class _SelectHit {
   bool get belongsToNewNode => node == null;
 }
 
-class CanvasStudioPage extends StatefulWidget {  const CanvasStudioPage({
+class CanvasStudioPage extends StatefulWidget {
+  const CanvasStudioPage({
     super.key,
     required this.document,
     required this.client,
@@ -109,6 +112,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
 
   /// Round-12 issue 06 — drives the image loading placeholder.
   ImagePlaceholderTicker? _placeholderTicker;
+
+  /// Round-12 issue 03 — focus mode hides the chrome while notes are written.
+  final FocusModeController _focus = FocusModeController();
   late final ArtboardManager _artboard;
 
   /// Doc 02 §10.2 live-mutation relay receive side (shared with the local
@@ -137,9 +143,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   /// blocked when any member is a free-hand stroke (see
   /// `selection_transform.dart` `canScaleSelection`).
   final Set<String> _selected = <String>{};
+
   /// Marquee drag in WORLD units while rubber-banding an empty-space drag.
   Rect? _marquee;
   Offset? _marqueeStart;
+
   /// Active move/resize drag.
   Offset? _transformStart;
   Rect? _transformFrom;
@@ -270,6 +278,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     _snap.dispose();
     _canvasTick.dispose();
     _history.dispose();
+    _focus.dispose();
     _hintTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
@@ -331,9 +340,10 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   /// cannot travel in an element commit, so when they changed the whole
   /// document is published instead (`CANVAS_PUT` is the only carrier).
   void _historyStep({required bool redo}) {
-    final List<CanvasNodeModel> before = List<CanvasNodeModel>.of(_doc.elements);
-    final Map<String, List<String>> groupsBefore =
-        <String, List<String>>{
+    final List<CanvasNodeModel> before = List<CanvasNodeModel>.of(
+      _doc.elements,
+    );
+    final Map<String, List<String>> groupsBefore = <String, List<String>>{
       for (final MapEntry<String, List<String>> e in _doc.groups.entries)
         e.key: List<String>.of(e.value),
     };
@@ -350,7 +360,10 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       unawaited(publishCanvasDocument(widget.client, _doc));
       return;
     }
-    for (final HistoryRpc rpc in diffNodes(before: before, after: _doc.elements)) {
+    for (final HistoryRpc rpc in diffNodes(
+      before: before,
+      after: _doc.elements,
+    )) {
       unawaited(
         widget.client.sendRpc(_commitEnvelope(rpc.action, rpc.payload)),
       );
@@ -433,7 +446,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   /// Doc 02 §10.5 fit-on-open target: bounded ⇒ page rect `(0,0,w,h)`;
   /// infinite ⇒ `content_bounds`, with the spec's `(-500,-500,1000,1000)`
   /// fallback while those bounds are empty.
-  Rect _fitTarget() => _artboard.boundaryRect() ??
+  Rect _fitTarget() =>
+      _artboard.boundaryRect() ??
       _boundsRectOrNull() ??
       const Rect.fromLTWH(-500, -500, 1000, 1000);
 
@@ -505,11 +519,12 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   static const double _handleHitPx = 22.0;
   static const double _tapSlopPx = 6.0;
 
-  bool get _selectionCanScale =>
-      canScaleSelection(_selected.map((String id) {
-        final CanvasNodeModel? n = _nodeById(id);
-        return n?.kind ?? '';
-      }));
+  bool get _selectionCanScale => canScaleSelection(
+    _selected.map((String id) {
+      final CanvasNodeModel? n = _nodeById(id);
+      return n?.kind ?? '';
+    }),
+  );
 
   /// Round-10 issue 05 — a locked selection exposes no transform affordance.
   ///
@@ -520,8 +535,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       _selected.isNotEmpty && !anyLocked(_doc, _selected);
 
   /// True when a gesture on the current selection may start.
-  bool get _selectionCanTransform =>
-      _selectionEditable && _selectionCanScale;
+  bool get _selectionCanTransform => _selectionEditable && _selectionCanScale;
 
   Rect get _selectionRect {
     final List<List<double>> boxes = <List<double>>[
@@ -545,8 +559,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     // 1) A resize handle of the current selection wins over everything else.
     if (_selected.isNotEmpty && _selectionCanTransform) {
       final Rect bounds = _selectionRect;
-      final double grab =
-          _handleHitPx / math.max(_camera.scale, 1e-6);
+      final double grab = _handleHitPx / math.max(_camera.scale, 1e-6);
       for (final ResizeHandle handle in ResizeHandle.values) {
         if ((handlePosition(handle, bounds) - world).distance <= grab) {
           _activeHandle = handle;
@@ -561,7 +574,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     }
     // 2) Tapping inside the current selection starts a MOVE of it.
     if (_selected.isNotEmpty && _selectionEditable) {
-      final Rect bounds = _selectionRect.inflate(_tapSlopPx / math.max(_camera.scale, 1e-6));
+      final Rect bounds = _selectionRect.inflate(
+        _tapSlopPx / math.max(_camera.scale, 1e-6),
+      );
       if (bounds.contains(world) && !_hitTopmost(world).belongsToNewNode) {
         _transformStart = world;
         _transformFrom = _selectionRect;
@@ -641,15 +656,11 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       final Rect from = _transformFrom!;
       final Rect to = _transformTo!;
       final bool moved = (to.topLeft - from.topLeft).distance > 1e-6;
-      final bool resized = _activeHandle != null &&
-          (to.width - from.width).abs() > 1e-6 ||
+      final bool resized =
+          _activeHandle != null && (to.width - from.width).abs() > 1e-6 ||
           _activeHandle != null && (to.height - from.height).abs() > 1e-6;
       if (moved || resized) {
-        _applyTransform(
-          from: from,
-          to: to,
-          scale: _activeHandle != null,
-        );
+        _applyTransform(from: from, to: to, scale: _activeHandle != null);
       }
       _transforming = false;
       _transformStart = null;
@@ -809,10 +820,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     }
     final ToolConfig cfg = _toolConfig.value;
     final bool clearing = target.node.style.fill != null;
-    _setNodeFill(
-      target.node,
-      clearing ? null : cfg.color,
-    );
+    _setNodeFill(target.node, clearing ? null : cfg.color);
   }
 
   /// Replaces [node] with a copy carrying [fill] (or none) and mirrors it.
@@ -905,11 +913,10 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   /// True when at least one selected node encloses a fillable region.
-  bool get _selectionCanFill =>
-      _selected.any((String id) {
-        final CanvasNodeModel? n = _nodeById(id);
-        return n != null && canFill(n);
-      });
+  bool get _selectionCanFill => _selected.any((String id) {
+    final CanvasNodeModel? n = _nodeById(id);
+    return n != null && canFill(n);
+  });
 
   void _lockSelection() {
     if (_selected.isEmpty) {
@@ -926,7 +933,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   void _unlockSelection() {
-    final String? groupId = _selected.isEmpty ? null : _doc.groupOf(_selected.first);
+    final String? groupId = _selected.isEmpty
+        ? null
+        : _doc.groupOf(_selected.first);
     if (groupId == null) {
       return;
     }
@@ -1080,15 +1089,17 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     final TableGrid grid = tableGridOf(box, table.geometry.graphConfig);
     final Map<String, dynamic>? config = grow
         ? (row
-            ? withExtraRow(table.geometry.graphConfig)
-            : withExtraColumn(table.geometry.graphConfig))
+              ? withExtraRow(table.geometry.graphConfig)
+              : withExtraColumn(table.geometry.graphConfig))
         : (row
-            ? withFewerRow(table.geometry.graphConfig)
-            : withFewerColumn(table.geometry.graphConfig));
+              ? withFewerRow(table.geometry.graphConfig)
+              : withFewerColumn(table.geometry.graphConfig));
     if (config == null) {
-      _showHint(row
-          ? 'A table needs at least one row.'
-          : 'A table needs at least one column.');
+      _showHint(
+        row
+            ? 'A table needs at least one row.'
+            : 'A table needs at least one column.',
+      );
       return;
     }
     final double cellH = grid.box.height / grid.rows;
@@ -1396,13 +1407,12 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   Map<String, dynamic> _commitEnvelope(
     String action,
     Map<String, dynamic> payload,
-  ) =>
-      <String, dynamic>{
-        'type': 'ELEMENT_COMMIT',
-        'action': action,
-        'canvas_id': _doc.canvasId,
-        'payload': payload,
-      };
+  ) => <String, dynamic>{
+    'type': 'ELEMENT_COMMIT',
+    'action': action,
+    'canvas_id': _doc.canvasId,
+    'payload': payload,
+  };
 
   // -------------------------------------------------------------------------
   // Live frames (Doc 24 preview streaming)
@@ -1467,8 +1477,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       _eraseDiscs.removeRange(0, _eraseDiscs.length - 24);
     }
     final Rect probe = Rect.fromCircle(center: world, radius: radius);
-    final bool elementMode =
-        _toolConfig.value.eraserMode == EraserMode.element;
+    final bool elementMode = _toolConfig.value.eraserMode == EraserMode.element;
     // Round-10 issue 05 — the eraser is a tool, so a locked group must be
     // immune to it. Filtering the candidates here also keeps `_erasedInDrag`
     // clean, so a node unlocked mid-gesture is not skipped later.
@@ -1510,7 +1519,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   ) {
     _beginEdit(); // round-9 issue 03
     forgetNode(_doc, original.nodeId); // round-9 issue 05
-    _doc.elements.removeWhere((CanvasNodeModel n) => n.nodeId == original.nodeId);
+    _doc.elements.removeWhere(
+      (CanvasNodeModel n) => n.nodeId == original.nodeId,
+    );
     _engine.removeCommitted(original.nodeId);
     unawaited(
       widget.client.sendRpc(
@@ -1548,13 +1559,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       );
       _engine.addNode(node);
       _doc.elements.add(node);
-      _artboard.noteContent(
-        Rect.fromLTRB(bbox[0], bbox[1], bbox[2], bbox[3]),
-      );
+      _artboard.noteContent(Rect.fromLTRB(bbox[0], bbox[1], bbox[2], bbox[3]));
       unawaited(
-        widget.client.sendRpc(
-          _commitEnvelope('ADD_STROKE', node.toJson()),
-        ),
+        widget.client.sendRpc(_commitEnvelope('ADD_STROKE', node.toJson())),
       );
     }
     _endEdit(); // round-9 issue 03 — the whole swap is one undo step
@@ -1618,7 +1625,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
       // Round-9 issue 06 — a table is a SHAPE with `shape_type: TABLE` and its
       // grid in `graph_config`, so every renderer gains tables by reading one
       // more shape_type instead of learning a new node kind.
-      final TableConfig config = _tableConfig ??
+      final TableConfig config =
+          _tableConfig ??
           const TableConfig(
             rows: kDefaultTableRows,
             cols: kDefaultTableCols,
@@ -1782,8 +1790,10 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   Future<void> _onPickImage(PendingImage img) async {
-    final String name =
-        img.filename.split(RegExp(r'[/\\]')).last.replaceAll('..', '');
+    final String name = img.filename
+        .split(RegExp(r'[/\\]'))
+        .last
+        .replaceAll('..', '');
     final String safeName = name.isEmpty ? 'image.png' : name;
     final String ref = 'assets/$safeName';
     _pendingAssets[ref] = img.bytes;
@@ -1878,11 +1888,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
           continue;
         }
         final File file = File(
-          await canvasAssetPath(
-            _doc.canvasId,
-            ref,
-            baseDir: widget.baseDir,
-          ),
+          await canvasAssetPath(_doc.canvasId, ref, baseDir: widget.baseDir),
         );
         if (!await file.exists()) {
           continue;
@@ -2001,7 +2007,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   String _groupsSignature() {
     final List<String> keys = _doc.groups.keys.toList()..sort();
     return keys
-        .map((String k) => '$k:${(_doc.groups[k] ?? const <String>[]).join(',')}')
+        .map(
+          (String k) => '$k:${(_doc.groups[k] ?? const <String>[]).join(',')}',
+        )
         .join('|');
   }
 
@@ -2073,21 +2081,15 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
     unawaited(
       showDialog<void>(
         context: context,
-        builder: (BuildContext ctx) => UpgradeDialog(
-          manager: _artboard,
-          onSaved: _onArtboardUpgraded,
-        ),
+        builder: (BuildContext ctx) =>
+            UpgradeDialog(manager: _artboard, onSaved: _onArtboardUpgraded),
       ),
     );
   }
 
   void _openExport() {
     unawaited(
-      showExportSheet(
-        context,
-        client: widget.client,
-        canvasId: _doc.canvasId,
-      ),
+      showExportSheet(context, client: widget.client, canvasId: _doc.canvasId),
     );
   }
 
@@ -2108,7 +2110,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   Color _liveColor() {
     final String hex = _toolConfig.value.color;
     final String digits = hex.replaceFirst('#', '');
-    final int? value = digits.length == 6 ? int.tryParse(digits, radix: 16) : null;
+    final int? value = digits.length == 6
+        ? int.tryParse(digits, radix: 16)
+        : null;
     if (value == null) {
       return StudioTheme.text;
     }
@@ -2116,30 +2120,34 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   }
 
   String? get _bannerText => switch (widget.client.state) {
-        SyncState.online => null,
-        SyncState.idle =>
-          'Not paired — strokes queue locally until the PC connects',
-        SyncState.discovering => 'Searching for SlateSync PC…',
-        SyncState.connecting => 'Connecting to PC…',
-        SyncState.backoff => 'Connection lost — retrying…',
-        SyncState.authFailed => 'Pairing rejected — scan the QR again',
-      };
+    SyncState.online => null,
+    SyncState.idle =>
+      'Not paired — strokes queue locally until the PC connects',
+    SyncState.discovering => 'Searching for SlateSync PC…',
+    SyncState.connecting => 'Connecting to PC…',
+    SyncState.backoff => 'Connection lost — retrying…',
+    SyncState.authFailed => 'Pairing rejected — scan the QR again',
+  };
 
   String get _statusLabel => switch (widget.client.state) {
-        SyncState.online => 'Paired',
-        SyncState.discovering => 'Searching',
-        SyncState.connecting => 'Connecting',
-        SyncState.backoff => 'Retrying',
-        SyncState.authFailed => 'Pairing failed',
-        SyncState.idle => 'Connect PC',
-      };
+    SyncState.online => 'Paired',
+    SyncState.discovering => 'Searching',
+    SyncState.connecting => 'Connecting',
+    SyncState.backoff => 'Retrying',
+    SyncState.authFailed => 'Pairing failed',
+    SyncState.idle => 'Connect PC',
+  };
 
   /// Artboard `background_color` parsed to a [Color] (Issue 02: white paper
   /// falls back to [StudioTheme.strokeCanvas] on malformed values).
   Color get _pageColor {
-    final String digits =
-        _artboard.current.backgroundColor.replaceFirst('#', '');
-    final int? value = digits.length == 6 ? int.tryParse(digits, radix: 16) : null;
+    final String digits = _artboard.current.backgroundColor.replaceFirst(
+      '#',
+      '',
+    );
+    final int? value = digits.length == 6
+        ? int.tryParse(digits, radix: 16)
+        : null;
     if (value == null) {
       return StudioTheme.strokeCanvas;
     }
@@ -2149,6 +2157,15 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   @override
   Widget build(BuildContext context) {
     final String? banner = _bannerText;
+    // Round-12 issue 03 — the page must rebuild when focus mode flips, because
+    // the app bar, banner and dock all appear/disappear with it.
+    return AnimatedBuilder(
+      animation: _focus,
+      builder: (BuildContext context, Widget? child) => _buildScaffold(banner),
+    );
+  }
+
+  Widget _buildScaffold(String? banner) {
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (bool didPop, Object? result) {
@@ -2156,19 +2173,22 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
           return;
         }
         final NavigatorState nav = Navigator.of(context);
-        unawaited(_save().whenComplete(() {
-          if (mounted) {
-            nav.pop();
-          }
-        }));
+        unawaited(
+          _save().whenComplete(() {
+            if (mounted) {
+              nav.pop();
+            }
+          }),
+        );
       },
       child: Scaffold(
         backgroundColor: StudioTheme.bg,
-        appBar: _buildTopBar(),
+        appBar: _focus.chrome.showTopBar ? _buildTopBar() : null,
         body: Column(
           children: <Widget>[
-            if (banner != null) _buildBanner(banner),
-            if (_hint != null) _buildHint(_hint!),
+            if (banner != null && _focus.chrome.showBanner)
+              _buildBanner(banner),
+            if (_hint != null && _focus.chrome.showHint) _buildHint(_hint!),
             Expanded(child: _buildCanvasLayer()),
           ],
         ),
@@ -2186,67 +2206,74 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
         icon: const Icon(Icons.arrow_back),
       ),
       titleSpacing: 0,
-      title: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: <Widget>[
-          // Round-9 issue 03 — undo/redo live at the TOP, as asked.
-          ValueListenableBuilder<int>(
-            valueListenable: _history.revision,
-            builder: (BuildContext context, int _, Widget? child) {
-              return Row(
-                mainAxisSize: MainAxisSize.min,
-                children: <Widget>[
-                  IconButton(
-                    key: const ValueKey<String>('studio-undo'),
-                    tooltip: 'Undo',
-                    onPressed: _history.canUndo ? _undo : null,
-                    icon: const Icon(Icons.undo),
-                  ),
-                  IconButton(
-                    key: const ValueKey<String>('studio-redo'),
-                    tooltip: 'Redo',
-                    onPressed: _history.canRedo ? _redo : null,
-                    icon: const Icon(Icons.redo),
-                  ),
-                ],
-              );
-            },
-          ),
-          IconButton(
-            key: const ValueKey<String>('studio-zoom-out'),
-            tooltip: 'Zoom out',
-            onPressed: () => _zoomBy(0.8),
-            icon: const Icon(Icons.zoom_out),
-          ),
-          Text(
-            '${(_camera.scale * 100).round()}%',
-            key: const ValueKey<String>('studio-zoom-level'),
-            style: const TextStyle(
-              fontSize: StudioTheme.captionSize,
-              color: StudioTheme.text,
+      // The header carries undo/redo, zoom, connect and export; on a narrow
+      // viewport adding the focus toggle overflows a fixed Row. A horizontal
+      // scroller keeps every action reachable at any width instead of silently
+      // clipping the last one.
+      title: SingleChildScrollView(
+        scrollDirection: Axis.horizontal,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            // Round-9 issue 03 — undo/redo live at the TOP, as asked.
+            ValueListenableBuilder<int>(
+              valueListenable: _history.revision,
+              builder: (BuildContext context, int _, Widget? child) {
+                return Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    IconButton(
+                      key: const ValueKey<String>('studio-undo'),
+                      tooltip: 'Undo',
+                      onPressed: _history.canUndo ? _undo : null,
+                      icon: const Icon(Icons.undo),
+                    ),
+                    IconButton(
+                      key: const ValueKey<String>('studio-redo'),
+                      tooltip: 'Redo',
+                      onPressed: _history.canRedo ? _redo : null,
+                      icon: const Icon(Icons.redo),
+                    ),
+                  ],
+                );
+              },
             ),
-          ),
-          IconButton(
-            key: const ValueKey<String>('studio-zoom-in'),
-            tooltip: 'Zoom in',
-            onPressed: () => _zoomBy(1.25),
-            icon: const Icon(Icons.zoom_in),
-          ),
-          IconButton(
-            key: const ValueKey<String>('studio-zoom-fit'),
-            tooltip: 'Zoom to fit',
-            onPressed: _zoomToFit,
-            icon: const Icon(Icons.fit_screen),
-          ),
-          TextButton(
-            key: const ValueKey<String>('studio-preset'),
-            onPressed: _openUpgrade,
-            child: Text(
-              presetLabel(_artboard.current.preset),
-              style: const TextStyle(color: StudioTheme.accent),
+            IconButton(
+              key: const ValueKey<String>('studio-zoom-out'),
+              tooltip: 'Zoom out',
+              onPressed: () => _zoomBy(0.8),
+              icon: const Icon(Icons.zoom_out),
             ),
-          ),
-        ],
+            Text(
+              '${(_camera.scale * 100).round()}%',
+              key: const ValueKey<String>('studio-zoom-level'),
+              style: const TextStyle(
+                fontSize: StudioTheme.captionSize,
+                color: StudioTheme.text,
+              ),
+            ),
+            IconButton(
+              key: const ValueKey<String>('studio-zoom-in'),
+              tooltip: 'Zoom in',
+              onPressed: () => _zoomBy(1.25),
+              icon: const Icon(Icons.zoom_in),
+            ),
+            IconButton(
+              key: const ValueKey<String>('studio-zoom-fit'),
+              tooltip: 'Zoom to fit',
+              onPressed: _zoomToFit,
+              icon: const Icon(Icons.fit_screen),
+            ),
+            TextButton(
+              key: const ValueKey<String>('studio-preset'),
+              onPressed: _openUpgrade,
+              child: Text(
+                presetLabel(_artboard.current.preset),
+                style: const TextStyle(color: StudioTheme.accent),
+              ),
+            ),
+          ],
+        ),
       ),
       actions: <Widget>[
         TextButton.icon(
@@ -2272,6 +2299,8 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
             style: TextStyle(color: StudioTheme.accent),
           ),
         ),
+        // Round-12 issue 03 — focus mode toggle lives in the header.
+        FocusToggleButton(controller: _focus, compact: true),
       ],
     );
   }
@@ -2328,9 +2357,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
   Widget _buildCanvasLayer() {
     return LayoutBuilder(
       builder: (BuildContext context, BoxConstraints constraints) {
-        _ensureInitialFit(
-          Size(constraints.maxWidth, constraints.maxHeight),
-        );
+        _ensureInitialFit(Size(constraints.maxWidth, constraints.maxHeight));
         return Stack(
           children: <Widget>[
             // Issue 02 — white paper canvas: the viewport sits on
@@ -2401,29 +2428,30 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                   );
                 },
               ),
-            Positioned(
-              left: 6,
-              top: 6,
-              bottom: 6,
-              child: ClipRect(
-                child: SingleChildScrollView(
-                  child: ToolDock(
-                    config: _toolConfig,
-                    tool: _tool,
-                    snapEnabled: _snap,
-                    onEraseRequest: _deleteNode,
-                    onClearRequested: _onClearCanvas,
-                    onPickImage: (PendingImage img) =>
-                        unawaited(_onPickImage(img)),
-                    onGraphCommitted: _onGraphCommitted,
+            if (_focus.chrome.showToolDock)
+              Positioned(
+                left: 6,
+                top: 6,
+                bottom: 6,
+                child: ClipRect(
+                  child: SingleChildScrollView(
+                    child: ToolDock(
+                      config: _toolConfig,
+                      tool: _tool,
+                      snapEnabled: _snap,
+                      onEraseRequest: _deleteNode,
+                      onClearRequested: _onClearCanvas,
+                      onPickImage: (PendingImage img) =>
+                          unawaited(_onPickImage(img)),
+                      onGraphCommitted: _onGraphCommitted,
+                    ),
                   ),
                 ),
-              ),
-            ),
-            // Round-9 issues 05/06 — the selector's per-object chrome:
-            // lock/unlock, rotate and fill float just above the selection box;
-            // a locked group also gets a lock badge. All anchored to the
-            // object, as asked, not to a global toolbar.
+              )
+            else
+              // Round-12 issue 03 — focus mode hides the dock, but the
+              // way out must stay reachable or the user is trapped.
+              Positioned.fill(child: FocusOverlayButton(controller: _focus)),
             if (_tool.value == StudioTool.select && _selected.isNotEmpty)
               ValueListenableBuilder<int>(
                 valueListenable: _canvasTick,
@@ -2438,8 +2466,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                   );
                   return Stack(
                     children: <Widget>[
-                      if (_selectionLocked)
-                        LockBadge(anchor: screenTopLeft),
+                      if (_selectionLocked) LockBadge(anchor: screenTopLeft),
                       SelectionActionBar(
                         anchor: screenTopLeft,
                         locked: _selectionLocked,
@@ -2454,8 +2481,7 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                         onUnlock: _unlockSelection,
                         onRotate: _rotateSelection,
                         onFill: _fillSelection,
-                        onDelete:
-                            _selectionEditable ? _deleteSelection : null,
+                        onDelete: _selectionEditable ? _deleteSelection : null,
                       ),
                       // Round-9 issue 06 — rows are added BELOW the table and
                       // columns to its RIGHT, where a spreadsheet puts them.
@@ -2471,8 +2497,9 @@ class _CanvasStudioPageState extends State<CanvasStudioPage>
                           ),
                           onAddRow: _addTableRow,
                           onAddColumn: _addTableColumn,
-                          onRemoveRow:
-                              _tableCanRemoveRow ? _removeTableRow : null,
+                          onRemoveRow: _tableCanRemoveRow
+                              ? _removeTableRow
+                              : null,
                           onRemoveColumn: _tableCanRemoveColumn
                               ? _removeTableColumn
                               : null,

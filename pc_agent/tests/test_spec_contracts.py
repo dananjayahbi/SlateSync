@@ -5,7 +5,7 @@
   corrupted action sets are rejected, consistently-removed ones still pass.
 * The embedded JSON body in Doc 02 §5 (Step 8) stays byte-identical with the
   schema file (mechanical sync required by §8.5).
-* ``pc_agent.core.protocol.RPC_ACTIONS`` mirrors the schema's 20 actions.
+* ``pc_agent.core.protocol.RPC_ACTIONS`` mirrors the schema's 24 actions.
 """
 
 from __future__ import annotations
@@ -55,9 +55,10 @@ def test_real_schema_validates_clean() -> None:
     assert _VALIDATOR.main([str(_SCHEMA_PATH.parent)]) == 0
 
 
-def test_twenty_actions_in_enum_and_canvas_lifecycle_group(schema: dict) -> None:
+def test_twenty_four_actions_in_enum_and_canvas_lifecycle_group(schema: dict) -> None:
     actions = schema["envelope"]["action"]["enum"]
-    assert len(actions) == 20
+    # Round 12 ?11.1 added the four OCR actions (20 -> 24).
+    assert len(actions) == 24
     assert set(actions) == set(RPC_ACTIONS)
     canvas_actions = set(schema["type_actions"]["CANVAS_LIFECYCLE"])
     assert canvas_actions == {
@@ -106,6 +107,11 @@ def test_payload_schemas_cover_the_canvas_sync_actions(schema: dict) -> None:
         "CANVAS_PULL",
         # Doc 02 §10.1 — round 6 clear.
         "CLEAR_CANVAS",
+        # Doc 02 §11.1 — round 12 OCR job.
+        "START_OCR",
+        "CANCEL_OCR",
+        "OCR_PROGRESS",
+        "OCR_RESULT",
     }
     open_canvas = schemas["OPEN_CANVAS"]
     assert open_canvas["discriminator"] == "canvas"
@@ -258,10 +264,10 @@ def test_doc02_step5_body_is_byte_identical_to_schema_file() -> None:
     )
 
 
-def test_doc02_embedded_body_parses_and_carries_the_20_actions() -> None:
+def test_doc02_embedded_body_parses_and_carries_the_24_actions() -> None:
     embedded = json.loads(_embedded_body())
     assert embedded == json.loads(_SCHEMA_PATH.read_text(encoding="utf-8"))
-    assert len(embedded["envelope"]["action"]["enum"]) == 20
+    assert len(embedded["envelope"]["action"]["enum"]) == 24
     assert set(embedded["type_actions"]["CANVAS_LIFECYCLE"]) >= {
         "CANVAS_PUT",
         "CANVAS_PULL",
